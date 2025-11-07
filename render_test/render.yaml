@@ -1,0 +1,21 @@
+services:
+  - type: worker
+    name: td-crypto-ticks
+    runtime: python
+    plan: starter
+    region: frankfurt
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python worker.py"
+    envVars:
+      - key: TWELVEDATA_API_KEY     # set in Render dashboard
+        sync: false
+      - key: SYMBOLS
+        value: "BTC/USD,ETH/USD,XRP/USD,XMR/USD,SOL/USD,BNB/USD,ADA/USD,DOGE/USD"
+      - key: SUPABASE_URL           # e.g. https://<ref>.supabase.co
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_TABLE
+        value: "ticks_crypto"
+      - key: LOG_LEVEL
+        value: "INFO"
