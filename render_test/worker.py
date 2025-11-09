@@ -4,10 +4,13 @@ import websockets
 from supabase import create_client, Client
 
 TD_API_KEY = os.environ["TWELVEDATA_API_KEY"]
+
+# Updated symbols - Crypto + Forex
 SYMBOLS = os.getenv(
     "SYMBOLS",
-    "BTC/USD,ETH/USD,XRP/USD,XMR/USD,SOL/USD,BNB/USD,ADA/USD,DOGE/USD"
+    "BTC/USD,ETH/USD,XRP/USD,XMR/USD,SOL/USD,BNB/USD,ADA/USD,DOGE/USD,XAU/USD,EUR/USD,GBP/USD,USD/CAD,GBP/AUD,AUD/CAD,EUR/GBP,USD/JPY"
 )
+
 WS_URL = f"wss://ws.twelvedata.com/v1/quotes/price?apikey={TD_API_KEY}"
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
