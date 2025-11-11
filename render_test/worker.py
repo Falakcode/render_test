@@ -5,19 +5,22 @@ from supabase import create_client, Client
 
 TD_API_KEY = os.environ["TWELVEDATA_API_KEY"]
 
-# All 16 symbols
-SYMBOLS = "BTC/USD,ETH/USD,XRP/USD,XMR/USD,SOL/USD,BNB/USD,ADA/USD,DOGE/USD,XAU/USD,EUR/USD,GBP/USD,USD/CAD,GBP/AUD,AUD/CAD,EUR/GBP,USD/JPY"
+# Your 16 actual symbols
+SYMBOLS = os.getenv(
+    "SYMBOLS",
+    "BTC/USD,ETH/USD,XRP/USD,XMR/USD,SOL/USD,BNB/USD,ADA/USD,DOGE/USD,XAU/USD,EUR/USD,GBP/USD,USD/CAD,GBP/AUD,AUD/CAD,EUR/GBP,USD/JPY"
+)
 
 WS_URL = f"wss://ws.twelvedata.com/v1/quotes/price?apikey={TD_API_KEY}"
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
-SUPABASE_TABLE = "ticks_crypto"
+SUPABASE_TABLE = "ticks_crypto"  # Fixed - always use ticks_crypto
 
 BATCH_MAX = 200
 BATCH_FLUSH_SECS = 5
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
 log = logging.getLogger("td-stream")
 
 sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -38,10 +41,12 @@ async def flush_batch():
             return
         payload, _batch = _batch, []
     try:
+        # Insert only into ticks_crypto
         sb.table(SUPABASE_TABLE).insert(payload).execute()
-        log.info("✅ Inserted %d ticks into ticks_crypto", len(payload))
+        log.info("Inserted %d ticks into ticks_crypto", len(payload))
     except Exception as e:
-        log.exception("❌ Insert failed; re-queueing %d rows", len(payload))
+        log.exception("Insert failed; re-queueing %d rows", len(payload))
+        # Put back to buffer (best-effort)
         async with _batch_lock:
             _batch.extend(payload)
 
@@ -53,6 +58,7 @@ async def periodic_flush():
             await flush_batch()
 
 async def handle_message(msg: dict):
+    # Two event types: subscribe-status and price
     if msg.get("event") == "price":
         ts = msg.get("timestamp")
         if isinstance(ts, (int, float)):
@@ -60,24 +66,26 @@ async def handle_message(msg: dict):
         else:
             dt = datetime.now(timezone.utc)
 
-        # Only store symbol, ts, and price
+        # Only store symbol, ts, and price (no bid/ask/volume)
         row = {
             "symbol": msg.get("symbol"),
             "ts": dt.isoformat(),
             "price": _to_float(msg.get("price")),
         }
 
+        # Skip if price is None
         if row["price"] is None:
-            log.warning("⚠️ Skipping tick with no price: %s", msg.get("symbol"))
+            log.warning("Skipping tick with no price: %s", msg)
             return
 
         async with _batch_lock:
             _batch.append(row)
             if len(_batch) >= BATCH_MAX:
+                # flush without waiting for timer
                 asyncio.create_task(flush_batch())
 
     elif msg.get("event") == "subscribe-status":
-        log.info("📊 Subscribe status: %s", msg)
+        log.info("Subscribe status: %s", msg)
     else:
         log.debug("Other event: %s", msg)
 
@@ -87,7 +95,7 @@ async def heartbeat(ws):
         try:
             await ws.send(json.dumps({"action": "heartbeat"}))
         except Exception:
-            return
+            return  # connection will be re-established
 
 async def run_once():
     async with websockets.connect(
@@ -96,11 +104,13 @@ async def run_once():
         ping_timeout=20,
         max_queue=1000,
     ) as ws:
+        # subscribe to symbols
         await ws.send(
             json.dumps({"action": "subscribe", "params": {"symbols": SYMBOLS}})
         )
-        log.info("🚀 Subscribed to: %s", SYMBOLS)
+        log.info("Subscribed to: %s", SYMBOLS)
 
+        # start heartbeat
         hb_task = asyncio.create_task(heartbeat(ws))
 
         async for raw in ws:
@@ -118,15 +128,17 @@ async def main():
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _stop.set)
 
+    # Periodic batch flusher
     flusher = asyncio.create_task(periodic_flush())
 
+    # Reconnect loop with backoff
     backoff = 1
     while not _stop.is_set():
         try:
             await run_once()
             backoff = 1
         except Exception as e:
-            log.warning("⚠️ WS error: %s; reconnecting in %ss", e, backoff)
+            log.warning("WS error: %s; reconnecting in %ss", e, backoff)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
 
