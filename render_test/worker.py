@@ -5,7 +5,7 @@ from supabase import create_client, Client
 
 TD_API_KEY = os.environ["TWELVEDATA_API_KEY"]
 
-# Updated symbols - Crypto + Forex
+# Your 16 actual symbols
 SYMBOLS = os.getenv(
     "SYMBOLS",
     "BTC/USD,ETH/USD,XRP/USD,XMR/USD,SOL/USD,BNB/USD,ADA/USD,DOGE/USD,XAU/USD,EUR/USD,GBP/USD,USD/CAD,GBP/AUD,AUD/CAD,EUR/GBP,USD/JPY"
@@ -15,7 +15,7 @@ WS_URL = f"wss://ws.twelvedata.com/v1/quotes/price?apikey={TD_API_KEY}"
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
-SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "ticks_crypto")
+SUPABASE_TABLE = "ticks_crypto"  # Fixed - always use ticks_crypto
 
 BATCH_MAX = 200
 BATCH_FLUSH_SECS = 5
@@ -41,9 +41,9 @@ async def flush_batch():
             return
         payload, _batch = _batch, []
     try:
-        # Supabase Python client does HTTP inserts (Data API).
+        # Insert only into ticks_crypto
         sb.table(SUPABASE_TABLE).insert(payload).execute()
-        log.info("Inserted %d ticks", len(payload))
+        log.info("Inserted %d ticks into ticks_crypto", len(payload))
     except Exception as e:
         log.exception("Insert failed; re-queueing %d rows", len(payload))
         # Put back to buffer (best-effort)
@@ -60,22 +60,23 @@ async def periodic_flush():
 async def handle_message(msg: dict):
     # Two event types: subscribe-status and price
     if msg.get("event") == "price":
-        # Example fields: symbol, price, timestamp, (optional) bid, ask, volume/day_volume
         ts = msg.get("timestamp")
         if isinstance(ts, (int, float)):
             dt = datetime.fromtimestamp(ts, tz=timezone.utc)
         else:
-            # Some payloads include ISO datetime; normalize to UTC
             dt = datetime.now(timezone.utc)
 
+        # Only store symbol, ts, and price (no bid/ask/volume)
         row = {
             "symbol": msg.get("symbol"),
             "ts": dt.isoformat(),
             "price": _to_float(msg.get("price")),
-            "bid": _to_float(msg.get("bid")),
-            "ask": _to_float(msg.get("ask")),
-            "day_volume": _to_float(msg.get("day_volume") or msg.get("volume")),
         }
+
+        # Skip if price is None
+        if row["price"] is None:
+            log.warning("Skipping tick with no price: %s", msg)
+            return
 
         async with _batch_lock:
             _batch.append(row)
