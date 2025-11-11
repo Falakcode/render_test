@@ -1,32 +1,37 @@
-import os, json, asyncio, signal, logging
+import os, json, asyncio, logging
 from datetime import datetime, timezone
 import websockets
-from supabase import create_client, Client
+from supabase import create_client
 
-TD_API_KEY = os.environ["TWELVEDATA_API_KEY"]
+# ── Env ──────────────────────────────────────────────────────────────────────
+TD_API_KEY   = os.environ["TWELVEDATA_API_KEY"]
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 
-# Your 16 actual symbols
-SYMBOLS = os.getenv(
-    "SYMBOLS",
-    "BTC/USD,ETH/USD,XRP/USD,XMR/USD,SOL/USD,BNB/USD,ADA/USD,DOGE/USD,XAU/USD,EUR/USD,GBP/USD,USD/CAD,GBP/AUD,AUD/CAD,EUR/GBP,USD/JPY"
+# Write *only* here
+SUPABASE_TABLE = os.environ.get("SUPABASE_TABLE", "ticks_crypto")
+
+# Symbols to stream (edit if you like)
+SYMBOLS = (
+    "BTC/USD,ETH/USD,XRP/USD,XMR/USD,SOL/USD,BNB/USD,ADA/USD,"
+    "XAU/USD,EUR/USD,GBP/USD,USD/CAD,GBP/AUD,AUD/CAD,EUR/GBP,USD/JPY"
 )
 
 WS_URL = f"wss://ws.twelvedata.com/v1/quotes/price?apikey={TD_API_KEY}"
 
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
-SUPABASE_TABLE = "ticks_crypto"  # Fixed - always use ticks_crypto
+# ── Supabase client ──────────────────────────────────────────────────────────
+sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-BATCH_MAX = 200
-BATCH_FLUSH_SECS = 5
+# ── Batching ─────────────────────────────────────────────────────────────────
+BATCH_MAX = 500
+BATCH_FLUSH_SECS = 2
 
-logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")))
+batch = []
+lock = asyncio.Lock()
+stop_event = asyncio.Event()
+
+logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("td-stream")
-
-sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-_batch = []
-_batch_lock = asyncio.Lock()
-_stop = asyncio.Event()
 
 def _to_float(x):
     try:
@@ -34,116 +39,113 @@ def _to_float(x):
     except Exception:
         return None
 
-async def flush_batch():
-    global _batch
-    async with _batch_lock:
-        if not _batch:
-            return
-        payload, _batch = _batch, []
+def _to_ts(ts_val):
+    """Return aware UTC datetime from ms/s epoch or ISO string."""
+    if ts_val is None:
+        return datetime.now(timezone.utc)
+    # epoch milliseconds or seconds
     try:
-        # Insert only into ticks_crypto
+        t = float(ts_val)
+        if t > 10**12:
+            t /= 1000.0
+        return datetime.fromtimestamp(t, tz=timezone.utc)
+    except Exception:
+        pass
+    # ISO
+    try:
+        # If TZ missing, assume UTC
+        dt = datetime.fromisoformat(str(ts_val).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return datetime.now(timezone.utc)
+
+async def flush():
+    global batch
+    async with lock:
+        if not batch:
+            return
+        payload, batch = batch, []
+
+    try:
         sb.table(SUPABASE_TABLE).insert(payload).execute()
-        log.info("Inserted %d ticks into ticks_crypto", len(payload))
-    except Exception as e:
-        log.exception("Insert failed; re-queueing %d rows", len(payload))
-        # Put back to buffer (best-effort)
-        async with _batch_lock:
-            _batch.extend(payload)
+        log.info("✅ Inserted %d rows into %s", len(payload), SUPABASE_TABLE)
+    except Exception:
+        # Put rows back if insert fails
+        log.exception("❌ Insert failed; re-queueing %d rows", len(payload))
+        async with lock:
+            batch[:0] = payload  # prepend to keep order
 
 async def periodic_flush():
-    while not _stop.is_set():
+    while not stop_event.is_set():
         try:
-            await asyncio.wait_for(_stop.wait(), timeout=BATCH_FLUSH_SECS)
+            await asyncio.wait_for(stop_event.wait(), timeout=BATCH_FLUSH_SECS)
         except asyncio.TimeoutError:
-            await flush_batch()
+            await flush()
 
 async def handle_message(msg: dict):
-    # Two event types: subscribe-status and price
-    if msg.get("event") == "price":
-        ts = msg.get("timestamp")
-        if isinstance(ts, (int, float)):
-            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-        else:
-            dt = datetime.now(timezone.utc)
+    # We only care about price events
+    if msg.get("event") != "price":
+        return
 
-        # Only store symbol, ts, and price (no bid/ask/volume)
-        row = {
-            "symbol": msg.get("symbol"),
-            "ts": dt.isoformat(),
-            "price": _to_float(msg.get("price")),
-        }
+    row = {
+        "symbol": msg.get("symbol"),
+        "ts": _to_ts(msg.get("timestamp")).isoformat(),
+        "price": _to_float(msg.get("price")),
+        "bid": _to_float(msg.get("bid")),
+        "ask": _to_float(msg.get("ask")),
+        # Try multiple common keys for volume
+        "day_volume": (
+            _to_float(msg.get("day_volume"))
+            or _to_float(msg.get("dayVolume"))
+            or _to_float(msg.get("volume"))
+        ),
+    }
 
-        # Skip if price is None
-        if row["price"] is None:
-            log.warning("Skipping tick with no price: %s", msg)
-            return
+    # Require at least symbol + price
+    if not row["symbol"] or row["price"] is None:
+        return
 
-        async with _batch_lock:
-            _batch.append(row)
-            if len(_batch) >= BATCH_MAX:
-                # flush without waiting for timer
-                asyncio.create_task(flush_batch())
-
-    elif msg.get("event") == "subscribe-status":
-        log.info("Subscribe status: %s", msg)
-    else:
-        log.debug("Other event: %s", msg)
-
-async def heartbeat(ws):
-    while not _stop.is_set():
-        await asyncio.sleep(10)
-        try:
-            await ws.send(json.dumps({"action": "heartbeat"}))
-        except Exception:
-            return  # connection will be re-established
+    async with lock:
+        batch.append(row)
+        if len(batch) >= BATCH_MAX:
+            await flush()
 
 async def run_once():
     async with websockets.connect(
-        WS_URL,
-        ping_interval=20,
-        ping_timeout=20,
-        max_queue=1000,
+        WS_URL, ping_interval=20, ping_timeout=20, max_queue=1000
     ) as ws:
-        # subscribe to symbols
+        # Subscribe to symbols
         await ws.send(
             json.dumps({"action": "subscribe", "params": {"symbols": SYMBOLS}})
         )
-        log.info("Subscribed to: %s", SYMBOLS)
+        log.info("🚀 Subscribed to: %s", SYMBOLS)
 
-        # start heartbeat
-        hb_task = asyncio.create_task(heartbeat(ws))
-
-        async for raw in ws:
-            try:
-                data = json.loads(raw)
-            except Exception:
-                log.warning("Non-JSON message: %s", raw)
-                continue
-            await handle_message(data)
-
-        hb_task.cancel()
+        flusher = asyncio.create_task(periodic_flush())
+        try:
+            async for raw in ws:
+                try:
+                    msg = json.loads(raw)
+                except Exception:
+                    continue
+                await handle_message(msg)
+        finally:
+            stop_event.set()
+            await flush()
+            flusher.cancel()
 
 async def main():
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, _stop.set)
-
-    # Periodic batch flusher
-    flusher = asyncio.create_task(periodic_flush())
-
-    # Reconnect loop with backoff
     backoff = 1
-    while not _stop.is_set():
+    while not stop_event.is_set():
         try:
             await run_once()
             backoff = 1
         except Exception as e:
-            log.warning("WS error: %s; reconnecting in %ss", e, backoff)
+            log.warning("⚠️ WS error: %s; reconnecting in %ss", e, backoff)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
 
-    await flush_batch()
-    flusher.cancel()
-
 if __name__ == "__main__":
     asyncio.run(main())
+
