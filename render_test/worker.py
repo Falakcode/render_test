@@ -146,7 +146,7 @@ def scrape_trading_economics():
         response = requests.get(url, headers=headers, timeout=30)
         response.raise_for_status()
         
-        soup = BeautifulSoup(response.content, 'lxml')
+        soup = BeautifulSoup(response.content, 'html.parser')
         events = []
         
         # Find the calendar table
