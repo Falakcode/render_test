@@ -143,8 +143,10 @@ def scrape_trading_economics():
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
         
+        log.info("🌐 Fetching Trading Economics calendar...")
         response = requests.get(url, headers=headers, timeout=30)
         response.raise_for_status()
+        log.info(f"✅ Got response: {response.status_code}, Content-Length: {len(response.content)}")
         
         soup = BeautifulSoup(response.content, 'html.parser')
         events = []
@@ -152,10 +154,30 @@ def scrape_trading_economics():
         # Find the calendar table
         table = soup.find('table', {'id': 'calendar'})
         if not table:
-            log.warning("⚠️ Could not find calendar table on Trading Economics")
-            return events
+            log.warning("⚠️ Could not find calendar table with id='calendar'")
+            # Try to find any table with class containing 'calendar'
+            table = soup.find('table', class_=lambda x: x and 'calendar' in x.lower())
+            if not table:
+                # Try to find the first large table on the page
+                tables = soup.find_all('table')
+                log.info(f"Found {len(tables)} tables on the page")
+                if tables and len(tables) > 0:
+                    table = tables[0]
+                    log.info("Using first table found")
+                else:
+                    log.error("❌ No tables found on Trading Economics page")
+                    return events
         
-        rows = table.find('tbody').find_all('tr')
+        tbody = table.find('tbody')
+        if not tbody:
+            log.warning("⚠️ No tbody found, trying to get rows directly from table")
+            rows = table.find_all('tr')
+        else:
+            rows = tbody.find_all('tr')
+        
+        if not rows:
+            log.error("❌ No rows found in table")
+            return events
         
         for row in rows:
             try:
@@ -359,4 +381,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
