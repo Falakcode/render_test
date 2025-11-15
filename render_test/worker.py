@@ -130,12 +130,11 @@ async def _handle(msg: dict):
         if len(_batch) >= BATCH_MAX:
             await _flush()
 
-# ────────────────────── ECONOMIC CALENDAR SCRAPER ────────────────────
-
+# ────────────────────── ECONOMIC CALENDAR SCRAPER ───────────────────
 def scrape_trading_economics():
     """
-    Scrape upcoming economic events from Trading Economics calendar.
-    Returns a list of event dictionaries.
+    Scrape economic calendar data from Trading Economics
+    Returns list of event dictionaries with proper UTC times
     """
     try:
         url = "https://tradingeconomics.com/calendar"
@@ -146,90 +145,98 @@ def scrape_trading_economics():
         log.info("🌐 Fetching Trading Economics calendar...")
         response = requests.get(url, headers=headers, timeout=30)
         response.raise_for_status()
-        log.info(f"✅ Got response: {response.status_code}, Content-Length: {len(response.content)}")
         
         soup = BeautifulSoup(response.content, 'html.parser')
-        events = []
         
         # Find the calendar table
         table = soup.find('table', {'id': 'calendar'})
         if not table:
-            log.warning("⚠️ Could not find calendar table with id='calendar'")
-            # Try to find any table with class containing 'calendar'
-            table = soup.find('table', class_=lambda x: x and 'calendar' in x.lower())
-            if not table:
-                # Try to find the first large table on the page
-                tables = soup.find_all('table')
-                log.info(f"Found {len(tables)} tables on the page")
-                if tables and len(tables) > 0:
-                    table = tables[0]
-                    log.info("Using first table found")
-                else:
-                    log.error("❌ No tables found on Trading Economics page")
-                    return events
+            log.error("❌ Could not find calendar table")
+            return []
         
-        tbody = table.find('tbody')
-        if not tbody:
-            log.warning("⚠️ No tbody found, trying to get rows directly from table")
-            rows = table.find_all('tr')
-        else:
-            rows = tbody.find_all('tr')
+        events = []
+        current_date = None
+        current_day = None
         
-        if not rows:
-            log.error("❌ No rows found in table")
-            return events
-        
-        for row in rows:
+        # Process all rows
+        for row in table.find_all('tr'):
+            # Check if this is a date header row
+            thead = row.find_parent('thead')
+            if thead and not row.find('td'):
+                # Skip hidden header copies
+                if 'hidden-head' in thead.get('class', []):
+                    continue
+                    
+                # This is a visible header row with the date
+                th = row.find('th')
+                if th:
+                    date_text = th.get_text(strip=True)
+                    try:
+                        date_obj = datetime.strptime(date_text, "%A %B %d %Y")
+                        current_date = date_obj.strftime("%Y-%m-%d")
+                        current_day = date_obj.strftime("%A")
+                    except:
+                        pass
+                continue
+            
+            # Check if this is a data row
+            cols = row.find_all('td')
+            if len(cols) < 7 or not current_date:
+                continue
+            
             try:
-                cols = row.find_all('td')
-                if len(cols) < 8:
+                # Column 0: Time (UTC)
+                time_str = cols[0].get_text(strip=True)
+                
+                # Column 3: Country code (2 letters)
+                country = cols[3].get_text(strip=True) if len(cols) > 3 else ""
+                
+                # Column 4: Event name
+                event = cols[4].get_text(strip=True) if len(cols) > 4 else ""
+                
+                # Column 5: Actual
+                actual_elem = cols[5].find('span', id='actual') if len(cols) > 5 else None
+                actual = actual_elem.get_text(strip=True) if actual_elem else ""
+                
+                # Column 6: Previous
+                previous_elem = cols[6].find('span', id='previous') if len(cols) > 6 else None
+                previous = previous_elem.get_text(strip=True) if previous_elem else ""
+                
+                # Column 7: Consensus
+                consensus_elem = cols[7].find(id='consensus') if len(cols) > 7 else None
+                consensus = consensus_elem.get_text(strip=True) if consensus_elem else ""
+                
+                # Forecast = consensus
+                forecast = consensus if consensus else ""
+                
+                # Get importance from event class in time column
+                importance = "Medium"
+                event_class = cols[0].find('span')
+                if event_class and event_class.get('class'):
+                    classes = ' '.join(event_class.get('class'))
+                    if 'event-3' in classes or 'event-2' in classes:
+                        importance = "High"
+                    elif 'event-0' in classes:
+                        importance = "Low"
+                
+                # Validate required fields
+                if not country or len(country) != 2:
+                    continue
+                if not event or len(event) < 3:
+                    continue
+                if not time_str:
                     continue
                 
-                # Extract data from columns
-                date_str = cols[0].get_text(strip=True)
-                time_str = cols[1].get_text(strip=True)
-                country = cols[2].find('a')['title'] if cols[2].find('a') else cols[2].get_text(strip=True)
-                event = cols[3].get_text(strip=True)
-                actual = cols[4].get_text(strip=True)
-                forecast = cols[5].get_text(strip=True)
-                previous = cols[6].get_text(strip=True)
-                
-                # Extract importance (usually in first column or as a class/icon)
-                importance = "Medium"  # Default
-                # Check for importance indicators in the row
-                if row.get('class'):
-                    row_classes = ' '.join(row.get('class', []))
-                    if 'high' in row_classes.lower() or 'calendar-important' in row_classes.lower():
-                        importance = "High"
-                    elif 'low' in row_classes.lower():
-                        importance = "Low"
-                # Also check for bull icons or stars in date column
-                date_col = cols[0]
-                bulls = date_col.find_all('i', class_='fa-star') or date_col.find_all('span', class_='bull')
-                if len(bulls) >= 3:
-                    importance = "High"
-                elif len(bulls) == 2:
-                    importance = "Medium"
-                elif len(bulls) == 1:
-                    importance = "Low"
-                
-                # Get day of week from date
-                try:
-                    event_date = datetime.strptime(date_str, "%Y-%m-%d")
-                    day = event_date.strftime("%A")
-                except:
-                    day = ""
-                
                 event_data = {
-                    'date': date_str,
-                    'day': day,
+                    'date': current_date,
+                    'day': current_day,
                     'time': time_str,
-                    'country': country,
+                    'country': country.upper(),
                     'event': event,
                     'actual': actual if actual else None,
                     'forecast': forecast if forecast else None,
                     'previous': previous if previous else None,
-                    'consensus': None,  # Trading Economics doesn't show consensus separately
+                    'consensus': consensus if consensus else None,
                     'importance': importance
                 }
                 
@@ -245,6 +252,20 @@ def scrape_trading_economics():
     except Exception as e:
         log.error(f"❌ Error scraping Trading Economics: {e}")
         return []
+
+─
+
+def scrape_trading_economics():
+    """
+    Scrape upcoming economic events from Trading Economics calendar.
+    Returns a list of event dictionaries.
+    """
+    try:
+        url = "https://tradingeconomics.com/calendar"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        
 
 def upsert_economic_events(events):
     """
