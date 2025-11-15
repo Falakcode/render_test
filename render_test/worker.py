@@ -10,7 +10,7 @@ import requests
 from bs4 import BeautifulSoup
 from supabase import create_client
 
-# ────────────────────────────── ENV ──────────────────────────────
+# ------------------------------ ENV ------------------------------
 TD_API_KEY   = os.environ["TWELVEDATA_API_KEY"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
@@ -29,7 +29,7 @@ WS_URL = f"wss://ws.twelvedata.com/v1/quotes/price?apikey={TD_API_KEY}"
 # Economic calendar scraping interval (in seconds)
 ECON_SCRAPE_INTERVAL = 3600  # Scrape every hour
 
-# ─────────────────────────── CLIENTS/LOG ─────────────────────────
+# --------------------------- CLIENTS/LOG -------------------------
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 logging.basicConfig(
@@ -38,7 +38,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("tick-stream")
 
-# ─────────────────────── BATCH / FLUSH SETTINGS ──────────────────
+# ----------------------- BATCH / FLUSH SETTINGS ------------------
 BATCH_MAX = 500           # flush when batch reaches this size
 BATCH_FLUSH_SECS = 2      # or after this many seconds pass
 
@@ -46,7 +46,7 @@ _batch = []
 _lock = asyncio.Lock()
 _stop = asyncio.Event()
 
-# ────────────────────────── HELPERS ──────────────────────────────
+# -------------------------- HELPERS ------------------------------
 def _to_float(x):
     try:
         return float(x) if x is not None else None
@@ -130,7 +130,7 @@ async def _handle(msg: dict):
         if len(_batch) >= BATCH_MAX:
             await _flush()
 
-# ────────────────────── ECONOMIC CALENDAR SCRAPER ───────────────────
+# ---------------------- ECONOMIC CALENDAR SCRAPER -------------------
 def scrape_trading_economics():
     """
     Scrape economic calendar data from Trading Economics
@@ -253,7 +253,6 @@ def scrape_trading_economics():
         log.error(f"❌ Error scraping Trading Economics: {e}")
         return []
 
-─
 
 def scrape_trading_economics():
     """
@@ -336,7 +335,7 @@ async def economic_calendar_task():
             log.error(f"❌ Error in economic calendar task: {e}")
             await asyncio.sleep(60)  # Wait 1 minute before retrying
 
-# ────────────────────── TICK STREAMING ──────────────────────
+# ---------------------- TICK STREAMING ----------------------
 
 async def _run_once():
     async with websockets.connect(
@@ -377,7 +376,7 @@ async def tick_streaming_task():
             await asyncio.sleep(backoff)
             backoff = min(60, backoff * 2)
 
-# ────────────────────── MAIN ──────────────────────
+# ---------------------- MAIN ----------------------
 
 async def main():
     """
