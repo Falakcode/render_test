@@ -254,18 +254,6 @@ def scrape_trading_economics():
         return []
 
 
-def scrape_trading_economics():
-    """
-    Scrape upcoming economic events from Trading Economics calendar.
-    Returns a list of event dictionaries.
-    """
-    try:
-        url = "https://tradingeconomics.com/calendar"
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        
-
 def upsert_economic_events(events):
     """
     Insert or update economic events in Supabase.
