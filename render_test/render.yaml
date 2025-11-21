@@ -1,17 +1,37 @@
 services:
+
   - type: worker
+
     name: td-tickdata
+
     runtime: python
+
     plan: starter
+
     region: frankfurt
+
     buildCommand: "pip install -r requirements.txt"
+
     startCommand: "python worker.py"
+
     envVars:
+
       - key: TWELVEDATA_API_KEY
-        sync: false         # set in Render Dashboard
+
+        sync: false
+
       - key: SUPABASE_URL
-        sync: false         # set in Render Dashboard
+
+        sync: false
+
       - key: SUPABASE_SERVICE_ROLE_KEY
-        sync: false         # set in Render Dashboard
-      - key: SUPABASE_TABLE  # optional; defaults to 'tickdata'
+
+        sync: false
+
+      - key: SUPABASE_TABLE
+
         value: tickdata
+
+      - key: ANTHROPIC_API_KEY
+
+        sync: false
