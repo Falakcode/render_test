@@ -1,45 +1,23 @@
 # Production Dependencies for Render.com Worker
-
 # Combines: Tick Streaming + Economic Calendar + Financial News Scraper
 
- 
-
 # WebSocket client for TwelveData streaming
-
 websockets==12.0
 
- 
-
 # HTTP requests for RSS feeds and web scraping
-
 requests==2.31.0
 
- 
-
 # HTML parsing for Trading Economics calendar
-
 beautifulsoup4==4.12.2
 
- 
-
-# Supabase database client
-
-supabase==2.3.4
-
- 
+# Supabase database client (UPDATED for Python 3.13 compatibility)
+supabase>=2.9.0
 
 # Claude AI for news classification
-
 anthropic==0.39.0
 
- 
-
 # RSS feed parsing
-
 feedparser==6.0.11
 
- 
-
 # Environment variables (for local testing)
-
 python-dotenv==1.0.0
