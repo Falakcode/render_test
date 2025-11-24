@@ -665,6 +665,65 @@ async def financial_news_task():
 
 # ==================== FRED MACRO DATA SCRAPER (NEW - TASK 4) ====================
 
+def fetch_fred_series_no_vintage(
+    series_id: str,
+    observation_start: str,
+    observation_end: str,
+    limit: Optional[int] = None
+) -> List[Dict]:
+    """
+    Fetch FRED data WITHOUT vintage constraints (gets latest revisions)
+    Used for backfill to avoid 400 errors from realtime parameters
+    """
+    if not FRED_API_KEY:
+        log.error("❌ FRED_API_KEY not set!")
+        return []
+    
+    url = f"{FRED_API_BASE}/series/observations"
+    params = {
+        'series_id': series_id,
+        'api_key': FRED_API_KEY,
+        'file_type': 'json',
+        'observation_start': observation_start,
+        'observation_end': observation_end,
+        'sort_order': 'desc'
+        # NO realtime parameters - gets latest revisions
+    }
+    
+    if limit:
+        params['limit'] = limit
+    
+    try:
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        
+        if 'observations' not in data:
+            log.warning(f"No observations found for {series_id}")
+            return []
+        
+        observations = [
+            {
+                'date': obs['date'], 
+                'value': obs['value']
+            }
+            for obs in data['observations']
+            if obs['value'] != '.'  # Filter out missing values
+        ]
+        
+        return observations
+    
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 400:
+            log.warning(f"⚠️ FRED API 400 error for {series_id} (likely no data available for requested dates)")
+        else:
+            log.error(f"Error fetching FRED series {series_id}: {e}")
+        return []
+    except Exception as e:
+        log.error(f"Error fetching FRED series {series_id}: {e}")
+        return []
+
+
 def fetch_fred_series(
     series_id: str,
     observation_start: Optional[str] = None,
@@ -887,21 +946,32 @@ async def backfill_historical_data():
     total_stored = 0
     loop = asyncio.get_event_loop()
     
+    # Use dates without realtime constraints for backfill
+    # End date = first day of current month (data is typically 1-2 months behind)
+    today = datetime.now()
+    observation_end = today.replace(day=1).strftime('%Y-%m-%d')  # First of this month
+    observation_start = (today - timedelta(days=365*5)).strftime('%Y-%m-%d')  # 5 years ago
+    today_vintage = today.strftime('%Y-%m-%d')
+    
     for indicator in indicators:
         log.info(f"⬇️  Fetching {indicator['indicator_name']} ({indicator['fred_code']})...")
         
+        # Fetch without vintage constraints (gets latest revisions)
         observations = await loop.run_in_executor(
             None,
-            fetch_fred_series,
+            fetch_fred_series_no_vintage,  # Use simplified version
             indicator['fred_code'],
-            (datetime.now() - timedelta(days=365*5)).strftime('%Y-%m-%d'),
-            datetime.now().strftime('%Y-%m-%d'),
-            None
+            observation_start,
+            observation_end
         )
         
         if not observations:
             log.warning(f"⚠️  No data found for {indicator['indicator_name']}")
             continue
+        
+        # Add vintage_date to all observations (today's date)
+        for obs in observations:
+            obs['vintage_date'] = today_vintage
         
         observations_with_changes = calculate_changes(observations, indicator['frequency'])
         
@@ -909,11 +979,12 @@ async def backfill_historical_data():
             None,
             store_observations,
             indicator,
-            observations_with_changes
+            observations_with_changes,
+            True  # is_initial = True for backfill
         )
         
         total_stored += stored
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.5)  # Rate limiting
     
     log.info(f"✅ Backfill complete! Stored {total_stored} total observations")
 
