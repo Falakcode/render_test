@@ -731,6 +731,12 @@ def fetch_fred_series(
         
         return observations
     
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 400:
+            log.warning(f"⚠️ FRED API 400 error for {series_id} (likely no data available for requested dates)")
+        else:
+            log.error(f"Error fetching FRED series {series_id}: {e}")
+        return []
     except Exception as e:
         log.error(f"Error fetching FRED series {series_id}: {e}")
         return []
@@ -927,6 +933,11 @@ def get_todays_macro_events() -> List[Dict]:
         matched_events = []
         for event in result.data:
             event_name = event.get('event', '').lower()
+            event_country = event.get('country', '')
+            
+            # FRED only has US data, skip non-US events
+            if event_country != 'US':
+                continue
             
             for indicator in indicators:
                 keywords = indicator.get('calendar_event_keywords', [])
