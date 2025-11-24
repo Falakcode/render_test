@@ -877,27 +877,48 @@ def get_latest_date_for_indicator(fred_code: str) -> Optional[str]:
 
 
 def store_observations(indicator: Dict, observations: List[Dict]) -> int:
-    """Store FRED observations in macro_indicators table with vintage tracking"""
+    """
+    Store FRED observations with 2-column vintage design:
+    - vintage_value/vintage_date: Original published value (frozen)
+    - actual_value/actual_date: Latest revised value (updated)
+    
+    For backfill: both vintage and actual are the same (today's revisions)
+    """
     if not observations:
         return 0
     
     rows = []
     for obs in observations:
         try:
+            value_float = float(obs['value'])
+            vintage_dt = obs.get('vintage_date')
+            
+            # Format the value
+            formatted = format_value(
+                obs['value'], 
+                indicator['unit'], 
+                indicator['display_format']
+            )
+            
+            # For backfill: vintage = actual (both same initially)
             row = {
                 'country': indicator['country'],
                 'indicator_name': indicator['indicator_name'],
                 'indicator_code': indicator['fred_code'],
                 'date': obs['date'],
-                'value': float(obs['value']),
-                'vintage_date': obs['vintage_date'],  # CRITICAL for backtesting!
-                'value_formatted': format_value(
-                    obs['value'], 
-                    indicator['unit'], 
-                    indicator['display_format']
-                ),
-                'change_mom': obs.get('change_mom'),
-                'change_yoy': obs.get('change_yoy'),
+                
+                # VINTAGE (frozen, original)
+                'vintage_value': value_float,
+                'vintage_date': vintage_dt,
+                'vintage_formatted': formatted,
+                'vintage_change_yoy': obs.get('change_yoy'),
+                
+                # ACTUAL (same as vintage for backfill)
+                'actual_value': value_float,
+                'actual_date': vintage_dt,
+                'actual_formatted': formatted,
+                'actual_change_yoy': obs.get('change_yoy'),
+                
                 'unit': indicator['unit'],
                 'frequency': indicator['frequency']
             }
@@ -910,12 +931,13 @@ def store_observations(indicator: Dict, observations: List[Dict]) -> int:
         return 0
     
     try:
+        # UPSERT based on indicator_code + date (one row per date)
         result = sb.table('macro_indicators').upsert(
             rows,
-            on_conflict='indicator_code,date,vintage_date'  # Updated for vintage support
+            on_conflict='indicator_code,date'  # One row per date
         ).execute()
         
-        inserted = len(result.data) if result.data else 0
+        inserted = len(rows)
         log.info(f"✅ Stored {inserted} observations for {indicator['indicator_name']}")
         return inserted
     
@@ -979,8 +1001,7 @@ async def backfill_historical_data():
             None,
             store_observations,
             indicator,
-            observations_with_changes,
-            True  # is_initial = True for backfill
+            observations_with_changes
         )
         
         total_stored += stored
