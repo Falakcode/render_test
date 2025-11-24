@@ -4,6 +4,7 @@ import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 from difflib import SequenceMatcher
+from typing import Optional, List, Dict
 
 import websockets
 import requests
@@ -17,6 +18,7 @@ TD_API_KEY   = os.environ["TWELVEDATA_API_KEY"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+FRED_API_KEY = os.environ.get("FRED_API_KEY")  # NEW!
 
 # Allow override, but default to the table you requested
 SUPABASE_TABLE = os.environ.get("SUPABASE_TABLE", "tickdata")
@@ -31,6 +33,9 @@ WS_URL = f"wss://ws.twelvedata.com/v1/quotes/price?apikey={TD_API_KEY}"
 
 # Economic calendar scraping interval (in seconds)
 ECON_SCRAPE_INTERVAL = 3600  # Scrape every hour
+
+# FRED API Base URL
+FRED_API_BASE = "https://api.stlouisfed.org/fred"
 
 # --------------------------- CLIENTS/LOG -------------------------
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -322,9 +327,8 @@ async def economic_calendar_task():
             log.error(f"❌ Error in economic calendar task: {e}")
             await asyncio.sleep(60)
 
-# ==================== FINANCIAL NEWS SCRAPER (WITH SMART SCHEDULING) ====================
+# ==================== FINANCIAL NEWS SCRAPER (UNCHANGED) ====================
 
-# RSS Feed Sources (ALL FREE!)
 RSS_FEEDS = [
     {"url": "http://feeds.bbci.co.uk/news/rss.xml", "name": "BBC News (Main)"},
     {"url": "http://feeds.bbci.co.uk/news/business/rss.xml", "name": "BBC News (Business)"},
@@ -343,7 +347,6 @@ RSS_FEEDS = [
     {"url": "https://www.aljazeera.com/xml/rss/all.xml", "name": "Al Jazeera"},
 ]
 
-# Pre-filtering keywords (saves Claude API costs)
 INCLUDE_KEYWORDS = [
     "war", "attack", "invasion", "military", "strike", "missile", "conflict", "terrorism", "coup",
     "trump", "biden", "election", "president", "prime minister", "government", "resign",
@@ -364,32 +367,19 @@ EXCLUDE_KEYWORDS = [
 ]
 
 def get_news_scan_interval():
-    """
-    Returns scan interval in seconds based on trading session
-    
-    - London/US sessions (active): 15 minutes
-    - Asian session (quiet): 30 minutes
-    - Weekend: 4 hours
-    """
     now = datetime.utcnow()
-    day_of_week = now.weekday()  # 0=Monday, 6=Sunday
+    day_of_week = now.weekday()
     hour_utc = now.hour
     
-    # Weekend (Saturday=5, Sunday=6)
     if day_of_week >= 5:
-        return 14400, "weekend"  # 4 hours
+        return 14400, "weekend"
     
-    # London session: 8:00-16:00 UTC (8am-4pm GMT)
-    # US session: 13:30-20:00 UTC (1:30pm-8pm EST = 18:30-01:00 UTC)
-    # Combined active hours: 8:00-20:00 UTC + 00:00-01:00 UTC
     if (8 <= hour_utc < 20) or (0 <= hour_utc < 1):
-        return 900, "active"  # 15 minutes
+        return 900, "active"
     
-    # Asian session and off-hours
-    return 1800, "quiet"  # 30 minutes
+    return 1800, "quiet"
 
 def should_prefilter_article(title: str, summary: str) -> bool:
-    """Pre-filter article by keywords BEFORE sending to Claude"""
     text = f"{title} {summary}".lower()
 
     for exclude_word in EXCLUDE_KEYWORDS:
@@ -405,30 +395,19 @@ def should_prefilter_article(title: str, summary: str) -> bool:
     return False
 
 def calculate_title_similarity(title1: str, title2: str) -> float:
-    """Calculate similarity between two titles (0.0 to 1.0)"""
     return SequenceMatcher(None, title1.lower(), title2.lower()).ratio()
 
 def optimize_articles_for_cost(articles: list) -> list:
-    """
-    Reduce costs by:
-    1. Only keeping articles with images
-    2. Removing similar/duplicate articles (75%+ similarity)
-    3. Limiting articles per category (STRICT limits)
-    
-    Expected reduction: 70-85% fewer articles to classify
-    """
     if not articles:
         return []
 
     log.info(f"💰 Cost optimization: Starting with {len(articles)} articles")
 
-    # Step 0: Filter out articles without images (NEW!)
     articles_with_images = [a for a in articles if a.get('image_url')]
     removed_no_images = len(articles) - len(articles_with_images)
     log.info(f"   Removed {removed_no_images} articles without images")
     log.info(f"   Remaining with images: {len(articles_with_images)}")
 
-    # Step 1: Remove similar articles (75%+ similarity)
     unique_articles = []
     seen_topics = []
 
@@ -436,7 +415,7 @@ def optimize_articles_for_cost(articles: list) -> list:
         is_duplicate = False
         for seen_title in seen_topics:
             similarity = calculate_title_similarity(article['title'], seen_title)
-            if similarity >= 0.75:  # 75% similar = duplicate (STRICTER!)
+            if similarity >= 0.75:
                 log.debug(f"   🔄 SIMILAR: {article['title'][:50]}... ({int(similarity*100)}% match)")
                 is_duplicate = True
                 break
@@ -448,7 +427,6 @@ def optimize_articles_for_cost(articles: list) -> list:
     removed_similar = len(articles_with_images) - len(unique_articles)
     log.info(f"   Removed {removed_similar} similar articles")
 
-    # Step 2: Apply category limits (MUCH STRICTER!)
     category_counts = {'crypto': 0, 'political': 0, 'central_bank': 0, 'market': 0}
     category_limits = {'crypto': 2, 'political': 2, 'central_bank': 2, 'market': 2}
 
@@ -461,7 +439,6 @@ def optimize_articles_for_cost(articles: list) -> list:
     for article in unique_articles:
         text = f"{article['title']} {article['summary']}".lower()
 
-        # Categorize
         category = None
         if any(kw in text for kw in crypto_kw):
             category = 'crypto'
@@ -472,7 +449,6 @@ def optimize_articles_for_cost(articles: list) -> list:
         elif any(kw in text for kw in market_kw):
             category = 'market'
 
-        # Check limit
         if category and category in category_limits:
             if category_counts[category] >= category_limits[category]:
                 log.debug(f"   🚫 LIMIT: {article['title'][:50]}... ({category} limit reached)")
@@ -493,7 +469,6 @@ def optimize_articles_for_cost(articles: list) -> list:
     return final_articles
 
 def fetch_rss_feed(feed_url: str, source_name: str) -> list:
-    """Fetch and parse RSS feed with error handling and image extraction"""
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (compatible; FinancialNewsBot/1.0)'}
         response = requests.get(feed_url, headers=headers, timeout=15)
@@ -520,25 +495,20 @@ def fetch_rss_feed(feed_url: str, source_name: str) -> list:
             if not title or not url:
                 continue
 
-            # Extract image URL from various RSS fields
             image_url = None
 
-            # Try media_content (most common)
             if hasattr(entry, 'media_content') and entry.media_content:
                 image_url = entry.media_content[0].get('url')
 
-            # Try media_thumbnail
             if not image_url and hasattr(entry, 'media_thumbnail') and entry.media_thumbnail:
                 image_url = entry.media_thumbnail[0].get('url')
 
-            # Try enclosures
             if not image_url and hasattr(entry, 'enclosures') and entry.enclosures:
                 for enclosure in entry.enclosures:
                     if enclosure.get('type', '').startswith('image/'):
                         image_url = enclosure.get('href') or enclosure.get('url')
                         break
 
-            # Try links array
             if not image_url and hasattr(entry, 'links'):
                 for link in entry.links:
                     if link.get('type', '').startswith('image/'):
@@ -561,7 +531,6 @@ def fetch_rss_feed(feed_url: str, source_name: str) -> list:
         return []
 
 def classify_article_with_claude(article: dict) -> dict:
-    """Send article to Claude Haiku for classification"""
     try:
         prompt = f"""You are a professional financial news analyst. Analyze this article and determine if it will impact financial markets.
 
@@ -600,7 +569,6 @@ Respond with ONLY a valid JSON object:
         return None
 
 def store_news_article(article: dict, classification: dict) -> bool:
-    """Store classified article in Supabase"""
     try:
         data = {
             'title': article['title'],
@@ -628,18 +596,15 @@ def store_news_article(article: dict, classification: dict) -> bool:
             return False
 
 async def financial_news_task():
-    """Periodically scrape and classify financial news with SMART SCHEDULING"""
     log.info("📰 Financial news scraper started (smart scheduling + cost optimization)")
 
     while not _stop.is_set():
         try:
-            # Get dynamic interval based on trading session
             interval, session_name = get_news_scan_interval()
             session_emoji = "🔥" if session_name == "active" else "😴" if session_name == "quiet" else "🌙"
             
             log.info(f"🔍 Starting news scan cycle ({session_emoji} {session_name} session)")
 
-            # Fetch from all RSS feeds
             all_articles = []
             loop = asyncio.get_event_loop()
 
@@ -650,7 +615,6 @@ async def financial_news_task():
 
             log.info(f"📊 Fetched {len(all_articles)} total articles")
 
-            # Deduplicate by URL
             seen_urls = set()
             unique_articles = []
             for article in all_articles:
@@ -660,7 +624,6 @@ async def financial_news_task():
 
             log.info(f"🔗 After deduplication: {len(unique_articles)} unique articles")
 
-            # Pre-filter by keywords
             filtered_articles = [
                 a for a in unique_articles
                 if should_prefilter_article(a['title'], a['summary'])
@@ -668,10 +631,8 @@ async def financial_news_task():
 
             log.info(f"🎯 After pre-filtering: {len(filtered_articles)} articles")
 
-            # COST OPTIMIZATION: Image filter + similarity + category limits
             filtered_articles = optimize_articles_for_cost(filtered_articles)
 
-            # Classify with Claude
             stored_count = 0
             classified_count = 0
 
@@ -682,7 +643,6 @@ async def financial_news_task():
                 if not classification:
                     continue
 
-                # Only store CRITICAL and HIGH impact (skip medium and low)
                 if not classification['is_important'] or classification['impact_level'] not in ['critical', 'high']:
                     continue
 
@@ -692,11 +652,10 @@ async def financial_news_task():
                 if await loop.run_in_executor(None, store_news_article, article, classification):
                     stored_count += 1
 
-                await asyncio.sleep(1)  # Rate limiting
+                await asyncio.sleep(1)
 
             log.info(f"✅ News cycle complete: {stored_count} stored, {classified_count} classified")
 
-            # Wait for next scrape interval (DYNAMIC!)
             log.info(f"😴 Next scan in {interval // 60} minutes ({session_emoji} {session_name} session)")
             await asyncio.sleep(interval)
 
@@ -704,27 +663,409 @@ async def financial_news_task():
             log.error(f"❌ Error in financial news task: {e}")
             await asyncio.sleep(60)
 
+# ==================== FRED MACRO DATA SCRAPER (NEW - TASK 4) ====================
+
+def fetch_fred_series(
+    series_id: str,
+    observation_start: Optional[str] = None,
+    observation_end: Optional[str] = None,
+    limit: Optional[int] = None,
+    vintage_date: Optional[str] = None
+) -> List[Dict]:
+    """
+    Fetch time series data from FRED API V2 with vintage support
+    
+    Args:
+        vintage_date: Date for vintage snapshot (YYYY-MM-DD)
+                     If None, gets latest revisions
+                     If set, gets data as it was known on that date
+    """
+    if not FRED_API_KEY:
+        log.error("❌ FRED_API_KEY not set!")
+        return []
+    
+    if not observation_start:
+        observation_start = (datetime.now() - timedelta(days=365*5)).strftime('%Y-%m-%d')
+    
+    if not observation_end:
+        observation_end = datetime.now().strftime('%Y-%m-%d')
+    
+    # Use today as vintage_date if not specified (for backfill)
+    if not vintage_date:
+        vintage_date = datetime.now().strftime('%Y-%m-%d')
+    
+    url = f"{FRED_API_BASE}/series/observations"
+    params = {
+        'series_id': series_id,
+        'api_key': FRED_API_KEY,
+        'file_type': 'json',
+        'observation_start': observation_start,
+        'observation_end': observation_end,
+        'sort_order': 'desc',
+        # Vintage parameters (as-of date)
+        'realtime_start': vintage_date,
+        'realtime_end': vintage_date
+    }
+    
+    if limit:
+        params['limit'] = limit
+    
+    try:
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        
+        if 'observations' not in data:
+            log.warning(f"No observations found for {series_id}")
+            return []
+        
+        observations = [
+            {
+                'date': obs['date'], 
+                'value': obs['value'],
+                'vintage_date': vintage_date  # Track when this snapshot was taken
+            }
+            for obs in data['observations']
+            if obs['value'] != '.'
+        ]
+        
+        return observations
+    
+    except Exception as e:
+        log.error(f"Error fetching FRED series {series_id}: {e}")
+        return []
+
+
+def calculate_changes(observations: List[Dict], frequency: str) -> List[Dict]:
+    """Calculate MoM%, QoQ%, and YoY% changes"""
+    sorted_obs = sorted(observations, key=lambda x: x['date'])
+    
+    for i, obs in enumerate(sorted_obs):
+        try:
+            current_value = float(obs['value'])
+            
+            if frequency == 'Monthly' and i > 0:
+                prev_value = float(sorted_obs[i-1]['value'])
+                obs['change_mom'] = ((current_value - prev_value) / prev_value) * 100
+            
+            if frequency == 'Quarterly' and i > 0:
+                prev_value = float(sorted_obs[i-1]['value'])
+                obs['change_qoq'] = ((current_value - prev_value) / prev_value) * 100
+            
+            if frequency == 'Monthly' and i >= 12:
+                year_ago_value = float(sorted_obs[i-12]['value'])
+                obs['change_yoy'] = ((current_value - year_ago_value) / year_ago_value) * 100
+            elif frequency == 'Quarterly' and i >= 4:
+                year_ago_value = float(sorted_obs[i-4]['value'])
+                obs['change_yoy'] = ((current_value - year_ago_value) / year_ago_value) * 100
+        
+        except (ValueError, ZeroDivisionError) as e:
+            log.warning(f"Error calculating changes for {obs['date']}: {e}")
+            continue
+    
+    return sorted_obs
+
+
+def format_value(value: float, unit: str, display_format: str) -> str:
+    """Format value for display"""
+    if display_format == 'YoY%' and 'change_yoy' in value:
+        return f"{value['change_yoy']:.1f}%"
+    elif display_format == 'MoM%' and 'change_mom' in value:
+        return f"{value['change_mom']:.1f}%"
+    elif display_format == 'QoQ%' and 'change_qoq' in value:
+        return f"{value['change_qoq']:.1f}%"
+    elif unit == 'Percent':
+        return f"{float(value):.2f}%"
+    elif unit == 'Billions of Dollars':
+        return f"${float(value)/1000:.2f}T"
+    elif unit == 'Millions of Dollars':
+        return f"${float(value)/1000:.2f}B"
+    elif unit == 'Thousands of Persons' or unit == 'Thousands of Units':
+        return f"{float(value):.0f}K"
+    else:
+        return f"{float(value):.2f}"
+
+
+def get_active_indicators() -> List[Dict]:
+    """Get all active macro indicators from metadata table"""
+    try:
+        result = sb.table('macro_indicator_metadata').select('*').eq('is_active', True).execute()
+        return result.data if result.data else []
+    except Exception as e:
+        log.error(f"Error fetching indicator metadata: {e}")
+        return []
+
+
+def get_latest_date_for_indicator(fred_code: str) -> Optional[str]:
+    """Get the most recent date we have data for a specific indicator"""
+    try:
+        result = sb.table('macro_indicators').select('date').eq(
+            'indicator_code', fred_code
+        ).order('date', desc=True).limit(1).execute()
+        
+        if result.data and len(result.data) > 0:
+            return result.data[0]['date']
+        return None
+    except Exception as e:
+        log.error(f"Error getting latest date for {fred_code}: {e}")
+        return None
+
+
+def store_observations(indicator: Dict, observations: List[Dict]) -> int:
+    """Store FRED observations in macro_indicators table with vintage tracking"""
+    if not observations:
+        return 0
+    
+    rows = []
+    for obs in observations:
+        try:
+            row = {
+                'country': indicator['country'],
+                'indicator_name': indicator['indicator_name'],
+                'indicator_code': indicator['fred_code'],
+                'date': obs['date'],
+                'value': float(obs['value']),
+                'vintage_date': obs['vintage_date'],  # CRITICAL for backtesting!
+                'value_formatted': format_value(
+                    obs['value'], 
+                    indicator['unit'], 
+                    indicator['display_format']
+                ),
+                'change_mom': obs.get('change_mom'),
+                'change_yoy': obs.get('change_yoy'),
+                'unit': indicator['unit'],
+                'frequency': indicator['frequency']
+            }
+            rows.append(row)
+        except Exception as e:
+            log.warning(f"Error preparing row for {obs['date']}: {e}")
+            continue
+    
+    if not rows:
+        return 0
+    
+    try:
+        result = sb.table('macro_indicators').upsert(
+            rows,
+            on_conflict='indicator_code,date,vintage_date'  # Updated for vintage support
+        ).execute()
+        
+        inserted = len(result.data) if result.data else 0
+        log.info(f"✅ Stored {inserted} observations for {indicator['indicator_name']}")
+        return inserted
+    
+    except Exception as e:
+        log.error(f"Error storing observations for {indicator['fred_code']}: {e}")
+        return 0
+
+
+async def backfill_historical_data():
+    """One-time backfill: Fetch last 5 years of data for all indicators"""
+    log.info("🔄 Starting historical data backfill (5 years)...")
+    
+    try:
+        result = sb.table('macro_indicators').select('id', count='exact').limit(1).execute()
+        if result.count and result.count > 0:
+            log.info("✅ Historical data already exists, skipping backfill")
+            return
+    except Exception as e:
+        log.warning(f"Could not check existing data: {e}")
+    
+    indicators = get_active_indicators()
+    if not indicators:
+        log.error("❌ No active indicators found in metadata table")
+        return
+    
+    log.info(f"📊 Backfilling {len(indicators)} indicators...")
+    
+    total_stored = 0
+    loop = asyncio.get_event_loop()
+    
+    for indicator in indicators:
+        log.info(f"⬇️  Fetching {indicator['indicator_name']} ({indicator['fred_code']})...")
+        
+        observations = await loop.run_in_executor(
+            None,
+            fetch_fred_series,
+            indicator['fred_code'],
+            (datetime.now() - timedelta(days=365*5)).strftime('%Y-%m-%d'),
+            datetime.now().strftime('%Y-%m-%d'),
+            None
+        )
+        
+        if not observations:
+            log.warning(f"⚠️  No data found for {indicator['indicator_name']}")
+            continue
+        
+        observations_with_changes = calculate_changes(observations, indicator['frequency'])
+        
+        stored = await loop.run_in_executor(
+            None,
+            store_observations,
+            indicator,
+            observations_with_changes
+        )
+        
+        total_stored += stored
+        await asyncio.sleep(0.5)
+    
+    log.info(f"✅ Backfill complete! Stored {total_stored} total observations")
+
+
+def get_todays_macro_events() -> List[Dict]:
+    """Get economic calendar events happening today that match FRED indicators"""
+    today = datetime.now().strftime('%Y-%m-%d')
+    
+    try:
+        result = sb.table('Economic_calander').select('*').eq('date', today).execute()
+        
+        if not result.data:
+            return []
+        
+        indicators = get_active_indicators()
+        
+        matched_events = []
+        for event in result.data:
+            event_name = event.get('event', '').lower()
+            
+            for indicator in indicators:
+                keywords = indicator.get('calendar_event_keywords', [])
+                if any(keyword.lower() in event_name for keyword in keywords):
+                    matched_events.append({
+                        'calendar_event': event,
+                        'indicator': indicator
+                    })
+                    break
+        
+        return matched_events
+    
+    except Exception as e:
+        log.error(f"Error getting today's macro events: {e}")
+        return []
+
+
+async def check_and_update_indicator(indicator: Dict, calendar_event: Dict):
+    """Check FRED for new data and update if available (with vintage tracking)"""
+    fred_code = indicator['fred_code']
+    
+    latest_date = get_latest_date_for_indicator(fred_code)
+    
+    observation_start = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+    today_vintage = datetime.now().strftime('%Y-%m-%d')  # Today's date as vintage
+    
+    loop = asyncio.get_event_loop()
+    observations = await loop.run_in_executor(
+        None,
+        fetch_fred_series,
+        fred_code,
+        observation_start,
+        datetime.now().strftime('%Y-%m-%d'),
+        None,
+        today_vintage  # Pass vintage date (new releases captured with today's date)
+    )
+    
+    if not observations:
+        log.info(f"📭 No new data yet for {indicator['indicator_name']}")
+        return
+    
+    latest_obs_date = observations[0]['date']
+    
+    if latest_date and latest_obs_date <= latest_date:
+        log.info(f"✅ Data for {indicator['indicator_name']} is up to date")
+        return
+    
+    log.info(f"🆕 NEW DATA: {indicator['indicator_name']} - {latest_obs_date} = {observations[0]['value']} (vintage: {today_vintage})")
+    
+    observations_with_changes = calculate_changes(observations, indicator['frequency'])
+    
+    stored = await loop.run_in_executor(
+        None,
+        store_observations,
+        indicator,
+        observations_with_changes
+    )
+    
+    if stored > 0:
+        try:
+            actual_value = format_value(
+                observations[0]['value'],
+                indicator['unit'],
+                indicator['display_format']
+            )
+            
+            sb.table('Economic_calander').update({
+                'actual': actual_value,
+                'fred_indicator_code': fred_code
+            }).eq('id', calendar_event['id']).execute()
+            
+            log.info(f"✅ Updated calendar: {indicator['indicator_name']} = {actual_value}")
+        except Exception as e:
+            log.warning(f"Could not update calendar: {e}")
+
+
+async def macro_data_task():
+    """
+    Event-driven macro data updater (TASK 4)
+    - Backfills historical data on first run
+    - Checks economic calendar for today's events every hour
+    - Fetches new data from FRED when scheduled
+    """
+    log.info("📅 Macro data event checker started")
+    
+    await backfill_historical_data()
+    
+    while not _stop.is_set():
+        try:
+            log.info("🔍 Checking economic calendar for today's macro events...")
+            
+            matched_events = get_todays_macro_events()
+            
+            if not matched_events:
+                log.info("📭 No macro events scheduled for today")
+            else:
+                log.info(f"📊 Found {len(matched_events)} macro events today")
+                
+                for event in matched_events:
+                    indicator = event['indicator']
+                    calendar_event = event['calendar_event']
+                    
+                    log.info(f"⏰ Checking {indicator['indicator_name']} (scheduled today)...")
+                    
+                    await check_and_update_indicator(indicator, calendar_event)
+                    
+                    await asyncio.sleep(1)
+            
+            log.info("😴 Next check in 1 hour...")
+            await asyncio.sleep(3600)
+        
+        except Exception as e:
+            log.error(f"❌ Error in macro data task: {e}")
+            await asyncio.sleep(300)
+
 # ====================== MAIN ======================
 
 async def main():
     """
-    Run all three tasks in parallel:
+    Run all FOUR tasks in parallel:
     1. Tick streaming (websockets)
     2. Economic calendar scraping
     3. Financial news scraping (with smart scheduling)
+    4. Macro data scraping (FRED API - event-driven)
     """
-    log.info("🚀 Starting worker with 3 parallel tasks:")
+    log.info("🚀 Starting worker with 4 parallel tasks:")
     log.info("   1️⃣ Tick streaming (TwelveData)")
     log.info("   2️⃣ Economic calendar (Trading Economics)")
     log.info("   3️⃣ Financial news (15 RSS feeds + smart scheduling)")
+    log.info("   4️⃣ Macro data (FRED API - US indicators)")
     log.info("   📅 Smart schedule: 15min (active) | 30min (quiet) | 4hr (weekend)")
 
     tick_task = asyncio.create_task(tick_streaming_task())
     econ_task = asyncio.create_task(economic_calendar_task())
     news_task = asyncio.create_task(financial_news_task())
+    macro_task = asyncio.create_task(macro_data_task())  # NEW!
 
     try:
-        await asyncio.gather(tick_task, econ_task, news_task)
+        await asyncio.gather(tick_task, econ_task, news_task, macro_task)
     except Exception as e:
         log.error(f"❌ Main loop error: {e}")
     finally:
@@ -732,6 +1073,7 @@ async def main():
         tick_task.cancel()
         econ_task.cancel()
         news_task.cancel()
+        macro_task.cancel()
 
 if __name__ == "__main__":
     asyncio.run(main())
