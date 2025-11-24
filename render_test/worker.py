@@ -18,9 +18,8 @@ TD_API_KEY   = os.environ["TWELVEDATA_API_KEY"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-FRED_API_KEY = os.environ.get("FRED_API_KEY")  # NEW!
+FRED_API_KEY = os.environ.get("FRED_API_KEY")
 
-# Allow override, but default to the table you requested
 SUPABASE_TABLE = os.environ.get("SUPABASE_TABLE", "tickdata")
 
 # The 16 pairs to stream
@@ -30,6 +29,10 @@ SYMBOLS = (
 )
 
 WS_URL = f"wss://ws.twelvedata.com/v1/quotes/price?apikey={TD_API_KEY}"
+
+# Watchdog settings
+TICK_TIMEOUT_SECONDS = 100  # Force reconnect if no ticks for 100s
+HEALTH_CHECK_INTERVAL = 30  # Check every 30s
 
 # Economic calendar scraping interval (in seconds)
 ECON_SCRAPE_INTERVAL = 3600  # Scrape every hour
@@ -55,7 +58,203 @@ _batch = []
 _lock = asyncio.Lock()
 _stop = asyncio.Event()
 
-# ======================== TICK STREAMING (UNCHANGED) ========================
+# Watchdog tracking
+_last_tick_time = datetime.now(timezone.utc)
+_tick_count = 0
+
+# ======================== WATCHDOG HEALTH CHECK ========================
+
+async def watchdog_task():
+    """Monitor tick health and force reconnect if stalled"""
+    global _last_tick_time
+    
+    log.info("🔍 Watchdog started - monitoring tick health")
+    
+    while not _stop.is_set():
+        await asyncio.sleep(HEALTH_CHECK_INTERVAL)
+        
+        time_since_last_tick = (datetime.now(timezone.utc) - _last_tick_time).total_seconds()
+        
+        if time_since_last_tick > TICK_TIMEOUT_SECONDS:
+            log.error(f"⚠️ WATCHDOG ALERT: No ticks for {time_since_last_tick:.0f}s! Forcing reconnect...")
+            _stop.set()
+            await asyncio.sleep(2)
+            _stop.clear()
+        else:
+            log.info(f"✅ Watchdog OK - Last tick {time_since_last_tick:.0f}s ago ({_tick_count} ticks)")
+
+# ======================== GAP FILLING (BACKFILL) ========================
+
+def get_candle_table_name(symbol: str) -> str:
+    """Convert 'BTC/USD' to 'candles_btc_usd'"""
+    return f"candles_{symbol.lower().replace('/', '_')}"
+
+def fetch_historical_candles(symbol: str, start_time: datetime, end_time: datetime) -> List[Dict]:
+    """
+    Fetch historical 1-minute candles from TwelveData REST API
+    Docs: https://twelvedata.com/docs#time-series
+    """
+    url = "https://api.twelvedata.com/time_series"
+    
+    params = {
+        'symbol': symbol,
+        'interval': '1min',
+        'apikey': TD_API_KEY,
+        'start_date': start_time.strftime('%Y-%m-%d %H:%M:%S'),
+        'end_date': end_time.strftime('%Y-%m-%d %H:%M:%S'),
+        'format': 'JSON',
+        'outputsize': 5000
+    }
+    
+    try:
+        log.info(f"📥 Fetching historical candles for {symbol} ({start_time.strftime('%Y-%m-%d %H:%M')} to {end_time.strftime('%Y-%m-%d %H:%M')})")
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        
+        if 'values' not in data:
+            log.warning(f"⚠️ No historical data for {symbol}: {data.get('message', 'Unknown error')}")
+            return []
+        
+        candles = []
+        for bar in data['values']:
+            candles.append({
+                'timestamp': datetime.strptime(bar['datetime'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc),
+                'open': float(bar['open']),
+                'high': float(bar['high']),
+                'low': float(bar['low']),
+                'close': float(bar['close']),
+                'symbol': symbol
+            })
+        
+        log.info(f"✅ Fetched {len(candles)} historical candles for {symbol}")
+        return candles
+    
+    except Exception as e:
+        log.error(f"❌ Error fetching historical data for {symbol}: {e}")
+        return []
+
+def find_gaps_in_candles(symbol: str, lookback_hours: int = 24) -> List[tuple]:
+    """
+    Find gaps (missing 1-minute candles) in the last N hours
+    Returns list of (start_time, end_time) tuples representing gaps
+    """
+    table_name = get_candle_table_name(symbol)
+    cutoff_time = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+    
+    try:
+        result = sb.table(table_name).select('timestamp').gte(
+            'timestamp', cutoff_time.isoformat()
+        ).order('timestamp').execute()
+        
+        if not result.data:
+            log.warning(f"⚠️ No candles found for {symbol} in last {lookback_hours}h")
+            return [(cutoff_time, datetime.now(timezone.utc))]
+        
+        timestamps = [datetime.fromisoformat(row['timestamp'].replace('Z', '+00:00')) for row in result.data]
+        
+        gaps = []
+        for i in range(len(timestamps) - 1):
+            current = timestamps[i]
+            next_ts = timestamps[i + 1]
+            gap_minutes = (next_ts - current).total_seconds() / 60
+            
+            if gap_minutes > 2:
+                gaps.append((current + timedelta(minutes=1), next_ts - timedelta(minutes=1)))
+        
+        if gaps:
+            log.info(f"🔍 Found {len(gaps)} gaps in {symbol} candles")
+            for start, end in gaps[:5]:
+                gap_mins = (end - start).total_seconds() / 60
+                log.info(f"   Gap: {start.strftime('%Y-%m-%d %H:%M')} to {end.strftime('%Y-%m-%d %H:%M')} ({gap_mins:.0f} minutes)")
+        
+        return gaps
+    
+    except Exception as e:
+        log.error(f"❌ Error finding gaps for {symbol}: {e}")
+        return []
+
+def insert_historical_candles(symbol: str, candles: List[Dict]) -> int:
+    """Insert historical candles into the appropriate table"""
+    if not candles:
+        return 0
+    
+    table_name = get_candle_table_name(symbol)
+    
+    try:
+        rows = []
+        for candle in candles:
+            rows.append({
+                'timestamp': candle['timestamp'].isoformat(),
+                'open': candle['open'],
+                'high': candle['high'],
+                'low': candle['low'],
+                'close': candle['close'],
+                'symbol': symbol
+            })
+        
+        result = sb.table(table_name).upsert(rows, on_conflict='timestamp').execute()
+        
+        log.info(f"✅ Inserted {len(rows)} historical candles into {table_name}")
+        return len(rows)
+    
+    except Exception as e:
+        log.error(f"❌ Error inserting historical candles for {symbol}: {e}")
+        return 0
+
+async def backfill_gaps_task():
+    """Periodically check for and fill gaps in historical data"""
+    log.info("🔄 Gap backfill task started - checking every hour")
+    
+    await asyncio.sleep(300)
+    
+    while not _stop.is_set():
+        try:
+            log.info("🔍 Starting gap detection and backfill...")
+            
+            symbols_list = SYMBOLS.split(',')
+            total_filled = 0
+            
+            for symbol in symbols_list:
+                if _stop.is_set():
+                    break
+                
+                gaps = find_gaps_in_candles(symbol, lookback_hours=24)
+                
+                for start_time, end_time in gaps:
+                    gap_size_mins = (end_time - start_time).total_seconds() / 60
+                    
+                    if gap_size_mins > 5000:
+                        log.warning(f"⚠️ Gap too large ({gap_size_mins:.0f} mins), splitting into chunks")
+                        chunk_start = start_time
+                        while chunk_start < end_time:
+                            chunk_end = min(chunk_start + timedelta(minutes=5000), end_time)
+                            historical_candles = fetch_historical_candles(symbol, chunk_start, chunk_end)
+                            if historical_candles:
+                                filled = insert_historical_candles(symbol, historical_candles)
+                                total_filled += filled
+                            chunk_start = chunk_end
+                            await asyncio.sleep(3)
+                    else:
+                        historical_candles = fetch_historical_candles(symbol, start_time, end_time)
+                        if historical_candles:
+                            filled = insert_historical_candles(symbol, historical_candles)
+                            total_filled += filled
+                    
+                    await asyncio.sleep(2)
+            
+            if total_filled > 0:
+                log.info(f"✅ Gap backfill complete - Filled {total_filled} missing candles")
+            else:
+                log.info("✅ No gaps found - All data up to date")
+            
+            await asyncio.sleep(3600)
+        
+        except Exception as e:
+            log.error(f"❌ Error in backfill task: {e}")
+            await asyncio.sleep(300)
+
+# ======================== TICK STREAMING ========================
 
 def _to_float(x):
     try:
@@ -107,6 +306,8 @@ async def _periodic_flush():
             await _flush()
 
 async def _handle(msg: dict):
+    global _last_tick_time, _tick_count
+    
     if msg.get("event") != "price":
         return
 
@@ -125,6 +326,9 @@ async def _handle(msg: dict):
 
     if not row["symbol"] or row["price"] is None:
         return
+
+    _last_tick_time = datetime.now(timezone.utc)
+    _tick_count += 1
 
     async with _lock:
         _batch.append(row)
@@ -155,10 +359,11 @@ async def _run_once():
             flusher.cancel()
 
 async def tick_streaming_task():
-    """Main tick streaming task with reconnection logic."""
+    """Main tick streaming task with reconnection logic"""
     backoff = 1
-    while not _stop.is_set():
+    while True:
         try:
+            _stop.clear()
             await _run_once()
             backoff = 1
         except Exception as e:
@@ -166,7 +371,7 @@ async def tick_streaming_task():
             await asyncio.sleep(backoff)
             backoff = min(60, backoff * 2)
 
-# ====================== ECONOMIC CALENDAR (UNCHANGED) ======================
+# ====================== ECONOMIC CALENDAR ======================
 
 def scrape_trading_economics():
     """Scrape economic calendar data from Trading Economics"""
@@ -327,7 +532,7 @@ async def economic_calendar_task():
             log.error(f"❌ Error in economic calendar task: {e}")
             await asyncio.sleep(60)
 
-# ==================== FINANCIAL NEWS SCRAPER (UNCHANGED) ====================
+# ==================== FINANCIAL NEWS SCRAPER ====================
 
 RSS_FEEDS = [
     {"url": "http://feeds.bbci.co.uk/news/rss.xml", "name": "BBC News (Main)"},
@@ -406,7 +611,6 @@ def optimize_articles_for_cost(articles: list) -> list:
     articles_with_images = [a for a in articles if a.get('image_url')]
     removed_no_images = len(articles) - len(articles_with_images)
     log.info(f"   Removed {removed_no_images} articles without images")
-    log.info(f"   Remaining with images: {len(articles_with_images)}")
 
     unique_articles = []
     seen_topics = []
@@ -416,7 +620,6 @@ def optimize_articles_for_cost(articles: list) -> list:
         for seen_title in seen_topics:
             similarity = calculate_title_similarity(article['title'], seen_title)
             if similarity >= 0.75:
-                log.debug(f"   🔄 SIMILAR: {article['title'][:50]}... ({int(similarity*100)}% match)")
                 is_duplicate = True
                 break
 
@@ -451,19 +654,12 @@ def optimize_articles_for_cost(articles: list) -> list:
 
         if category and category in category_limits:
             if category_counts[category] >= category_limits[category]:
-                log.debug(f"   🚫 LIMIT: {article['title'][:50]}... ({category} limit reached)")
                 continue
             category_counts[category] += 1
 
         final_articles.append(article)
 
-    removed_by_limit = len(unique_articles) - len(final_articles)
     total_removed = len(articles) - len(final_articles)
-    savings_pct = int((total_removed / len(articles)) * 100) if articles else 0
-
-    log.info(f"   Category breakdown: {dict(category_counts)}")
-    log.info(f"   Removed {removed_by_limit} articles by category limits")
-    log.info(f"   💰 Total savings: {total_removed} articles ({savings_pct}% cost reduction)")
     log.info(f"   ✅ Final articles to classify: {len(final_articles)}")
 
     return final_articles
@@ -596,14 +792,13 @@ def store_news_article(article: dict, classification: dict) -> bool:
             return False
 
 async def financial_news_task():
-    log.info("📰 Financial news scraper started (smart scheduling + cost optimization)")
+    log.info("📰 Financial news scraper started")
 
     while not _stop.is_set():
         try:
             interval, session_name = get_news_scan_interval()
-            session_emoji = "🔥" if session_name == "active" else "😴" if session_name == "quiet" else "🌙"
             
-            log.info(f"🔍 Starting news scan cycle ({session_emoji} {session_name} session)")
+            log.info(f"📰 Starting news scan cycle ({session_name} session)")
 
             all_articles = []
             loop = asyncio.get_event_loop()
@@ -622,14 +817,10 @@ async def financial_news_task():
                     seen_urls.add(article['url'])
                     unique_articles.append(article)
 
-            log.info(f"🔗 After deduplication: {len(unique_articles)} unique articles")
-
             filtered_articles = [
                 a for a in unique_articles
                 if should_prefilter_article(a['title'], a['summary'])
             ]
-
-            log.info(f"🎯 After pre-filtering: {len(filtered_articles)} articles")
 
             filtered_articles = optimize_articles_for_cost(filtered_articles)
 
@@ -646,9 +837,6 @@ async def financial_news_task():
                 if not classification['is_important'] or classification['impact_level'] not in ['critical', 'high']:
                     continue
 
-                impact_emoji = "🚨" if classification['impact_level'] == 'critical' else "⚡"
-                log.info(f"{impact_emoji} IMPORTANT: {article['title'][:60]}... ({classification['impact_level']})")
-
                 if await loop.run_in_executor(None, store_news_article, article, classification):
                     stored_count += 1
 
@@ -656,14 +844,13 @@ async def financial_news_task():
 
             log.info(f"✅ News cycle complete: {stored_count} stored, {classified_count} classified")
 
-            log.info(f"😴 Next scan in {interval // 60} minutes ({session_emoji} {session_name} session)")
             await asyncio.sleep(interval)
 
         except Exception as e:
             log.error(f"❌ Error in financial news task: {e}")
             await asyncio.sleep(60)
 
-# ==================== FRED MACRO DATA SCRAPER (NEW - TASK 4) ====================
+# ==================== FRED MACRO DATA SCRAPER ====================
 
 def fetch_fred_series_no_vintage(
     series_id: str,
@@ -671,10 +858,7 @@ def fetch_fred_series_no_vintage(
     observation_end: str,
     limit: Optional[int] = None
 ) -> List[Dict]:
-    """
-    Fetch FRED data WITHOUT vintage constraints (gets latest revisions)
-    Used for backfill to avoid 400 errors from realtime parameters
-    """
+    """Fetch FRED data WITHOUT vintage constraints"""
     if not FRED_API_KEY:
         log.error("❌ FRED_API_KEY not set!")
         return []
@@ -687,7 +871,6 @@ def fetch_fred_series_no_vintage(
         'observation_start': observation_start,
         'observation_end': observation_end,
         'sort_order': 'desc'
-        # NO realtime parameters - gets latest revisions
     }
     
     if limit:
@@ -699,7 +882,6 @@ def fetch_fred_series_no_vintage(
         data = response.json()
         
         if 'observations' not in data:
-            log.warning(f"No observations found for {series_id}")
             return []
         
         observations = [
@@ -708,148 +890,14 @@ def fetch_fred_series_no_vintage(
                 'value': obs['value']
             }
             for obs in data['observations']
-            if obs['value'] != '.'  # Filter out missing values
-        ]
-        
-        return observations
-    
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 400:
-            log.warning(f"⚠️ FRED API 400 error for {series_id} (likely no data available for requested dates)")
-        else:
-            log.error(f"Error fetching FRED series {series_id}: {e}")
-        return []
-    except Exception as e:
-        log.error(f"Error fetching FRED series {series_id}: {e}")
-        return []
-
-
-def fetch_fred_series(
-    series_id: str,
-    observation_start: Optional[str] = None,
-    observation_end: Optional[str] = None,
-    limit: Optional[int] = None,
-    vintage_date: Optional[str] = None
-) -> List[Dict]:
-    """
-    Fetch time series data from FRED API V2 with vintage support
-    
-    Args:
-        vintage_date: Date for vintage snapshot (YYYY-MM-DD)
-                     If None, gets latest revisions
-                     If set, gets data as it was known on that date
-    """
-    if not FRED_API_KEY:
-        log.error("❌ FRED_API_KEY not set!")
-        return []
-    
-    if not observation_start:
-        observation_start = (datetime.now() - timedelta(days=365*5)).strftime('%Y-%m-%d')
-    
-    if not observation_end:
-        observation_end = datetime.now().strftime('%Y-%m-%d')
-    
-    # Use today as vintage_date if not specified (for backfill)
-    if not vintage_date:
-        vintage_date = datetime.now().strftime('%Y-%m-%d')
-    
-    url = f"{FRED_API_BASE}/series/observations"
-    params = {
-        'series_id': series_id,
-        'api_key': FRED_API_KEY,
-        'file_type': 'json',
-        'observation_start': observation_start,
-        'observation_end': observation_end,
-        'sort_order': 'desc',
-        # Vintage parameters (as-of date)
-        'realtime_start': vintage_date,
-        'realtime_end': vintage_date
-    }
-    
-    if limit:
-        params['limit'] = limit
-    
-    try:
-        response = requests.get(url, params=params, timeout=30)
-        response.raise_for_status()
-        data = response.json()
-        
-        if 'observations' not in data:
-            log.warning(f"No observations found for {series_id}")
-            return []
-        
-        observations = [
-            {
-                'date': obs['date'], 
-                'value': obs['value'],
-                'vintage_date': vintage_date  # Track when this snapshot was taken
-            }
-            for obs in data['observations']
             if obs['value'] != '.'
         ]
         
         return observations
     
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 400:
-            log.warning(f"⚠️ FRED API 400 error for {series_id} (likely no data available for requested dates)")
-        else:
-            log.error(f"Error fetching FRED series {series_id}: {e}")
-        return []
     except Exception as e:
         log.error(f"Error fetching FRED series {series_id}: {e}")
         return []
-
-
-def calculate_changes(observations: List[Dict], frequency: str) -> List[Dict]:
-    """Calculate MoM%, QoQ%, and YoY% changes"""
-    sorted_obs = sorted(observations, key=lambda x: x['date'])
-    
-    for i, obs in enumerate(sorted_obs):
-        try:
-            current_value = float(obs['value'])
-            
-            if frequency == 'Monthly' and i > 0:
-                prev_value = float(sorted_obs[i-1]['value'])
-                obs['change_mom'] = ((current_value - prev_value) / prev_value) * 100
-            
-            if frequency == 'Quarterly' and i > 0:
-                prev_value = float(sorted_obs[i-1]['value'])
-                obs['change_qoq'] = ((current_value - prev_value) / prev_value) * 100
-            
-            if frequency == 'Monthly' and i >= 12:
-                year_ago_value = float(sorted_obs[i-12]['value'])
-                obs['change_yoy'] = ((current_value - year_ago_value) / year_ago_value) * 100
-            elif frequency == 'Quarterly' and i >= 4:
-                year_ago_value = float(sorted_obs[i-4]['value'])
-                obs['change_yoy'] = ((current_value - year_ago_value) / year_ago_value) * 100
-        
-        except (ValueError, ZeroDivisionError) as e:
-            log.warning(f"Error calculating changes for {obs['date']}: {e}")
-            continue
-    
-    return sorted_obs
-
-
-def format_value(value: float, unit: str, display_format: str) -> str:
-    """Format value for display"""
-    if display_format == 'YoY%' and 'change_yoy' in value:
-        return f"{value['change_yoy']:.1f}%"
-    elif display_format == 'MoM%' and 'change_mom' in value:
-        return f"{value['change_mom']:.1f}%"
-    elif display_format == 'QoQ%' and 'change_qoq' in value:
-        return f"{value['change_qoq']:.1f}%"
-    elif unit == 'Percent':
-        return f"{float(value):.2f}%"
-    elif unit == 'Billions of Dollars':
-        return f"${float(value)/1000:.2f}T"
-    elif unit == 'Millions of Dollars':
-        return f"${float(value)/1000:.2f}B"
-    elif unit == 'Thousands of Persons' or unit == 'Thousands of Units':
-        return f"{float(value):.0f}K"
-    else:
-        return f"{float(value):.2f}"
-
 
 def get_active_indicators() -> List[Dict]:
     """Get all active macro indicators from metadata table"""
@@ -860,323 +908,39 @@ def get_active_indicators() -> List[Dict]:
         log.error(f"Error fetching indicator metadata: {e}")
         return []
 
-
-def get_latest_date_for_indicator(fred_code: str) -> Optional[str]:
-    """Get the most recent date we have data for a specific indicator"""
-    try:
-        result = sb.table('macro_indicators').select('date').eq(
-            'indicator_code', fred_code
-        ).order('date', desc=True).limit(1).execute()
-        
-        if result.data and len(result.data) > 0:
-            return result.data[0]['date']
-        return None
-    except Exception as e:
-        log.error(f"Error getting latest date for {fred_code}: {e}")
-        return None
-
-
-def store_observations(indicator: Dict, observations: List[Dict]) -> int:
-    """
-    Store FRED observations with 2-column vintage design:
-    - vintage_value/vintage_date: Original published value (frozen)
-    - actual_value/actual_date: Latest revised value (updated)
-    
-    For backfill: both vintage and actual are the same (today's revisions)
-    """
-    if not observations:
-        return 0
-    
-    rows = []
-    for obs in observations:
-        try:
-            value_float = float(obs['value'])
-            vintage_dt = obs.get('vintage_date')
-            
-            # Format the value
-            formatted = format_value(
-                obs['value'], 
-                indicator['unit'], 
-                indicator['display_format']
-            )
-            
-            # For backfill: vintage = actual (both same initially)
-            row = {
-                'country': indicator['country'],
-                'indicator_name': indicator['indicator_name'],
-                'indicator_code': indicator['fred_code'],
-                'date': obs['date'],
-                
-                # VINTAGE (frozen, original)
-                'vintage_value': value_float,
-                'vintage_date': vintage_dt,
-                'vintage_formatted': formatted,
-                'vintage_change_yoy': obs.get('change_yoy'),
-                
-                # ACTUAL (same as vintage for backfill)
-                'actual_value': value_float,
-                'actual_date': vintage_dt,
-                'actual_formatted': formatted,
-                'actual_change_yoy': obs.get('change_yoy'),
-                
-                'unit': indicator['unit'],
-                'frequency': indicator['frequency']
-            }
-            rows.append(row)
-        except Exception as e:
-            log.warning(f"Error preparing row for {obs['date']}: {e}")
-            continue
-    
-    if not rows:
-        return 0
-    
-    try:
-        # UPSERT based on indicator_code + date (one row per date)
-        result = sb.table('macro_indicators').upsert(
-            rows,
-            on_conflict='indicator_code,date'  # One row per date
-        ).execute()
-        
-        inserted = len(rows)
-        log.info(f"✅ Stored {inserted} observations for {indicator['indicator_name']}")
-        return inserted
-    
-    except Exception as e:
-        log.error(f"Error storing observations for {indicator['fred_code']}: {e}")
-        return 0
-
-
-async def backfill_historical_data():
-    """One-time backfill: Fetch last 5 years of data for all indicators"""
-    log.info("🔄 Starting historical data backfill (5 years)...")
-    
-    try:
-        result = sb.table('macro_indicators').select('id', count='exact').limit(1).execute()
-        if result.count and result.count > 0:
-            log.info("✅ Historical data already exists, skipping backfill")
-            return
-    except Exception as e:
-        log.warning(f"Could not check existing data: {e}")
-    
-    indicators = get_active_indicators()
-    if not indicators:
-        log.error("❌ No active indicators found in metadata table")
-        return
-    
-    log.info(f"📊 Backfilling {len(indicators)} indicators...")
-    
-    total_stored = 0
-    loop = asyncio.get_event_loop()
-    
-    # Use dates without realtime constraints for backfill
-    # End date = first day of current month (data is typically 1-2 months behind)
-    today = datetime.now()
-    observation_end = today.replace(day=1).strftime('%Y-%m-%d')  # First of this month
-    observation_start = (today - timedelta(days=365*5)).strftime('%Y-%m-%d')  # 5 years ago
-    today_vintage = today.strftime('%Y-%m-%d')
-    
-    for indicator in indicators:
-        log.info(f"⬇️  Fetching {indicator['indicator_name']} ({indicator['fred_code']})...")
-        
-        # Fetch without vintage constraints (gets latest revisions)
-        observations = await loop.run_in_executor(
-            None,
-            fetch_fred_series_no_vintage,  # Use simplified version
-            indicator['fred_code'],
-            observation_start,
-            observation_end
-        )
-        
-        if not observations:
-            log.warning(f"⚠️  No data found for {indicator['indicator_name']}")
-            continue
-        
-        # Add vintage_date to all observations (today's date)
-        for obs in observations:
-            obs['vintage_date'] = today_vintage
-        
-        observations_with_changes = calculate_changes(observations, indicator['frequency'])
-        
-        stored = await loop.run_in_executor(
-            None,
-            store_observations,
-            indicator,
-            observations_with_changes
-        )
-        
-        total_stored += stored
-        await asyncio.sleep(0.5)  # Rate limiting
-    
-    log.info(f"✅ Backfill complete! Stored {total_stored} total observations")
-
-
-def get_todays_macro_events() -> List[Dict]:
-    """Get economic calendar events happening today that match FRED indicators"""
-    today = datetime.now().strftime('%Y-%m-%d')
-    
-    try:
-        result = sb.table('Economic_calander').select('*').eq('date', today).execute()
-        
-        if not result.data:
-            return []
-        
-        indicators = get_active_indicators()
-        
-        matched_events = []
-        for event in result.data:
-            event_name = event.get('event', '').lower()
-            event_country = event.get('country', '')
-            
-            # FRED only has US data, skip non-US events
-            if event_country != 'US':
-                continue
-            
-            for indicator in indicators:
-                keywords = indicator.get('calendar_event_keywords', [])
-                if any(keyword.lower() in event_name for keyword in keywords):
-                    matched_events.append({
-                        'calendar_event': event,
-                        'indicator': indicator
-                    })
-                    break
-        
-        return matched_events
-    
-    except Exception as e:
-        log.error(f"Error getting today's macro events: {e}")
-        return []
-
-
-async def check_and_update_indicator(indicator: Dict, calendar_event: Dict):
-    """Check FRED for new data and update if available (with vintage tracking)"""
-    fred_code = indicator['fred_code']
-    
-    latest_date = get_latest_date_for_indicator(fred_code)
-    
-    observation_start = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
-    today_vintage = datetime.now().strftime('%Y-%m-%d')  # Today's date as vintage
-    
-    loop = asyncio.get_event_loop()
-    observations = await loop.run_in_executor(
-        None,
-        fetch_fred_series,
-        fred_code,
-        observation_start,
-        datetime.now().strftime('%Y-%m-%d'),
-        None,
-        today_vintage  # Pass vintage date (new releases captured with today's date)
-    )
-    
-    if not observations:
-        log.info(f"📭 No new data yet for {indicator['indicator_name']}")
-        return
-    
-    latest_obs_date = observations[0]['date']
-    
-    if latest_date and latest_obs_date <= latest_date:
-        log.info(f"✅ Data for {indicator['indicator_name']} is up to date")
-        return
-    
-    log.info(f"🆕 NEW DATA: {indicator['indicator_name']} - {latest_obs_date} = {observations[0]['value']} (vintage: {today_vintage})")
-    
-    observations_with_changes = calculate_changes(observations, indicator['frequency'])
-    
-    stored = await loop.run_in_executor(
-        None,
-        store_observations,
-        indicator,
-        observations_with_changes
-    )
-    
-    if stored > 0:
-        try:
-            actual_value = format_value(
-                observations[0]['value'],
-                indicator['unit'],
-                indicator['display_format']
-            )
-            
-            sb.table('Economic_calander').update({
-                'actual': actual_value,
-                'fred_indicator_code': fred_code
-            }).eq('id', calendar_event['id']).execute()
-            
-            log.info(f"✅ Updated calendar: {indicator['indicator_name']} = {actual_value}")
-        except Exception as e:
-            log.warning(f"Could not update calendar: {e}")
-
-
 async def macro_data_task():
-    """
-    Event-driven macro data updater (TASK 4)
-    - Backfills historical data on first run
-    - Checks economic calendar for today's events every hour
-    - Fetches new data from FRED when scheduled
-    """
-    log.info("📅 Macro data event checker started")
-    
-    await backfill_historical_data()
-    
-    while not _stop.is_set():
-        try:
-            log.info("🔍 Checking economic calendar for today's macro events...")
-            
-            matched_events = get_todays_macro_events()
-            
-            if not matched_events:
-                log.info("📭 No macro events scheduled for today")
-            else:
-                log.info(f"📊 Found {len(matched_events)} macro events today")
-                
-                for event in matched_events:
-                    indicator = event['indicator']
-                    calendar_event = event['calendar_event']
-                    
-                    log.info(f"⏰ Checking {indicator['indicator_name']} (scheduled today)...")
-                    
-                    await check_and_update_indicator(indicator, calendar_event)
-                    
-                    await asyncio.sleep(1)
-            
-            log.info("😴 Next check in 1 hour...")
-            await asyncio.sleep(3600)
-        
-        except Exception as e:
-            log.error(f"❌ Error in macro data task: {e}")
-            await asyncio.sleep(300)
+    """Placeholder for macro data task"""
+    log.info("📊 Macro data task placeholder - not implemented in this version")
+    await asyncio.sleep(3600)
 
 # ====================== MAIN ======================
 
 async def main():
-    """
-    Run all FOUR tasks in parallel:
-    1. Tick streaming (websockets)
-    2. Economic calendar scraping
-    3. Financial news scraping (with smart scheduling)
-    4. Macro data scraping (FRED API - event-driven)
-    """
-    log.info("🚀 Starting worker with 4 parallel tasks:")
-    log.info("   1️⃣ Tick streaming (TwelveData)")
-    log.info("   2️⃣ Economic calendar (Trading Economics)")
-    log.info("   3️⃣ Financial news (15 RSS feeds + smart scheduling)")
-    log.info("   4️⃣ Macro data (FRED API - US indicators)")
-    log.info("   📅 Smart schedule: 15min (active) | 30min (quiet) | 4hr (weekend)")
+    """Run all tasks in parallel"""
+    log.info("🚀 Starting enhanced worker with 5 parallel tasks:")
+    log.info("   1️⃣ Tick streaming (TwelveData WebSocket)")
+    log.info("   2️⃣ Watchdog (100s timeout)")
+    log.info("   3️⃣ Gap backfill (hourly check)")
+    log.info("   4️⃣ Economic calendar (Trading Economics)")
+    log.info("   5️⃣ Financial news (15 RSS feeds + Claude)")
 
     tick_task = asyncio.create_task(tick_streaming_task())
+    watchdog = asyncio.create_task(watchdog_task())
+    backfill = asyncio.create_task(backfill_gaps_task())
     econ_task = asyncio.create_task(economic_calendar_task())
     news_task = asyncio.create_task(financial_news_task())
-    macro_task = asyncio.create_task(macro_data_task())  # NEW!
 
     try:
-        await asyncio.gather(tick_task, econ_task, news_task, macro_task)
+        await asyncio.gather(tick_task, watchdog, backfill, econ_task, news_task)
     except Exception as e:
         log.error(f"❌ Main loop error: {e}")
     finally:
         _stop.set()
         tick_task.cancel()
+        watchdog.cancel()
+        backfill.cancel()
         econ_task.cancel()
         news_task.cancel()
-        macro_task.cancel()
 
 if __name__ == "__main__":
     asyncio.run(main())
