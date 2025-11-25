@@ -1,19 +1,12 @@
-services:
-  - type: worker
-    name: td-tickdata
-    runtime: python
-    plan: starter
-    region: frankfurt
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "python worker.py"
-    envVars:
-      - key: TWELVEDATA_API_KEY
-        sync: false
-      - key: SUPABASE_URL
-        sync: false
-      - key: SUPABASE_SERVICE_ROLE_KEY
-        sync: false
-      - key: SUPABASE_TABLE
-        value: tickdata
-      - key: ANTHROPIC_API_KEY
-        sync: false
+envVars:
+  - key: TWELVEDATA_API_KEY
+    sync: false
+  - key: SUPABASE_URL
+    sync: false
+  - key: SUPABASE_SERVICE_ROLE_KEY
+    sync: false
+  - key: SUPABASE_TABLE
+    value: tickdata
+  - key: DEEPSEEK_API_KEY
+    sync: false
+  # REMOVED: FRED_API_KEY no longer needed
