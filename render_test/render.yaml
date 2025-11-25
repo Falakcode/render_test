@@ -1,12 +1,32 @@
-envVars:
-  - key: TWELVEDATA_API_KEY
-    sync: false
-  - key: SUPABASE_URL
-    sync: false
-  - key: SUPABASE_SERVICE_ROLE_KEY
-    sync: false
-  - key: SUPABASE_TABLE
-    value: tickdata
-  - key: DEEPSEEK_API_KEY
-    sync: false
-  # REMOVED: FRED_API_KEY no longer needed
+# =============================================================================
+# TOKEN CHARTED - RENDER DEPLOYMENT CONFIG
+# =============================================================================
+# Bulletproof production deployment with health checks
+# =============================================================================
+
+services:
+  - type: web  # Changed from 'worker' to 'web' to enable health checks
+    name: td-tickdata
+    runtime: python
+    plan: starter
+    region: frankfurt
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python worker.py"
+    
+    # Health check configuration (prevents Render from sleeping)
+    healthCheckPath: /health
+    
+    # Environment variables
+    envVars:
+      - key: TWELVEDATA_API_KEY
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_TABLE
+        value: tickdata
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: PORT
+        value: 10000  # Render's default port
