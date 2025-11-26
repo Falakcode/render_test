@@ -25,15 +25,13 @@ FRED_API_KEY = os.environ.get("FRED_API_KEY")
 SUPABASE_TABLE = os.environ.get("SUPABASE_TABLE", "tickdata")
 
 # The 16 pairs to stream
-# The 16 pairs to stream
 SYMBOLS = (
     "BTC/USD,ETH/USD,XRP/USD,XMR/USD,SOL/USD,BNB/USD,ADA/USD,DOGE/USD,"
     "XAU/USD,EUR/USD,GBP/USD,USD/CAD,GBP/AUD,AUD/CAD,EUR/GBP,USD/JPY"
 )
 
-# Request maximum precision from TwelveData (8 decimal places)
-# This ensures we get full precision for forex (5dp) and small crypto (8dp)
-WS_URL = f"wss://ws.twelvedata.com/v1/quotes/price?apikey={TD_API_KEY}&dp=8"
+# WebSocket URL - dp parameter will be in subscribe message
+WS_URL = f"wss://ws.twelvedata.com/v1/quotes/price?apikey={TD_API_KEY}"
 
 # Economic calendar scraping interval (in seconds)
 ECON_SCRAPE_INTERVAL = 3600  # Scrape every hour
@@ -232,7 +230,7 @@ async def _handle(msg: dict):
 
     # Debug logging for forex pairs to verify precision
     if symbol in FOREX_PAIRS and raw_price:
-        log.debug(f"📊 {symbol}: raw={raw_price} -> formatted={formatted_price} (5dp)")
+        log.info(f"📊 {symbol}: raw={raw_price} -> formatted={formatted_price} (5dp target)")
 
     async with _lock:
         _batch.append(row)
@@ -246,8 +244,17 @@ async def _run_once():
         ping_timeout=20,
         max_queue=1000,
     ) as ws:
-        await ws.send(json.dumps({"action": "subscribe", "params": {"symbols": SYMBOLS}}))
+        # Subscribe with dp=8 parameter for maximum precision (CRITICAL FIX!)
+        subscribe_msg = {
+            "action": "subscribe",
+            "params": {
+                "symbols": SYMBOLS,
+                "dp": 8  # Request 8 decimal places from TwelveData
+            }
+        }
+        await ws.send(json.dumps(subscribe_msg))
         log.info("🚀 Subscribed to: %s", SYMBOLS)
+        log.info("📐 PRECISION REQUEST: dp=8 from TwelveData WebSocket")
         log.info("📐 Precision settings: Forex=5dp, JPY=3dp, Crypto>=1=2dp, Crypto<1=5dp")
 
         flusher = asyncio.create_task(_periodic_flush())
@@ -1174,11 +1181,11 @@ async def macro_data_task():
 
 async def main():
     log.info("🚀 Starting worker with 4 parallel tasks:")
-    log.info("   1️⃣ Tick streaming (TwelveData) - Forex=5dp, Crypto=dynamic")
+    log.info("   1️⃣ Tick streaming (TwelveData WebSocket) - WITH dp=8 REQUEST")
     log.info("   2️⃣ Economic calendar (Trading Economics)")
     log.info("   3️⃣ Financial news (15 RSS feeds + smart scheduling)")
     log.info("   4️⃣ Macro data (FRED API - US indicators)")
-    log.info("   📐 Precision: Forex=5dp | JPY=3dp | Crypto>=$1=2dp | Crypto<$1=5dp")
+    log.info("   📐 Precision target: Forex=5dp | JPY=3dp | Crypto>=$1=2dp | Crypto<$1=5dp")
 
     tick_task = asyncio.create_task(tick_streaming_task())
     econ_task = asyncio.create_task(economic_calendar_task())
