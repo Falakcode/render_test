@@ -895,10 +895,9 @@ def detect_gaps(symbol: str, lookback_hours: int = MAX_GAP_HOURS) -> List[tuple]
 def fetch_candles_rest(symbol: str, start_date: datetime, end_date: datetime) -> List[Dict]:
     """Fetch historical candles from TwelveData REST API."""
     try:
-        td_symbol = symbol.replace("/", "")
-        
+        # TwelveData REST API uses symbol WITH slash: BTC/USD, EUR/USD, XAU/USD
         params = {
-            "symbol": td_symbol,
+            "symbol": symbol,
             "interval": "1min",
             "start_date": start_date.strftime("%Y-%m-%d %H:%M:%S"),
             "end_date": end_date.strftime("%Y-%m-%d %H:%M:%S"),
