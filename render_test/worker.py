@@ -25,12 +25,15 @@ FRED_API_KEY = os.environ.get("FRED_API_KEY")
 SUPABASE_TABLE = os.environ.get("SUPABASE_TABLE", "tickdata")
 
 # The 16 pairs to stream
+# The 16 pairs to stream
 SYMBOLS = (
     "BTC/USD,ETH/USD,XRP/USD,XMR/USD,SOL/USD,BNB/USD,ADA/USD,DOGE/USD,"
     "XAU/USD,EUR/USD,GBP/USD,USD/CAD,GBP/AUD,AUD/CAD,EUR/GBP,USD/JPY"
 )
 
-WS_URL = f"wss://ws.twelvedata.com/v1/quotes/price?apikey={TD_API_KEY}"
+# Request maximum precision from TwelveData (8 decimal places)
+# This ensures we get full precision for forex (5dp) and small crypto (8dp)
+WS_URL = f"wss://ws.twelvedata.com/v1/quotes/price?apikey={TD_API_KEY}&dp=8"
 
 # Economic calendar scraping interval (in seconds)
 ECON_SCRAPE_INTERVAL = 3600  # Scrape every hour
