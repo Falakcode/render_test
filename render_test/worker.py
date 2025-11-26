@@ -838,6 +838,221 @@ async def financial_news_task():
             await asyncio.sleep(60)
 
 
+# ==================== GAP DETECTION AND BACKFILL ====================
+
+# TwelveData REST API for backfill
+TD_REST_URL = "https://api.twelvedata.com/time_series"
+GAP_SCAN_INTERVAL = 300      # Scan every 5 minutes
+MAX_GAP_HOURS = 24           # Look back 24 hours
+MIN_GAP_MINUTES = 2          # Minimum gap to trigger backfill
+BACKFILL_RATE_LIMIT = 1.2    # Seconds between API calls
+
+ALL_SYMBOLS = [
+    "BTC/USD", "ETH/USD", "XRP/USD", "XMR/USD", "SOL/USD", "BNB/USD", "ADA/USD", "DOGE/USD",
+    "XAU/USD", "EUR/USD", "GBP/USD", "USD/CAD", "GBP/AUD", "AUD/CAD", "EUR/GBP", "USD/JPY"
+]
+
+
+def symbol_to_table(symbol: str) -> str:
+    """Convert symbol to table name: BTC/USD -> candles_btc_usd"""
+    return f"candles_{symbol.lower().replace('/', '_')}"
+
+
+def detect_gaps(symbol: str, lookback_hours: int = MAX_GAP_HOURS) -> List[tuple]:
+    """Detect gaps in candle data for a symbol."""
+    table_name = symbol_to_table(symbol)
+    
+    try:
+        since = (datetime.now(timezone.utc) - timedelta(hours=lookback_hours)).isoformat()
+        
+        result = sb.table(table_name).select('timestamp').gte(
+            'timestamp', since
+        ).order('timestamp', desc=False).execute()
+        
+        if not result.data or len(result.data) < 2:
+            return []
+        
+        gaps = []
+        timestamps = [datetime.fromisoformat(r['timestamp'].replace('Z', '+00:00')) for r in result.data]
+        
+        for i in range(1, len(timestamps)):
+            prev_ts = timestamps[i - 1]
+            curr_ts = timestamps[i]
+            gap_minutes = (curr_ts - prev_ts).total_seconds() / 60
+            
+            if gap_minutes > MIN_GAP_MINUTES:
+                gap_start = prev_ts + timedelta(minutes=1)
+                gap_end = curr_ts - timedelta(minutes=1)
+                gaps.append((gap_start, gap_end))
+                
+        return gaps
+        
+    except Exception as e:
+        log.error(f"❌ Error detecting gaps for {symbol}: {e}")
+        return []
+
+
+def fetch_candles_rest(symbol: str, start_date: datetime, end_date: datetime) -> List[Dict]:
+    """Fetch historical candles from TwelveData REST API."""
+    try:
+        td_symbol = symbol.replace("/", "")
+        
+        params = {
+            "symbol": td_symbol,
+            "interval": "1min",
+            "start_date": start_date.strftime("%Y-%m-%d %H:%M:%S"),
+            "end_date": end_date.strftime("%Y-%m-%d %H:%M:%S"),
+            "apikey": TD_API_KEY,
+            "format": "JSON",
+            "timezone": "UTC"
+        }
+        
+        response = requests.get(TD_REST_URL, params=params, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        
+        if "values" not in data:
+            if "message" in data:
+                log.warning(f"⚠️ TwelveData: {data.get('message', 'No data')}")
+            return []
+        
+        candles = []
+        for v in data["values"]:
+            try:
+                candles.append({
+                    "timestamp": datetime.strptime(v["datetime"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc),
+                    "open": float(Decimal(str(v["open"]))),
+                    "high": float(Decimal(str(v["high"]))),
+                    "low": float(Decimal(str(v["low"]))),
+                    "close": float(Decimal(str(v["close"]))),
+                    "symbol": symbol
+                })
+            except Exception:
+                continue
+        
+        return candles
+        
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 429:
+            log.warning(f"⚠️ Rate limited by TwelveData")
+        else:
+            log.error(f"❌ TwelveData API error: {e}")
+        return []
+    except Exception as e:
+        log.error(f"❌ Error fetching candles for {symbol}: {e}")
+        return []
+
+
+def insert_candles(symbol: str, candles: List[Dict]) -> int:
+    """Insert candles using upsert."""
+    if not candles:
+        return 0
+    
+    table_name = symbol_to_table(symbol)
+    
+    try:
+        rows = [
+            {
+                "timestamp": c["timestamp"].isoformat(),
+                "open": c["open"],
+                "high": c["high"],
+                "low": c["low"],
+                "close": c["close"],
+                "symbol": c["symbol"]
+            }
+            for c in candles
+        ]
+        
+        sb.table(table_name).upsert(rows, on_conflict="timestamp").execute()
+        return len(rows)
+        
+    except Exception as e:
+        log.error(f"❌ Error inserting candles for {symbol}: {e}")
+        return 0
+
+
+async def fill_gaps_for_symbol(symbol: str, gaps: List[tuple]) -> int:
+    """Fill all detected gaps for a symbol."""
+    total_filled = 0
+    
+    for gap_start, gap_end in gaps:
+        gap_minutes = int((gap_end - gap_start).total_seconds() / 60) + 1
+        log.info(f"🔧 Filling {symbol}: {gap_start.strftime('%H:%M')}-{gap_end.strftime('%H:%M')} ({gap_minutes}min)")
+        
+        loop = asyncio.get_event_loop()
+        candles = await loop.run_in_executor(None, fetch_candles_rest, symbol, gap_start, gap_end)
+        
+        if candles:
+            inserted = await loop.run_in_executor(None, insert_candles, symbol, candles)
+            total_filled += inserted
+            log.info(f"✅ Filled {inserted} candles for {symbol}")
+        
+        await asyncio.sleep(BACKFILL_RATE_LIMIT)
+    
+    return total_filled
+
+
+async def startup_backfill(hours: int = 2):
+    """On startup, backfill last N hours to catch gaps from downtime."""
+    log.info(f"🚀 Running startup backfill for last {hours} hours...")
+    
+    end_time = datetime.now(timezone.utc)
+    start_time = end_time - timedelta(hours=hours)
+    
+    total_candles = 0
+    loop = asyncio.get_event_loop()
+    
+    for symbol in ALL_SYMBOLS:
+        log.info(f"⬇️ Backfilling {symbol}...")
+        
+        candles = await loop.run_in_executor(None, fetch_candles_rest, symbol, start_time, end_time)
+        
+        if candles:
+            inserted = await loop.run_in_executor(None, insert_candles, symbol, candles)
+            total_candles += inserted
+            log.info(f"✅ {symbol}: {inserted} candles")
+        
+        await asyncio.sleep(BACKFILL_RATE_LIMIT)
+    
+    log.info(f"🎉 Startup backfill complete: {total_candles} total candles")
+
+
+async def gap_fill_task():
+    """Periodic gap detection and filling."""
+    log.info("🔧 Gap fill service started")
+    log.info(f"   Scan interval: {GAP_SCAN_INTERVAL}s | Lookback: {MAX_GAP_HOURS}h")
+    
+    # Run startup backfill first
+    await startup_backfill(hours=2)
+    
+    while not tick_streamer._shutdown.is_set():
+        try:
+            log.info("🔍 Scanning for gaps...")
+            
+            total_gaps = 0
+            total_filled = 0
+            
+            for symbol in ALL_SYMBOLS:
+                gaps = detect_gaps(symbol)
+                
+                if gaps:
+                    total_gaps += len(gaps)
+                    filled = await fill_gaps_for_symbol(symbol, gaps)
+                    total_filled += filled
+                    await asyncio.sleep(BACKFILL_RATE_LIMIT)
+            
+            if total_gaps > 0:
+                log.info(f"📊 Gap scan: {total_gaps} gaps found, {total_filled} candles filled")
+            else:
+                log.info("✅ No gaps detected")
+            
+            await asyncio.sleep(GAP_SCAN_INTERVAL)
+            
+        except Exception as e:
+            log.error(f"❌ Gap fill error: {e}")
+            await asyncio.sleep(60)
+
+
 # ==================== FRED MACRO DATA ====================
 
 def fetch_fred_series_no_vintage(
@@ -929,6 +1144,7 @@ async def main():
     log.info("   2️⃣ Economic calendar (Trading Economics)")
     log.info("   3️⃣ Financial news (13 RSS feeds + DeepSeek)")
     log.info("   4️⃣ Macro data (FRED API)")
+    log.info("   5️⃣ Gap detection & backfill (AUTO-HEALING)")
     log.info("=" * 70)
 
     # Setup graceful shutdown
@@ -945,6 +1161,7 @@ async def main():
         asyncio.create_task(economic_calendar_task(), name="econ_calendar"),
         asyncio.create_task(financial_news_task(), name="news"),
         asyncio.create_task(macro_data_task(), name="macro"),
+        asyncio.create_task(gap_fill_task(), name="gap_fill"),
     ]
 
     try:
