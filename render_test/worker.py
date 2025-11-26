@@ -3,6 +3,7 @@ import json
 import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
 from typing import Optional, List, Dict
 
@@ -58,9 +59,14 @@ _stop = asyncio.Event()
 # ======================== TICK STREAMING (UNCHANGED) ========================
 
 def _to_float(x):
+    """Convert to float preserving up to 8 decimal places from TwelveData API."""
+    if x is None:
+        return None
     try:
-        return float(x) if x is not None else None
-    except Exception:
+        # Use Decimal for precise intermediate conversion
+        # This preserves full precision from TwelveData (up to 8dp for crypto, 5dp for forex)
+        return float(Decimal(str(x)))
+    except (InvalidOperation, ValueError, TypeError):
         return None
 
 def _to_ts(v):
@@ -93,9 +99,9 @@ async def _flush():
 
     try:
         sb.table(SUPABASE_TABLE).insert(payload).execute()
-        log.info("âœ… Inserted %d rows into %s", len(payload), SUPABASE_TABLE)
+        log.info("Ã¢Å“â€¦ Inserted %d rows into %s", len(payload), SUPABASE_TABLE)
     except Exception:
-        log.exception("âŒ Insert failed, re-queuing %d rows", len(payload))
+        log.exception("Ã¢ÂÅ’ Insert failed, re-queuing %d rows", len(payload))
         async with _lock:
             _batch[:0] = payload
 
@@ -139,7 +145,7 @@ async def _run_once():
         max_queue=1000,
     ) as ws:
         await ws.send(json.dumps({"action": "subscribe", "params": {"symbols": SYMBOLS}}))
-        log.info("ðŸš€ Subscribed to: %s", SYMBOLS)
+        log.info("Ã°Å¸Å¡â‚¬ Subscribed to: %s", SYMBOLS)
 
         flusher = asyncio.create_task(_periodic_flush())
         try:
@@ -162,7 +168,7 @@ async def tick_streaming_task():
             await _run_once()
             backoff = 1
         except Exception as e:
-            log.warning("âš ï¸ WS error: %s; reconnecting in %ss", e, backoff)
+            log.warning("Ã¢Å¡Â Ã¯Â¸Â WS error: %s; reconnecting in %ss", e, backoff)
             await asyncio.sleep(backoff)
             backoff = min(60, backoff * 2)
 
@@ -176,14 +182,14 @@ def scrape_trading_economics():
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
 
-        log.info("ðŸŒ Fetching Trading Economics calendar...")
+        log.info("Ã°Å¸Å’Â Fetching Trading Economics calendar...")
         response = requests.get(url, headers=headers, timeout=30)
         response.raise_for_status()
 
         soup = BeautifulSoup(response.content, 'html.parser')
         table = soup.find('table', {'id': 'calendar'})
         if not table:
-            log.error("âŒ Could not find calendar table")
+            log.error("Ã¢ÂÅ’ Could not find calendar table")
             return []
 
         events = []
@@ -259,14 +265,14 @@ def scrape_trading_economics():
                 events.append(event_data)
 
             except Exception as e:
-                log.warning(f"âš ï¸ Error parsing row: {e}")
+                log.warning(f"Ã¢Å¡Â Ã¯Â¸Â Error parsing row: {e}")
                 continue
 
-        log.info(f"ðŸ“Š Scraped {len(events)} events from Trading Economics")
+        log.info(f"Ã°Å¸â€œÅ  Scraped {len(events)} events from Trading Economics")
         return events
 
     except Exception as e:
-        log.error(f"âŒ Error scraping Trading Economics: {e}")
+        log.error(f"Ã¢ÂÅ’ Error scraping Trading Economics: {e}")
         return []
 
 def upsert_economic_events(events):
@@ -301,17 +307,17 @@ def upsert_economic_events(events):
                     sb.table('Economic_calander').insert(event).execute()
 
             except Exception as e:
-                log.warning(f"âš ï¸ Error upserting event {event['event']}: {e}")
+                log.warning(f"Ã¢Å¡Â Ã¯Â¸Â Error upserting event {event['event']}: {e}")
                 continue
 
-        log.info(f"âœ… Successfully processed {len(events)} economic events")
+        log.info(f"Ã¢Å“â€¦ Successfully processed {len(events)} economic events")
 
     except Exception as e:
-        log.error(f"âŒ Error upserting events to Supabase: {e}")
+        log.error(f"Ã¢ÂÅ’ Error upserting events to Supabase: {e}")
 
 async def economic_calendar_task():
     """Periodically scrape and update economic calendar."""
-    log.info("ðŸ—“ï¸ Economic calendar scraper started")
+    log.info("Ã°Å¸â€”â€œÃ¯Â¸Â Economic calendar scraper started")
 
     while not _stop.is_set():
         try:
@@ -324,7 +330,7 @@ async def economic_calendar_task():
             await asyncio.sleep(ECON_SCRAPE_INTERVAL)
 
         except Exception as e:
-            log.error(f"âŒ Error in economic calendar task: {e}")
+            log.error(f"Ã¢ÂÅ’ Error in economic calendar task: {e}")
             await asyncio.sleep(60)
 
 # ==================== FINANCIAL NEWS SCRAPER (UNCHANGED) ====================
@@ -401,7 +407,7 @@ def optimize_articles_for_cost(articles: list) -> list:
     if not articles:
         return []
 
-    log.info(f"ðŸ’° Cost optimization: Starting with {len(articles)} articles")
+    log.info(f"Ã°Å¸â€™Â° Cost optimization: Starting with {len(articles)} articles")
 
     articles_with_images = [a for a in articles if a.get('image_url')]
     removed_no_images = len(articles) - len(articles_with_images)
@@ -416,7 +422,7 @@ def optimize_articles_for_cost(articles: list) -> list:
         for seen_title in seen_topics:
             similarity = calculate_title_similarity(article['title'], seen_title)
             if similarity >= 0.75:
-                log.debug(f"   ðŸ”„ SIMILAR: {article['title'][:50]}... ({int(similarity*100)}% match)")
+                log.debug(f"   Ã°Å¸â€â€ž SIMILAR: {article['title'][:50]}... ({int(similarity*100)}% match)")
                 is_duplicate = True
                 break
 
@@ -451,7 +457,7 @@ def optimize_articles_for_cost(articles: list) -> list:
 
         if category and category in category_limits:
             if category_counts[category] >= category_limits[category]:
-                log.debug(f"   ðŸš« LIMIT: {article['title'][:50]}... ({category} limit reached)")
+                log.debug(f"   Ã°Å¸Å¡Â« LIMIT: {article['title'][:50]}... ({category} limit reached)")
                 continue
             category_counts[category] += 1
 
@@ -463,8 +469,8 @@ def optimize_articles_for_cost(articles: list) -> list:
 
     log.info(f"   Category breakdown: {dict(category_counts)}")
     log.info(f"   Removed {removed_by_limit} articles by category limits")
-    log.info(f"   ðŸ’° Total savings: {total_removed} articles ({savings_pct}% cost reduction)")
-    log.info(f"   âœ… Final articles to classify: {len(final_articles)}")
+    log.info(f"   Ã°Å¸â€™Â° Total savings: {total_removed} articles ({savings_pct}% cost reduction)")
+    log.info(f"   Ã¢Å“â€¦ Final articles to classify: {len(final_articles)}")
 
     return final_articles
 
@@ -527,13 +533,13 @@ def fetch_rss_feed(feed_url: str, source_name: str) -> list:
         return articles
 
     except Exception as e:
-        log.warning(f"âš ï¸ RSS feed error ({source_name}): {e}")
+        log.warning(f"Ã¢Å¡Â Ã¯Â¸Â RSS feed error ({source_name}): {e}")
         return []
 
 def classify_article_with_deepseek(article: dict) -> dict:
     """Classify article using DeepSeek API (80% cheaper than Claude)"""
     if not deepseek_client:
-        log.warning("⚠️ DeepSeek API key not configured")
+        log.warning("âš ï¸ DeepSeek API key not configured")
         return None
         
     try:
@@ -571,10 +577,10 @@ Valid sentiments: bullish, bearish, neutral"""
         return json.loads(response_text)
 
     except json.JSONDecodeError as e:
-        log.warning(f"⚠️ DeepSeek JSON parse error: {e}")
+        log.warning(f"âš ï¸ DeepSeek JSON parse error: {e}")
         return None
     except Exception as e:
-        log.warning(f"⚠️ DeepSeek API error: {e}")
+        log.warning(f"âš ï¸ DeepSeek API error: {e}")
         return None
 
 
@@ -602,18 +608,18 @@ def store_news_article(article: dict, classification: dict) -> bool:
         if 'duplicate key value' in str(e).lower() or 'unique constraint' in str(e).lower():
             return False
         else:
-            log.warning(f"âš ï¸ Database error storing news: {e}")
+            log.warning(f"Ã¢Å¡Â Ã¯Â¸Â Database error storing news: {e}")
             return False
 
 async def financial_news_task():
-    log.info("ðŸ“° Financial news scraper started (smart scheduling + cost optimization)")
+    log.info("Ã°Å¸â€œÂ° Financial news scraper started (smart scheduling + cost optimization)")
 
     while not _stop.is_set():
         try:
             interval, session_name = get_news_scan_interval()
-            session_emoji = "ðŸ”¥" if session_name == "active" else "ðŸ˜´" if session_name == "quiet" else "ðŸŒ™"
+            session_emoji = "Ã°Å¸â€Â¥" if session_name == "active" else "Ã°Å¸ËœÂ´" if session_name == "quiet" else "Ã°Å¸Å’â„¢"
             
-            log.info(f"ðŸ” Starting news scan cycle ({session_emoji} {session_name} session)")
+            log.info(f"Ã°Å¸â€Â Starting news scan cycle ({session_emoji} {session_name} session)")
 
             all_articles = []
             loop = asyncio.get_event_loop()
@@ -623,7 +629,7 @@ async def financial_news_task():
                 all_articles.extend(articles)
                 await asyncio.sleep(0.5)
 
-            log.info(f"ðŸ“Š Fetched {len(all_articles)} total articles")
+            log.info(f"Ã°Å¸â€œÅ  Fetched {len(all_articles)} total articles")
 
             seen_urls = set()
             unique_articles = []
@@ -632,14 +638,14 @@ async def financial_news_task():
                     seen_urls.add(article['url'])
                     unique_articles.append(article)
 
-            log.info(f"ðŸ”— After deduplication: {len(unique_articles)} unique articles")
+            log.info(f"Ã°Å¸â€â€” After deduplication: {len(unique_articles)} unique articles")
 
             filtered_articles = [
                 a for a in unique_articles
                 if should_prefilter_article(a['title'], a['summary'])
             ]
 
-            log.info(f"ðŸŽ¯ After pre-filtering: {len(filtered_articles)} articles")
+            log.info(f"Ã°Å¸Å½Â¯ After pre-filtering: {len(filtered_articles)} articles")
 
             filtered_articles = optimize_articles_for_cost(filtered_articles)
 
@@ -656,7 +662,7 @@ async def financial_news_task():
                 if not classification['is_important'] or classification['impact_level'] not in ['critical', 'high']:
                     continue
 
-                impact_emoji = "ðŸš¨" if classification['impact_level'] == 'critical' else "âš¡"
+                impact_emoji = "Ã°Å¸Å¡Â¨" if classification['impact_level'] == 'critical' else "Ã¢Å¡Â¡"
                 log.info(f"{impact_emoji} IMPORTANT: {article['title'][:60]}... ({classification['impact_level']})")
 
                 if await loop.run_in_executor(None, store_news_article, article, classification):
@@ -664,13 +670,13 @@ async def financial_news_task():
 
                 await asyncio.sleep(1)
 
-            log.info(f"âœ… News cycle complete: {stored_count} stored, {classified_count} classified")
+            log.info(f"Ã¢Å“â€¦ News cycle complete: {stored_count} stored, {classified_count} classified")
 
-            log.info(f"ðŸ˜´ Next scan in {interval // 60} minutes ({session_emoji} {session_name} session)")
+            log.info(f"Ã°Å¸ËœÂ´ Next scan in {interval // 60} minutes ({session_emoji} {session_name} session)")
             await asyncio.sleep(interval)
 
         except Exception as e:
-            log.error(f"âŒ Error in financial news task: {e}")
+            log.error(f"Ã¢ÂÅ’ Error in financial news task: {e}")
             await asyncio.sleep(60)
 
 # ==================== FRED MACRO DATA SCRAPER (NEW - TASK 4) ====================
@@ -686,7 +692,7 @@ def fetch_fred_series_no_vintage(
     Used for backfill to avoid 400 errors from realtime parameters
     """
     if not FRED_API_KEY:
-        log.error("âŒ FRED_API_KEY not set!")
+        log.error("Ã¢ÂÅ’ FRED_API_KEY not set!")
         return []
     
     url = f"{FRED_API_BASE}/series/observations"
@@ -725,7 +731,7 @@ def fetch_fred_series_no_vintage(
     
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 400:
-            log.warning(f"âš ï¸ FRED API 400 error for {series_id} (likely no data available for requested dates)")
+            log.warning(f"Ã¢Å¡Â Ã¯Â¸Â FRED API 400 error for {series_id} (likely no data available for requested dates)")
         else:
             log.error(f"Error fetching FRED series {series_id}: {e}")
         return []
@@ -750,7 +756,7 @@ def fetch_fred_series(
                      If set, gets data as it was known on that date
     """
     if not FRED_API_KEY:
-        log.error("âŒ FRED_API_KEY not set!")
+        log.error("Ã¢ÂÅ’ FRED_API_KEY not set!")
         return []
     
     if not observation_start:
@@ -802,7 +808,7 @@ def fetch_fred_series(
     
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 400:
-            log.warning(f"âš ï¸ FRED API 400 error for {series_id} (likely no data available for requested dates)")
+            log.warning(f"Ã¢Å¡Â Ã¯Â¸Â FRED API 400 error for {series_id} (likely no data available for requested dates)")
         else:
             log.error(f"Error fetching FRED series {series_id}: {e}")
         return []
@@ -948,7 +954,7 @@ def store_observations(indicator: Dict, observations: List[Dict]) -> int:
         ).execute()
         
         inserted = len(rows)
-        log.info(f"âœ… Stored {inserted} observations for {indicator['indicator_name']}")
+        log.info(f"Ã¢Å“â€¦ Stored {inserted} observations for {indicator['indicator_name']}")
         return inserted
     
     except Exception as e:
@@ -958,22 +964,22 @@ def store_observations(indicator: Dict, observations: List[Dict]) -> int:
 
 async def backfill_historical_data():
     """One-time backfill: Fetch last 5 years of data for all indicators"""
-    log.info("ðŸ”„ Starting historical data backfill (5 years)...")
+    log.info("Ã°Å¸â€â€ž Starting historical data backfill (5 years)...")
     
     try:
         result = sb.table('macro_indicators').select('id', count='exact').limit(1).execute()
         if result.count and result.count > 0:
-            log.info("âœ… Historical data already exists, skipping backfill")
+            log.info("Ã¢Å“â€¦ Historical data already exists, skipping backfill")
             return
     except Exception as e:
         log.warning(f"Could not check existing data: {e}")
     
     indicators = get_active_indicators()
     if not indicators:
-        log.error("âŒ No active indicators found in metadata table")
+        log.error("Ã¢ÂÅ’ No active indicators found in metadata table")
         return
     
-    log.info(f"ðŸ“Š Backfilling {len(indicators)} indicators...")
+    log.info(f"Ã°Å¸â€œÅ  Backfilling {len(indicators)} indicators...")
     
     total_stored = 0
     loop = asyncio.get_event_loop()
@@ -986,7 +992,7 @@ async def backfill_historical_data():
     today_vintage = today.strftime('%Y-%m-%d')
     
     for indicator in indicators:
-        log.info(f"â¬‡ï¸  Fetching {indicator['indicator_name']} ({indicator['fred_code']})...")
+        log.info(f"Ã¢Â¬â€¡Ã¯Â¸Â  Fetching {indicator['indicator_name']} ({indicator['fred_code']})...")
         
         # Fetch without vintage constraints (gets latest revisions)
         observations = await loop.run_in_executor(
@@ -998,7 +1004,7 @@ async def backfill_historical_data():
         )
         
         if not observations:
-            log.warning(f"âš ï¸  No data found for {indicator['indicator_name']}")
+            log.warning(f"Ã¢Å¡Â Ã¯Â¸Â  No data found for {indicator['indicator_name']}")
             continue
         
         # Add vintage_date to all observations (today's date)
@@ -1017,7 +1023,7 @@ async def backfill_historical_data():
         total_stored += stored
         await asyncio.sleep(0.5)  # Rate limiting
     
-    log.info(f"âœ… Backfill complete! Stored {total_stored} total observations")
+    log.info(f"Ã¢Å“â€¦ Backfill complete! Stored {total_stored} total observations")
 
 
 def get_todays_macro_events() -> List[Dict]:
@@ -1078,16 +1084,16 @@ async def check_and_update_indicator(indicator: Dict, calendar_event: Dict):
     )
     
     if not observations:
-        log.info(f"ðŸ“­ No new data yet for {indicator['indicator_name']}")
+        log.info(f"Ã°Å¸â€œÂ­ No new data yet for {indicator['indicator_name']}")
         return
     
     latest_obs_date = observations[0]['date']
     
     if latest_date and latest_obs_date <= latest_date:
-        log.info(f"âœ… Data for {indicator['indicator_name']} is up to date")
+        log.info(f"Ã¢Å“â€¦ Data for {indicator['indicator_name']} is up to date")
         return
     
-    log.info(f"ðŸ†• NEW DATA: {indicator['indicator_name']} - {latest_obs_date} = {observations[0]['value']} (vintage: {today_vintage})")
+    log.info(f"Ã°Å¸â€ â€¢ NEW DATA: {indicator['indicator_name']} - {latest_obs_date} = {observations[0]['value']} (vintage: {today_vintage})")
     
     observations_with_changes = calculate_changes(observations, indicator['frequency'])
     
@@ -1111,7 +1117,7 @@ async def check_and_update_indicator(indicator: Dict, calendar_event: Dict):
                 'fred_indicator_code': fred_code
             }).eq('id', calendar_event['id']).execute()
             
-            log.info(f"âœ… Updated calendar: {indicator['indicator_name']} = {actual_value}")
+            log.info(f"Ã¢Å“â€¦ Updated calendar: {indicator['indicator_name']} = {actual_value}")
         except Exception as e:
             log.warning(f"Could not update calendar: {e}")
 
@@ -1123,36 +1129,36 @@ async def macro_data_task():
     - Checks economic calendar for today's events every hour
     - Fetches new data from FRED when scheduled
     """
-    log.info("ðŸ“… Macro data event checker started")
+    log.info("Ã°Å¸â€œâ€¦ Macro data event checker started")
     
     await backfill_historical_data()
     
     while not _stop.is_set():
         try:
-            log.info("ðŸ” Checking economic calendar for today's macro events...")
+            log.info("Ã°Å¸â€Â Checking economic calendar for today's macro events...")
             
             matched_events = get_todays_macro_events()
             
             if not matched_events:
-                log.info("ðŸ“­ No macro events scheduled for today")
+                log.info("Ã°Å¸â€œÂ­ No macro events scheduled for today")
             else:
-                log.info(f"ðŸ“Š Found {len(matched_events)} macro events today")
+                log.info(f"Ã°Å¸â€œÅ  Found {len(matched_events)} macro events today")
                 
                 for event in matched_events:
                     indicator = event['indicator']
                     calendar_event = event['calendar_event']
                     
-                    log.info(f"â° Checking {indicator['indicator_name']} (scheduled today)...")
+                    log.info(f"Ã¢ÂÂ° Checking {indicator['indicator_name']} (scheduled today)...")
                     
                     await check_and_update_indicator(indicator, calendar_event)
                     
                     await asyncio.sleep(1)
             
-            log.info("ðŸ˜´ Next check in 1 hour...")
+            log.info("Ã°Å¸ËœÂ´ Next check in 1 hour...")
             await asyncio.sleep(3600)
         
         except Exception as e:
-            log.error(f"âŒ Error in macro data task: {e}")
+            log.error(f"Ã¢ÂÅ’ Error in macro data task: {e}")
             await asyncio.sleep(300)
 
 # ====================== MAIN ======================
@@ -1165,12 +1171,12 @@ async def main():
     3. Financial news scraping (with smart scheduling)
     4. Macro data scraping (FRED API - event-driven)
     """
-    log.info("ðŸš€ Starting worker with 4 parallel tasks:")
-    log.info("   1ï¸âƒ£ Tick streaming (TwelveData)")
-    log.info("   2ï¸âƒ£ Economic calendar (Trading Economics)")
-    log.info("   3ï¸âƒ£ Financial news (15 RSS feeds + smart scheduling)")
-    log.info("   4ï¸âƒ£ Macro data (FRED API - US indicators)")
-    log.info("   ðŸ“… Smart schedule: 15min (active) | 30min (quiet) | 4hr (weekend)")
+    log.info("Ã°Å¸Å¡â‚¬ Starting worker with 4 parallel tasks:")
+    log.info("   1Ã¯Â¸ÂÃ¢Æ’Â£ Tick streaming (TwelveData)")
+    log.info("   2Ã¯Â¸ÂÃ¢Æ’Â£ Economic calendar (Trading Economics)")
+    log.info("   3Ã¯Â¸ÂÃ¢Æ’Â£ Financial news (15 RSS feeds + smart scheduling)")
+    log.info("   4Ã¯Â¸ÂÃ¢Æ’Â£ Macro data (FRED API - US indicators)")
+    log.info("   Ã°Å¸â€œâ€¦ Smart schedule: 15min (active) | 30min (quiet) | 4hr (weekend)")
 
     tick_task = asyncio.create_task(tick_streaming_task())
     econ_task = asyncio.create_task(economic_calendar_task())
@@ -1180,7 +1186,7 @@ async def main():
     try:
         await asyncio.gather(tick_task, econ_task, news_task, macro_task)
     except Exception as e:
-        log.error(f"âŒ Main loop error: {e}")
+        log.error(f"Ã¢ÂÅ’ Main loop error: {e}")
     finally:
         _stop.set()
         tick_task.cancel()
