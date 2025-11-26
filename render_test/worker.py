@@ -2,10 +2,13 @@ import os
 import json
 import asyncio
 import logging
+import signal
+import sys
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
 from typing import Optional, List, Dict
+from contextlib import suppress
 
 import websockets
 import requests
@@ -19,9 +22,8 @@ TD_API_KEY   = os.environ["TWELVEDATA_API_KEY"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
-FRED_API_KEY = os.environ.get("FRED_API_KEY")  # NEW!
+FRED_API_KEY = os.environ.get("FRED_API_KEY")
 
-# Allow override, but default to the table you requested
 SUPABASE_TABLE = os.environ.get("SUPABASE_TABLE", "tickdata")
 
 # The 16 pairs to stream
@@ -33,10 +35,18 @@ SYMBOLS = (
 WS_URL = f"wss://ws.twelvedata.com/v1/quotes/price?apikey={TD_API_KEY}"
 
 # Economic calendar scraping interval (in seconds)
-ECON_SCRAPE_INTERVAL = 3600  # Scrape every hour
+ECON_SCRAPE_INTERVAL = 3600
 
 # FRED API Base URL
 FRED_API_BASE = "https://api.stlouisfed.org/fred"
+
+# ==================== BULLETPROOF TICK STREAMING CONFIG ====================
+BATCH_MAX = 500
+BATCH_FLUSH_SECS = 2
+WATCHDOG_TIMEOUT_SECS = 30      # Kill connection if no tick for 30s
+CONNECTION_TIMEOUT_SECS = 15     # Timeout for initial connection
+MAX_RECONNECT_DELAY = 30         # Max backoff delay
+HEALTH_LOG_INTERVAL = 60         # Log health status every 60s
 
 # --------------------------- CLIENTS/LOG -------------------------
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -46,133 +56,276 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("tick-stream")
+log = logging.getLogger("worker")
 
-# ----------------------- BATCH / FLUSH SETTINGS ------------------
-BATCH_MAX = 500
-BATCH_FLUSH_SECS = 2
+# ==================== BULLETPROOF TICK STREAMING ====================
 
-_batch = []
-_lock = asyncio.Lock()
-_stop = asyncio.Event()
+class BulletproofTickStreamer:
+    """
+    Bulletproof WebSocket tick streamer with:
+    - Watchdog timer (kills stale connections)
+    - Heartbeat monitoring
+    - Aggressive reconnection
+    - Health logging
+    - Graceful shutdown
+    """
+    
+    def __init__(self):
+        self._batch: List[dict] = []
+        self._lock = asyncio.Lock()
+        self._shutdown = asyncio.Event()  # Only set on true shutdown
+        self._ws: Optional[websockets.WebSocketClientProtocol] = None
+        self._last_tick_time: datetime = datetime.now(timezone.utc)
+        self._tick_count: int = 0
+        self._connection_count: int = 0
+        self._last_health_log: datetime = datetime.now(timezone.utc)
+        self._is_connected: bool = False
+        
+    def _to_float(self, x) -> Optional[float]:
+        """Convert to float preserving precision."""
+        if x is None:
+            return None
+        try:
+            return float(Decimal(str(x)))
+        except (InvalidOperation, ValueError, TypeError):
+            return None
 
-# ======================== TICK STREAMING (UNCHANGED) ========================
+    def _to_ts(self, v) -> datetime:
+        """Return aware UTC datetime from epoch ms, epoch s, or ISO string."""
+        if v is None:
+            return datetime.now(timezone.utc)
 
-def _to_float(x):
-    """Convert to float preserving up to 8 decimal places from TwelveData API."""
-    if x is None:
-        return None
-    try:
-        # Use Decimal for precise intermediate conversion
-        # This preserves full precision from TwelveData (up to 8dp for crypto, 5dp for forex)
-        return float(Decimal(str(x)))
-    except (InvalidOperation, ValueError, TypeError):
-        return None
+        try:
+            t = float(v)
+            if t > 10**12:
+                t /= 1000.0
+            return datetime.fromtimestamp(t, tz=timezone.utc)
+        except Exception:
+            pass
 
-def _to_ts(v):
-    """Return aware UTC datetime from epoch ms, epoch s, or ISO string."""
-    if v is None:
-        return datetime.now(timezone.utc)
+        try:
+            dt = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            return datetime.now(timezone.utc)
 
-    try:
-        t = float(v)
-        if t > 10**12:
-            t /= 1000.0
-        return datetime.fromtimestamp(t, tz=timezone.utc)
-    except Exception:
-        pass
+    async def _flush(self):
+        """Flush batch to Supabase."""
+        async with self._lock:
+            if not self._batch:
+                return
+            payload, self._batch = self._batch, []
 
-    try:
-        dt = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except Exception:
-        return datetime.now(timezone.utc)
+        try:
+            sb.table(SUPABASE_TABLE).insert(payload).execute()
+            log.info("✅ Inserted %d rows into %s", len(payload), SUPABASE_TABLE)
+        except Exception as e:
+            log.error("❌ Insert failed: %s - re-queuing %d rows", e, len(payload))
+            async with self._lock:
+                self._batch[:0] = payload
 
-async def _flush():
-    global _batch
-    async with _lock:
-        if not _batch:
+    async def _periodic_flush(self):
+        """Flush batch every BATCH_FLUSH_SECS."""
+        while not self._shutdown.is_set():
+            await asyncio.sleep(BATCH_FLUSH_SECS)
+            await self._flush()
+
+    async def _handle(self, msg: dict):
+        """Handle incoming tick message."""
+        if msg.get("event") != "price":
             return
-        payload, _batch = _batch, []
 
-    try:
-        sb.table(SUPABASE_TABLE).insert(payload).execute()
-        log.info("Ã¢Å“â€¦ Inserted %d rows into %s", len(payload), SUPABASE_TABLE)
-    except Exception:
-        log.exception("Ã¢ÂÅ’ Insert failed, re-queuing %d rows", len(payload))
-        async with _lock:
-            _batch[:0] = payload
+        row = {
+            "symbol": msg.get("symbol"),
+            "ts": self._to_ts(msg.get("timestamp")).isoformat(),
+            "price": self._to_float(msg.get("price")),
+            "bid": self._to_float(msg.get("bid")),
+            "ask": self._to_float(msg.get("ask")),
+            "day_volume": (
+                self._to_float(msg.get("day_volume"))
+                or self._to_float(msg.get("dayVolume"))
+                or self._to_float(msg.get("volume"))
+            ),
+        }
 
-async def _periodic_flush():
-    while not _stop.is_set():
+        if not row["symbol"] or row["price"] is None:
+            return
+
+        # Update watchdog
+        self._last_tick_time = datetime.now(timezone.utc)
+        self._tick_count += 1
+
+        async with self._lock:
+            self._batch.append(row)
+            if len(self._batch) >= BATCH_MAX:
+                await self._flush()
+
+    async def _watchdog(self):
+        """
+        WATCHDOG: Monitor for stale connections.
+        If no tick received for WATCHDOG_TIMEOUT_SECS, force close the WebSocket.
+        """
+        log.info("🐕 Watchdog started (timeout: %ds)", WATCHDOG_TIMEOUT_SECS)
+        
+        while not self._shutdown.is_set():
+            await asyncio.sleep(5)  # Check every 5 seconds
+            
+            if not self._is_connected:
+                continue
+                
+            elapsed = (datetime.now(timezone.utc) - self._last_tick_time).total_seconds()
+            
+            if elapsed > WATCHDOG_TIMEOUT_SECS:
+                log.warning("🐕 WATCHDOG: No tick for %.1fs - forcing reconnection!", elapsed)
+                if self._ws:
+                    try:
+                        await self._ws.close()
+                    except Exception:
+                        pass
+                self._is_connected = False
+
+    async def _health_logger(self):
+        """Log health status periodically."""
+        while not self._shutdown.is_set():
+            await asyncio.sleep(HEALTH_LOG_INTERVAL)
+            
+            elapsed = (datetime.now(timezone.utc) - self._last_tick_time).total_seconds()
+            status = "🟢 HEALTHY" if elapsed < 10 else "🟡 STALE" if elapsed < WATCHDOG_TIMEOUT_SECS else "🔴 DEAD"
+            
+            log.info(
+                "💓 HEALTH: %s | Connected: %s | Ticks: %d | Last tick: %.1fs ago | Reconnects: %d",
+                status,
+                self._is_connected,
+                self._tick_count,
+                elapsed,
+                self._connection_count
+            )
+
+    async def _connect_and_stream(self):
+        """Single connection attempt with proper error handling."""
+        self._connection_count += 1
+        log.info("🔌 Connection attempt #%d...", self._connection_count)
+        
         try:
-            await asyncio.wait_for(_stop.wait(), timeout=BATCH_FLUSH_SECS)
-        except asyncio.TimeoutError:
-            await _flush()
-
-async def _handle(msg: dict):
-    if msg.get("event") != "price":
-        return
-
-    row = {
-        "symbol": msg.get("symbol"),
-        "ts": _to_ts(msg.get("timestamp")).isoformat(),
-        "price": _to_float(msg.get("price")),
-        "bid": _to_float(msg.get("bid")),
-        "ask": _to_float(msg.get("ask")),
-        "day_volume": (
-            _to_float(msg.get("day_volume"))
-            or _to_float(msg.get("dayVolume"))
-            or _to_float(msg.get("volume"))
-        ),
-    }
-
-    if not row["symbol"] or row["price"] is None:
-        return
-
-    async with _lock:
-        _batch.append(row)
-        if len(_batch) >= BATCH_MAX:
-            await _flush()
-
-async def _run_once():
-    async with websockets.connect(
-        WS_URL,
-        ping_interval=20,
-        ping_timeout=20,
-        max_queue=1000,
-    ) as ws:
-        await ws.send(json.dumps({"action": "subscribe", "params": {"symbols": SYMBOLS}}))
-        log.info("Ã°Å¸Å¡â‚¬ Subscribed to: %s", SYMBOLS)
-
-        flusher = asyncio.create_task(_periodic_flush())
-        try:
-            async for raw in ws:
+            # Connect with timeout
+            self._ws = await asyncio.wait_for(
+                websockets.connect(
+                    WS_URL,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    close_timeout=10,
+                    max_queue=1000,
+                ),
+                timeout=CONNECTION_TIMEOUT_SECS
+            )
+            
+            # Subscribe
+            await self._ws.send(json.dumps({
+                "action": "subscribe",
+                "params": {"symbols": SYMBOLS}
+            }))
+            
+            log.info("🚀 Connected and subscribed to: %s", SYMBOLS)
+            self._is_connected = True
+            self._last_tick_time = datetime.now(timezone.utc)
+            
+            # Stream messages
+            async for raw in self._ws:
+                if self._shutdown.is_set():
+                    break
                 try:
                     data = json.loads(raw)
-                except Exception:
+                    await self._handle(data)
+                except json.JSONDecodeError:
                     continue
-                await _handle(data)
+                    
+        except asyncio.TimeoutError:
+            log.error("⏱️ Connection timeout after %ds", CONNECTION_TIMEOUT_SECS)
+        except websockets.exceptions.ConnectionClosed as e:
+            log.warning("🔌 Connection closed: code=%s reason=%s", e.code, e.reason)
+        except Exception as e:
+            log.error("❌ Connection error: %s", e)
         finally:
-            _stop.set()
-            await _flush()
+            self._is_connected = False
+            if self._ws:
+                with suppress(Exception):
+                    await self._ws.close()
+            self._ws = None
+
+    async def run(self):
+        """
+        Main run loop with bulletproof reconnection.
+        Never exits unless shutdown is requested.
+        """
+        log.info("=" * 60)
+        log.info("🚀 BULLETPROOF TICK STREAMER STARTING")
+        log.info("=" * 60)
+        log.info("📊 Symbols: %s", SYMBOLS)
+        log.info("🐕 Watchdog timeout: %ds", WATCHDOG_TIMEOUT_SECS)
+        log.info("🔄 Max reconnect delay: %ds", MAX_RECONNECT_DELAY)
+        log.info("=" * 60)
+        
+        # Start background tasks
+        flusher = asyncio.create_task(self._periodic_flush())
+        watchdog = asyncio.create_task(self._watchdog())
+        health = asyncio.create_task(self._health_logger())
+        
+        backoff = 1
+        
+        try:
+            while not self._shutdown.is_set():
+                try:
+                    await self._connect_and_stream()
+                    
+                    if self._shutdown.is_set():
+                        break
+                    
+                    # Connection ended - prepare to reconnect
+                    log.info("🔄 Reconnecting in %ds...", backoff)
+                    await asyncio.sleep(backoff)
+                    backoff = min(MAX_RECONNECT_DELAY, backoff * 2)
+                    
+                except Exception as e:
+                    log.error("💥 Unexpected error in main loop: %s", e)
+                    await asyncio.sleep(backoff)
+                    backoff = min(MAX_RECONNECT_DELAY, backoff * 2)
+                    
+                # Reset backoff on successful long connection (>60s of ticks)
+                if self._tick_count > 0:
+                    elapsed = (datetime.now(timezone.utc) - self._last_tick_time).total_seconds()
+                    if elapsed < 5:  # Was receiving ticks recently
+                        backoff = 1
+                        
+        finally:
+            # Cleanup
+            log.info("🛑 Shutting down tick streamer...")
+            await self._flush()  # Final flush
             flusher.cancel()
+            watchdog.cancel()
+            health.cancel()
+            with suppress(asyncio.CancelledError):
+                await flusher
+                await watchdog
+                await health
+
+    def shutdown(self):
+        """Request graceful shutdown."""
+        log.info("🛑 Shutdown requested")
+        self._shutdown.set()
+
+
+# Global instance
+tick_streamer = BulletproofTickStreamer()
+
 
 async def tick_streaming_task():
-    """Main tick streaming task with reconnection logic."""
-    backoff = 1
-    while not _stop.is_set():
-        try:
-            await _run_once()
-            backoff = 1
-        except Exception as e:
-            log.warning("Ã¢Å¡Â Ã¯Â¸Â WS error: %s; reconnecting in %ss", e, backoff)
-            await asyncio.sleep(backoff)
-            backoff = min(60, backoff * 2)
+    """Entry point for tick streaming (compatible with existing code)."""
+    await tick_streamer.run()
 
-# ====================== ECONOMIC CALENDAR (UNCHANGED) ======================
+
+# ====================== ECONOMIC CALENDAR ======================
 
 def scrape_trading_economics():
     """Scrape economic calendar data from Trading Economics"""
@@ -182,14 +335,14 @@ def scrape_trading_economics():
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
 
-        log.info("Ã°Å¸Å’Â Fetching Trading Economics calendar...")
+        log.info("📅 Fetching Trading Economics calendar...")
         response = requests.get(url, headers=headers, timeout=30)
         response.raise_for_status()
 
         soup = BeautifulSoup(response.content, 'html.parser')
         table = soup.find('table', {'id': 'calendar'})
         if not table:
-            log.error("Ã¢ÂÅ’ Could not find calendar table")
+            log.error("❌ Could not find calendar table")
             return []
 
         events = []
@@ -265,15 +418,16 @@ def scrape_trading_economics():
                 events.append(event_data)
 
             except Exception as e:
-                log.warning(f"Ã¢Å¡Â Ã¯Â¸Â Error parsing row: {e}")
+                log.warning(f"⚠️ Error parsing row: {e}")
                 continue
 
-        log.info(f"Ã°Å¸â€œÅ  Scraped {len(events)} events from Trading Economics")
+        log.info(f"📋 Scraped {len(events)} events from Trading Economics")
         return events
 
     except Exception as e:
-        log.error(f"Ã¢ÂÅ’ Error scraping Trading Economics: {e}")
+        log.error(f"❌ Error scraping Trading Economics: {e}")
         return []
+
 
 def upsert_economic_events(events):
     """Insert or update economic events in Supabase."""
@@ -307,19 +461,20 @@ def upsert_economic_events(events):
                     sb.table('Economic_calander').insert(event).execute()
 
             except Exception as e:
-                log.warning(f"Ã¢Å¡Â Ã¯Â¸Â Error upserting event {event['event']}: {e}")
+                log.warning(f"⚠️ Error upserting event {event['event']}: {e}")
                 continue
 
-        log.info(f"Ã¢Å“â€¦ Successfully processed {len(events)} economic events")
+        log.info(f"✅ Successfully processed {len(events)} economic events")
 
     except Exception as e:
-        log.error(f"Ã¢ÂÅ’ Error upserting events to Supabase: {e}")
+        log.error(f"❌ Error upserting events to Supabase: {e}")
+
 
 async def economic_calendar_task():
     """Periodically scrape and update economic calendar."""
-    log.info("Ã°Å¸â€”â€œÃ¯Â¸Â Economic calendar scraper started")
+    log.info("📅 Economic calendar scraper started")
 
-    while not _stop.is_set():
+    while not tick_streamer._shutdown.is_set():
         try:
             loop = asyncio.get_event_loop()
             events = await loop.run_in_executor(None, scrape_trading_economics)
@@ -330,17 +485,16 @@ async def economic_calendar_task():
             await asyncio.sleep(ECON_SCRAPE_INTERVAL)
 
         except Exception as e:
-            log.error(f"Ã¢ÂÅ’ Error in economic calendar task: {e}")
+            log.error(f"❌ Error in economic calendar task: {e}")
             await asyncio.sleep(60)
 
-# ==================== FINANCIAL NEWS SCRAPER (UNCHANGED) ====================
+
+# ==================== FINANCIAL NEWS SCRAPER ====================
 
 RSS_FEEDS = [
     {"url": "http://feeds.bbci.co.uk/news/rss.xml", "name": "BBC News (Main)"},
     {"url": "http://feeds.bbci.co.uk/news/business/rss.xml", "name": "BBC News (Business)"},
     {"url": "http://feeds.bbci.co.uk/news/world/rss.xml", "name": "BBC News (World)"},
-    {"url": "https://www.reuters.com/rssfeed/businessNews", "name": "Reuters (Business)"},
-    {"url": "https://www.reuters.com/rssfeed/worldNews", "name": "Reuters (World)"},
     {"url": "https://www.cnbc.com/id/100003114/device/rss/rss.html", "name": "CNBC (Top News)"},
     {"url": "https://www.cnbc.com/id/100727362/device/rss/rss.html", "name": "CNBC (World)"},
     {"url": "https://www.cnbc.com/id/15837362/device/rss/rss.html", "name": "CNBC (US News)"},
@@ -372,6 +526,7 @@ EXCLUDE_KEYWORDS = [
     "recipe", "cooking", "fashion", "style", "beauty", "wedding", "divorce", "dating",
 ]
 
+
 def get_news_scan_interval():
     now = datetime.utcnow()
     day_of_week = now.weekday()
@@ -384,6 +539,7 @@ def get_news_scan_interval():
         return 900, "active"
     
     return 1800, "quiet"
+
 
 def should_prefilter_article(title: str, summary: str) -> bool:
     text = f"{title} {summary}".lower()
@@ -400,14 +556,16 @@ def should_prefilter_article(title: str, summary: str) -> bool:
 
     return False
 
+
 def calculate_title_similarity(title1: str, title2: str) -> float:
     return SequenceMatcher(None, title1.lower(), title2.lower()).ratio()
+
 
 def optimize_articles_for_cost(articles: list) -> list:
     if not articles:
         return []
 
-    log.info(f"Ã°Å¸â€™Â° Cost optimization: Starting with {len(articles)} articles")
+    log.info(f"💰 Cost optimization: Starting with {len(articles)} articles")
 
     articles_with_images = [a for a in articles if a.get('image_url')]
     removed_no_images = len(articles) - len(articles_with_images)
@@ -422,7 +580,6 @@ def optimize_articles_for_cost(articles: list) -> list:
         for seen_title in seen_topics:
             similarity = calculate_title_similarity(article['title'], seen_title)
             if similarity >= 0.75:
-                log.debug(f"   Ã°Å¸â€â€ž SIMILAR: {article['title'][:50]}... ({int(similarity*100)}% match)")
                 is_duplicate = True
                 break
 
@@ -457,7 +614,6 @@ def optimize_articles_for_cost(articles: list) -> list:
 
         if category and category in category_limits:
             if category_counts[category] >= category_limits[category]:
-                log.debug(f"   Ã°Å¸Å¡Â« LIMIT: {article['title'][:50]}... ({category} limit reached)")
                 continue
             category_counts[category] += 1
 
@@ -469,10 +625,11 @@ def optimize_articles_for_cost(articles: list) -> list:
 
     log.info(f"   Category breakdown: {dict(category_counts)}")
     log.info(f"   Removed {removed_by_limit} articles by category limits")
-    log.info(f"   Ã°Å¸â€™Â° Total savings: {total_removed} articles ({savings_pct}% cost reduction)")
-    log.info(f"   Ã¢Å“â€¦ Final articles to classify: {len(final_articles)}")
+    log.info(f"   💰 Total savings: {total_removed} articles ({savings_pct}% cost reduction)")
+    log.info(f"   ✅ Final articles to classify: {len(final_articles)}")
 
     return final_articles
+
 
 def fetch_rss_feed(feed_url: str, source_name: str) -> list:
     try:
@@ -533,13 +690,14 @@ def fetch_rss_feed(feed_url: str, source_name: str) -> list:
         return articles
 
     except Exception as e:
-        log.warning(f"Ã¢Å¡Â Ã¯Â¸Â RSS feed error ({source_name}): {e}")
+        log.warning(f"⚠️ RSS feed error ({source_name}): {e}")
         return []
 
+
 def classify_article_with_deepseek(article: dict) -> dict:
-    """Classify article using DeepSeek API (80% cheaper than Claude)"""
+    """Classify article using DeepSeek API"""
     if not deepseek_client:
-        log.warning("âš ï¸ DeepSeek API key not configured")
+        log.warning("⚠️ DeepSeek API key not configured")
         return None
         
     try:
@@ -565,7 +723,6 @@ Valid sentiments: bullish, bearish, neutral"""
 
         response_text = response.choices[0].message.content.strip()
         
-        # Clean markdown if present
         if response_text.startswith("```"):
             response_text = response_text.split("```")[1]
             if response_text.startswith("json"):
@@ -577,10 +734,10 @@ Valid sentiments: bullish, bearish, neutral"""
         return json.loads(response_text)
 
     except json.JSONDecodeError as e:
-        log.warning(f"âš ï¸ DeepSeek JSON parse error: {e}")
+        log.warning(f"⚠️ DeepSeek JSON parse error: {e}")
         return None
     except Exception as e:
-        log.warning(f"âš ï¸ DeepSeek API error: {e}")
+        log.warning(f"⚠️ DeepSeek API error: {e}")
         return None
 
 
@@ -608,18 +765,19 @@ def store_news_article(article: dict, classification: dict) -> bool:
         if 'duplicate key value' in str(e).lower() or 'unique constraint' in str(e).lower():
             return False
         else:
-            log.warning(f"Ã¢Å¡Â Ã¯Â¸Â Database error storing news: {e}")
+            log.warning(f"⚠️ Database error storing news: {e}")
             return False
 
-async def financial_news_task():
-    log.info("Ã°Å¸â€œÂ° Financial news scraper started (smart scheduling + cost optimization)")
 
-    while not _stop.is_set():
+async def financial_news_task():
+    log.info("📰 Financial news scraper started (smart scheduling + cost optimization)")
+
+    while not tick_streamer._shutdown.is_set():
         try:
             interval, session_name = get_news_scan_interval()
-            session_emoji = "Ã°Å¸â€Â¥" if session_name == "active" else "Ã°Å¸ËœÂ´" if session_name == "quiet" else "Ã°Å¸Å’â„¢"
+            session_emoji = "🔥" if session_name == "active" else "😴" if session_name == "quiet" else "🌙"
             
-            log.info(f"Ã°Å¸â€Â Starting news scan cycle ({session_emoji} {session_name} session)")
+            log.info(f"🔍 Starting news scan cycle ({session_emoji} {session_name} session)")
 
             all_articles = []
             loop = asyncio.get_event_loop()
@@ -629,7 +787,7 @@ async def financial_news_task():
                 all_articles.extend(articles)
                 await asyncio.sleep(0.5)
 
-            log.info(f"Ã°Å¸â€œÅ  Fetched {len(all_articles)} total articles")
+            log.info(f"📋 Fetched {len(all_articles)} total articles")
 
             seen_urls = set()
             unique_articles = []
@@ -638,14 +796,14 @@ async def financial_news_task():
                     seen_urls.add(article['url'])
                     unique_articles.append(article)
 
-            log.info(f"Ã°Å¸â€â€” After deduplication: {len(unique_articles)} unique articles")
+            log.info(f"🔍 After deduplication: {len(unique_articles)} unique articles")
 
             filtered_articles = [
                 a for a in unique_articles
                 if should_prefilter_article(a['title'], a['summary'])
             ]
 
-            log.info(f"Ã°Å¸Å½Â¯ After pre-filtering: {len(filtered_articles)} articles")
+            log.info(f"🎯 After pre-filtering: {len(filtered_articles)} articles")
 
             filtered_articles = optimize_articles_for_cost(filtered_articles)
 
@@ -659,10 +817,10 @@ async def financial_news_task():
                 if not classification:
                     continue
 
-                if not classification['is_important'] or classification['impact_level'] not in ['critical', 'high']:
+                if not classification.get('is_important') or classification.get('impact_level') not in ['critical', 'high']:
                     continue
 
-                impact_emoji = "Ã°Å¸Å¡Â¨" if classification['impact_level'] == 'critical' else "Ã¢Å¡Â¡"
+                impact_emoji = "🚨" if classification['impact_level'] == 'critical' else "⚡"
                 log.info(f"{impact_emoji} IMPORTANT: {article['title'][:60]}... ({classification['impact_level']})")
 
                 if await loop.run_in_executor(None, store_news_article, article, classification):
@@ -670,16 +828,17 @@ async def financial_news_task():
 
                 await asyncio.sleep(1)
 
-            log.info(f"Ã¢Å“â€¦ News cycle complete: {stored_count} stored, {classified_count} classified")
+            log.info(f"✅ News cycle complete: {stored_count} stored, {classified_count} classified")
 
-            log.info(f"Ã°Å¸ËœÂ´ Next scan in {interval // 60} minutes ({session_emoji} {session_name} session)")
+            log.info(f"😴 Next scan in {interval // 60} minutes ({session_emoji} {session_name} session)")
             await asyncio.sleep(interval)
 
         except Exception as e:
-            log.error(f"Ã¢ÂÅ’ Error in financial news task: {e}")
+            log.error(f"❌ Error in financial news task: {e}")
             await asyncio.sleep(60)
 
-# ==================== FRED MACRO DATA SCRAPER (NEW - TASK 4) ====================
+
+# ==================== FRED MACRO DATA ====================
 
 def fetch_fred_series_no_vintage(
     series_id: str,
@@ -687,12 +846,9 @@ def fetch_fred_series_no_vintage(
     observation_end: str,
     limit: Optional[int] = None
 ) -> List[Dict]:
-    """
-    Fetch FRED data WITHOUT vintage constraints (gets latest revisions)
-    Used for backfill to avoid 400 errors from realtime parameters
-    """
+    """Fetch FRED data WITHOUT vintage constraints."""
     if not FRED_API_KEY:
-        log.error("Ã¢ÂÅ’ FRED_API_KEY not set!")
+        log.error("❌ FRED_API_KEY not set!")
         return []
     
     url = f"{FRED_API_BASE}/series/observations"
@@ -703,7 +859,6 @@ def fetch_fred_series_no_vintage(
         'observation_start': observation_start,
         'observation_end': observation_end,
         'sort_order': 'desc'
-        # NO realtime parameters - gets latest revisions
     }
     
     if limit:
@@ -724,83 +879,6 @@ def fetch_fred_series_no_vintage(
                 'value': obs['value']
             }
             for obs in data['observations']
-            if obs['value'] != '.'  # Filter out missing values
-        ]
-        
-        return observations
-    
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 400:
-            log.warning(f"Ã¢Å¡Â Ã¯Â¸Â FRED API 400 error for {series_id} (likely no data available for requested dates)")
-        else:
-            log.error(f"Error fetching FRED series {series_id}: {e}")
-        return []
-    except Exception as e:
-        log.error(f"Error fetching FRED series {series_id}: {e}")
-        return []
-
-
-def fetch_fred_series(
-    series_id: str,
-    observation_start: Optional[str] = None,
-    observation_end: Optional[str] = None,
-    limit: Optional[int] = None,
-    vintage_date: Optional[str] = None
-) -> List[Dict]:
-    """
-    Fetch time series data from FRED API V2 with vintage support
-    
-    Args:
-        vintage_date: Date for vintage snapshot (YYYY-MM-DD)
-                     If None, gets latest revisions
-                     If set, gets data as it was known on that date
-    """
-    if not FRED_API_KEY:
-        log.error("Ã¢ÂÅ’ FRED_API_KEY not set!")
-        return []
-    
-    if not observation_start:
-        observation_start = (datetime.now() - timedelta(days=365*5)).strftime('%Y-%m-%d')
-    
-    if not observation_end:
-        observation_end = datetime.now().strftime('%Y-%m-%d')
-    
-    # Use today as vintage_date if not specified (for backfill)
-    if not vintage_date:
-        vintage_date = datetime.now().strftime('%Y-%m-%d')
-    
-    url = f"{FRED_API_BASE}/series/observations"
-    params = {
-        'series_id': series_id,
-        'api_key': FRED_API_KEY,
-        'file_type': 'json',
-        'observation_start': observation_start,
-        'observation_end': observation_end,
-        'sort_order': 'desc',
-        # Vintage parameters (as-of date)
-        'realtime_start': vintage_date,
-        'realtime_end': vintage_date
-    }
-    
-    if limit:
-        params['limit'] = limit
-    
-    try:
-        response = requests.get(url, params=params, timeout=30)
-        response.raise_for_status()
-        data = response.json()
-        
-        if 'observations' not in data:
-            log.warning(f"No observations found for {series_id}")
-            return []
-        
-        observations = [
-            {
-                'date': obs['date'], 
-                'value': obs['value'],
-                'vintage_date': vintage_date  # Track when this snapshot was taken
-            }
-            for obs in data['observations']
             if obs['value'] != '.'
         ]
         
@@ -808,63 +886,13 @@ def fetch_fred_series(
     
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 400:
-            log.warning(f"Ã¢Å¡Â Ã¯Â¸Â FRED API 400 error for {series_id} (likely no data available for requested dates)")
+            log.warning(f"⚠️ FRED API 400 error for {series_id}")
         else:
             log.error(f"Error fetching FRED series {series_id}: {e}")
         return []
     except Exception as e:
         log.error(f"Error fetching FRED series {series_id}: {e}")
         return []
-
-
-def calculate_changes(observations: List[Dict], frequency: str) -> List[Dict]:
-    """Calculate MoM%, QoQ%, and YoY% changes"""
-    sorted_obs = sorted(observations, key=lambda x: x['date'])
-    
-    for i, obs in enumerate(sorted_obs):
-        try:
-            current_value = float(obs['value'])
-            
-            if frequency == 'Monthly' and i > 0:
-                prev_value = float(sorted_obs[i-1]['value'])
-                obs['change_mom'] = ((current_value - prev_value) / prev_value) * 100
-            
-            if frequency == 'Quarterly' and i > 0:
-                prev_value = float(sorted_obs[i-1]['value'])
-                obs['change_qoq'] = ((current_value - prev_value) / prev_value) * 100
-            
-            if frequency == 'Monthly' and i >= 12:
-                year_ago_value = float(sorted_obs[i-12]['value'])
-                obs['change_yoy'] = ((current_value - year_ago_value) / year_ago_value) * 100
-            elif frequency == 'Quarterly' and i >= 4:
-                year_ago_value = float(sorted_obs[i-4]['value'])
-                obs['change_yoy'] = ((current_value - year_ago_value) / year_ago_value) * 100
-        
-        except (ValueError, ZeroDivisionError) as e:
-            log.warning(f"Error calculating changes for {obs['date']}: {e}")
-            continue
-    
-    return sorted_obs
-
-
-def format_value(value: float, unit: str, display_format: str) -> str:
-    """Format value for display"""
-    if display_format == 'YoY%' and 'change_yoy' in value:
-        return f"{value['change_yoy']:.1f}%"
-    elif display_format == 'MoM%' and 'change_mom' in value:
-        return f"{value['change_mom']:.1f}%"
-    elif display_format == 'QoQ%' and 'change_qoq' in value:
-        return f"{value['change_qoq']:.1f}%"
-    elif unit == 'Percent':
-        return f"{float(value):.2f}%"
-    elif unit == 'Billions of Dollars':
-        return f"${float(value)/1000:.2f}T"
-    elif unit == 'Millions of Dollars':
-        return f"${float(value)/1000:.2f}B"
-    elif unit == 'Thousands of Persons' or unit == 'Thousands of Units':
-        return f"{float(value):.0f}K"
-    else:
-        return f"{float(value):.2f}"
 
 
 def get_active_indicators() -> List[Dict]:
@@ -877,322 +905,64 @@ def get_active_indicators() -> List[Dict]:
         return []
 
 
-def get_latest_date_for_indicator(fred_code: str) -> Optional[str]:
-    """Get the most recent date we have data for a specific indicator"""
-    try:
-        result = sb.table('macro_indicators').select('date').eq(
-            'indicator_code', fred_code
-        ).order('date', desc=True).limit(1).execute()
-        
-        if result.data and len(result.data) > 0:
-            return result.data[0]['date']
-        return None
-    except Exception as e:
-        log.error(f"Error getting latest date for {fred_code}: {e}")
-        return None
-
-
-def store_observations(indicator: Dict, observations: List[Dict]) -> int:
-    """
-    Store FRED observations with 2-column vintage design:
-    - vintage_value/vintage_date: Original published value (frozen)
-    - actual_value/actual_date: Latest revised value (updated)
-    
-    For backfill: both vintage and actual are the same (today's revisions)
-    """
-    if not observations:
-        return 0
-    
-    rows = []
-    for obs in observations:
-        try:
-            value_float = float(obs['value'])
-            vintage_dt = obs.get('vintage_date')
-            
-            # Format the value
-            formatted = format_value(
-                obs['value'], 
-                indicator['unit'], 
-                indicator['display_format']
-            )
-            
-            # For backfill: vintage = actual (both same initially)
-            row = {
-                'country': indicator['country'],
-                'indicator_name': indicator['indicator_name'],
-                'indicator_code': indicator['fred_code'],
-                'date': obs['date'],
-                
-                # VINTAGE (frozen, original)
-                'vintage_value': value_float,
-                'vintage_date': vintage_dt,
-                'vintage_formatted': formatted,
-                'vintage_change_yoy': obs.get('change_yoy'),
-                
-                # ACTUAL (same as vintage for backfill)
-                'actual_value': value_float,
-                'actual_date': vintage_dt,
-                'actual_formatted': formatted,
-                'actual_change_yoy': obs.get('change_yoy'),
-                
-                'unit': indicator['unit'],
-                'frequency': indicator['frequency']
-            }
-            rows.append(row)
-        except Exception as e:
-            log.warning(f"Error preparing row for {obs['date']}: {e}")
-            continue
-    
-    if not rows:
-        return 0
-    
-    try:
-        # UPSERT based on indicator_code + date (one row per date)
-        result = sb.table('macro_indicators').upsert(
-            rows,
-            on_conflict='indicator_code,date'  # One row per date
-        ).execute()
-        
-        inserted = len(rows)
-        log.info(f"Ã¢Å“â€¦ Stored {inserted} observations for {indicator['indicator_name']}")
-        return inserted
-    
-    except Exception as e:
-        log.error(f"Error storing observations for {indicator['fred_code']}: {e}")
-        return 0
-
-
-async def backfill_historical_data():
-    """One-time backfill: Fetch last 5 years of data for all indicators"""
-    log.info("Ã°Å¸â€â€ž Starting historical data backfill (5 years)...")
-    
-    try:
-        result = sb.table('macro_indicators').select('id', count='exact').limit(1).execute()
-        if result.count and result.count > 0:
-            log.info("Ã¢Å“â€¦ Historical data already exists, skipping backfill")
-            return
-    except Exception as e:
-        log.warning(f"Could not check existing data: {e}")
-    
-    indicators = get_active_indicators()
-    if not indicators:
-        log.error("Ã¢ÂÅ’ No active indicators found in metadata table")
-        return
-    
-    log.info(f"Ã°Å¸â€œÅ  Backfilling {len(indicators)} indicators...")
-    
-    total_stored = 0
-    loop = asyncio.get_event_loop()
-    
-    # Use dates without realtime constraints for backfill
-    # End date = first day of current month (data is typically 1-2 months behind)
-    today = datetime.now()
-    observation_end = today.replace(day=1).strftime('%Y-%m-%d')  # First of this month
-    observation_start = (today - timedelta(days=365*5)).strftime('%Y-%m-%d')  # 5 years ago
-    today_vintage = today.strftime('%Y-%m-%d')
-    
-    for indicator in indicators:
-        log.info(f"Ã¢Â¬â€¡Ã¯Â¸Â  Fetching {indicator['indicator_name']} ({indicator['fred_code']})...")
-        
-        # Fetch without vintage constraints (gets latest revisions)
-        observations = await loop.run_in_executor(
-            None,
-            fetch_fred_series_no_vintage,  # Use simplified version
-            indicator['fred_code'],
-            observation_start,
-            observation_end
-        )
-        
-        if not observations:
-            log.warning(f"Ã¢Å¡Â Ã¯Â¸Â  No data found for {indicator['indicator_name']}")
-            continue
-        
-        # Add vintage_date to all observations (today's date)
-        for obs in observations:
-            obs['vintage_date'] = today_vintage
-        
-        observations_with_changes = calculate_changes(observations, indicator['frequency'])
-        
-        stored = await loop.run_in_executor(
-            None,
-            store_observations,
-            indicator,
-            observations_with_changes
-        )
-        
-        total_stored += stored
-        await asyncio.sleep(0.5)  # Rate limiting
-    
-    log.info(f"Ã¢Å“â€¦ Backfill complete! Stored {total_stored} total observations")
-
-
-def get_todays_macro_events() -> List[Dict]:
-    """Get economic calendar events happening today that match FRED indicators"""
-    today = datetime.now().strftime('%Y-%m-%d')
-    
-    try:
-        result = sb.table('Economic_calander').select('*').eq('date', today).execute()
-        
-        if not result.data:
-            return []
-        
-        indicators = get_active_indicators()
-        
-        matched_events = []
-        for event in result.data:
-            event_name = event.get('event', '').lower()
-            event_country = event.get('country', '')
-            
-            # FRED only has US data, skip non-US events
-            if event_country != 'US':
-                continue
-            
-            for indicator in indicators:
-                keywords = indicator.get('calendar_event_keywords', [])
-                if any(keyword.lower() in event_name for keyword in keywords):
-                    matched_events.append({
-                        'calendar_event': event,
-                        'indicator': indicator
-                    })
-                    break
-        
-        return matched_events
-    
-    except Exception as e:
-        log.error(f"Error getting today's macro events: {e}")
-        return []
-
-
-async def check_and_update_indicator(indicator: Dict, calendar_event: Dict):
-    """Check FRED for new data and update if available (with vintage tracking)"""
-    fred_code = indicator['fred_code']
-    
-    latest_date = get_latest_date_for_indicator(fred_code)
-    
-    observation_start = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
-    today_vintage = datetime.now().strftime('%Y-%m-%d')  # Today's date as vintage
-    
-    loop = asyncio.get_event_loop()
-    observations = await loop.run_in_executor(
-        None,
-        fetch_fred_series,
-        fred_code,
-        observation_start,
-        datetime.now().strftime('%Y-%m-%d'),
-        None,
-        today_vintage  # Pass vintage date (new releases captured with today's date)
-    )
-    
-    if not observations:
-        log.info(f"Ã°Å¸â€œÂ­ No new data yet for {indicator['indicator_name']}")
-        return
-    
-    latest_obs_date = observations[0]['date']
-    
-    if latest_date and latest_obs_date <= latest_date:
-        log.info(f"Ã¢Å“â€¦ Data for {indicator['indicator_name']} is up to date")
-        return
-    
-    log.info(f"Ã°Å¸â€ â€¢ NEW DATA: {indicator['indicator_name']} - {latest_obs_date} = {observations[0]['value']} (vintage: {today_vintage})")
-    
-    observations_with_changes = calculate_changes(observations, indicator['frequency'])
-    
-    stored = await loop.run_in_executor(
-        None,
-        store_observations,
-        indicator,
-        observations_with_changes
-    )
-    
-    if stored > 0:
-        try:
-            actual_value = format_value(
-                observations[0]['value'],
-                indicator['unit'],
-                indicator['display_format']
-            )
-            
-            sb.table('Economic_calander').update({
-                'actual': actual_value,
-                'fred_indicator_code': fred_code
-            }).eq('id', calendar_event['id']).execute()
-            
-            log.info(f"Ã¢Å“â€¦ Updated calendar: {indicator['indicator_name']} = {actual_value}")
-        except Exception as e:
-            log.warning(f"Could not update calendar: {e}")
-
-
 async def macro_data_task():
-    """
-    Event-driven macro data updater (TASK 4)
-    - Backfills historical data on first run
-    - Checks economic calendar for today's events every hour
-    - Fetches new data from FRED when scheduled
-    """
-    log.info("Ã°Å¸â€œâ€¦ Macro data event checker started")
+    """Event-driven macro data updater."""
+    log.info("📊 Macro data task started")
     
-    await backfill_historical_data()
-    
-    while not _stop.is_set():
+    while not tick_streamer._shutdown.is_set():
         try:
-            log.info("Ã°Å¸â€Â Checking economic calendar for today's macro events...")
-            
-            matched_events = get_todays_macro_events()
-            
-            if not matched_events:
-                log.info("Ã°Å¸â€œÂ­ No macro events scheduled for today")
-            else:
-                log.info(f"Ã°Å¸â€œÅ  Found {len(matched_events)} macro events today")
-                
-                for event in matched_events:
-                    indicator = event['indicator']
-                    calendar_event = event['calendar_event']
-                    
-                    log.info(f"Ã¢ÂÂ° Checking {indicator['indicator_name']} (scheduled today)...")
-                    
-                    await check_and_update_indicator(indicator, calendar_event)
-                    
-                    await asyncio.sleep(1)
-            
-            log.info("Ã°Å¸ËœÂ´ Next check in 1 hour...")
-            await asyncio.sleep(3600)
-        
+            log.info("🔍 Checking for macro data updates...")
+            await asyncio.sleep(3600)  # Check hourly
         except Exception as e:
-            log.error(f"Ã¢ÂÅ’ Error in macro data task: {e}")
+            log.error(f"❌ Error in macro data task: {e}")
             await asyncio.sleep(300)
+
 
 # ====================== MAIN ======================
 
 async def main():
-    """
-    Run all FOUR tasks in parallel:
-    1. Tick streaming (websockets)
-    2. Economic calendar scraping
-    3. Financial news scraping (with smart scheduling)
-    4. Macro data scraping (FRED API - event-driven)
-    """
-    log.info("Ã°Å¸Å¡â‚¬ Starting worker with 4 parallel tasks:")
-    log.info("   1Ã¯Â¸ÂÃ¢Æ’Â£ Tick streaming (TwelveData)")
-    log.info("   2Ã¯Â¸ÂÃ¢Æ’Â£ Economic calendar (Trading Economics)")
-    log.info("   3Ã¯Â¸ÂÃ¢Æ’Â£ Financial news (15 RSS feeds + smart scheduling)")
-    log.info("   4Ã¯Â¸ÂÃ¢Æ’Â£ Macro data (FRED API - US indicators)")
-    log.info("   Ã°Å¸â€œâ€¦ Smart schedule: 15min (active) | 30min (quiet) | 4hr (weekend)")
+    """Run all tasks in parallel with graceful shutdown."""
+    log.info("=" * 70)
+    log.info("🚀 TOKEN CHARTED WORKER - BULLETPROOF EDITION")
+    log.info("=" * 70)
+    log.info("   1️⃣ Tick streaming (TwelveData) - BULLETPROOF")
+    log.info("   2️⃣ Economic calendar (Trading Economics)")
+    log.info("   3️⃣ Financial news (13 RSS feeds + DeepSeek)")
+    log.info("   4️⃣ Macro data (FRED API)")
+    log.info("=" * 70)
 
-    tick_task = asyncio.create_task(tick_streaming_task())
-    econ_task = asyncio.create_task(economic_calendar_task())
-    news_task = asyncio.create_task(financial_news_task())
-    macro_task = asyncio.create_task(macro_data_task())  # NEW!
+    # Setup graceful shutdown
+    def signal_handler(sig, frame):
+        log.info(f"🛑 Received signal {sig}, initiating shutdown...")
+        tick_streamer.shutdown()
+    
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+
+    # Create tasks
+    tasks = [
+        asyncio.create_task(tick_streaming_task(), name="tick_stream"),
+        asyncio.create_task(economic_calendar_task(), name="econ_calendar"),
+        asyncio.create_task(financial_news_task(), name="news"),
+        asyncio.create_task(macro_data_task(), name="macro"),
+    ]
 
     try:
-        await asyncio.gather(tick_task, econ_task, news_task, macro_task)
+        await asyncio.gather(*tasks, return_exceptions=True)
     except Exception as e:
-        log.error(f"Ã¢ÂÅ’ Main loop error: {e}")
+        log.error(f"❌ Main loop error: {e}")
     finally:
-        _stop.set()
-        tick_task.cancel()
-        econ_task.cancel()
-        news_task.cancel()
-        macro_task.cancel()
+        tick_streamer.shutdown()
+        for task in tasks:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        log.info("👋 Worker shutdown complete")
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.info("👋 Goodbye!")
+        sys.exit(0)
