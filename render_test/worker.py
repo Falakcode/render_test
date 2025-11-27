@@ -1,36 +1,14 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-=============================================================================
-LONDON STRATEGIC EDGE - BULLETPROOF PRODUCTION WORKER v4.0
-=============================================================================
-6 Parallel Tasks:
-  1. Tick Streaming (TwelveData WebSocket) + Watchdog
-  2. Economic Calendar (Quarter-hour scraping)
-  3. Financial News (15 RSS feeds + DeepSeek classification)
-  4. Macro Data (FRED API - event-driven)
-  5. AI Market Briefs (DeepSeek - every 30 min)
-  6. Gap Detection & Auto-Backfill (24 hours on startup, continuous monitoring)
-
-Reliability Features:
-  - Watchdog timer: Forces reconnect if no ticks for 30s
-  - 24-hour candle backfill on startup
-  - Continuous gap detection every 5 minutes
-  - Exponential backoff reconnection
-  - Comprehensive error handling
-  - Health metrics tracking
-=============================================================================
-"""
-
 import os
 import json
 import asyncio
 import logging
-import time
+import signal
+import sys
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
-from typing import Optional, List, Dict, Set
-from decimal import Decimal
+from typing import Optional, List, Dict
+from contextlib import suppress
 
 import websockets
 import requests
@@ -39,8 +17,8 @@ from supabase import create_client
 import feedparser
 import openai
 
-# ================================ ENV ================================
-TD_API_KEY = os.environ["TWELVEDATA_API_KEY"]
+# ------------------------------ ENV ------------------------------
+TD_API_KEY   = os.environ["TWELVEDATA_API_KEY"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
@@ -48,636 +26,376 @@ FRED_API_KEY = os.environ.get("FRED_API_KEY")
 
 SUPABASE_TABLE = os.environ.get("SUPABASE_TABLE", "tickdata")
 
-# The 16 pairs to stream
-SYMBOLS_LIST = [
-    "BTC/USD", "ETH/USD", "XRP/USD", "XMR/USD", "SOL/USD", "BNB/USD", "ADA/USD", "DOGE/USD",
-    "XAU/USD", "EUR/USD", "GBP/USD", "USD/CAD", "GBP/AUD", "AUD/CAD", "EUR/GBP", "USD/JPY"
+# ==================== 202 TRADING PAIRS ====================
+# Crypto (39 pairs)
+CRYPTO_SYMBOLS = [
+    "1INCH/USD", "AAVE/USD", "ADA/BTC", "ADA/USD", "ALGO/USD", "APE/USD", "ARB/USD",
+    "ATOM/USD", "AVAX/BTC", "AVAX/USD", "BCH/USD", "BNB/USD", "BTC/USD", "COMP/USD",
+    "CRV/USD", "DOGE/BTC", "DOGE/USD", "DOT/USD", "ETC/USD", "ETH/BTC", "ETH/USD",
+    "FIL/USD", "GRT/USD", "LDO/USD", "LINK/BTC", "LINK/USD", "LTC/USD", "MANA/USD",
+    "NEAR/USD", "OP/USD", "SAND/USD", "SHIB/USD", "SNX/USD", "SOL/BTC", "SOL/USD",
+    "SUSHI/USD", "TRX/USD", "UNI/USD", "VET/USD", "XLM/USD", "XMR/USD", "XRP/BTC",
+    "XRP/USD", "YFI/USD"
 ]
-SYMBOLS = ",".join(SYMBOLS_LIST)
+
+# Forex (51 pairs)
+FOREX_SYMBOLS = [
+    "AUD/CAD", "AUD/CHF", "AUD/JPY", "AUD/NZD", "AUD/SGD",
+    "CAD/CHF", "CAD/JPY", "CHF/JPY",
+    "EUR/AUD", "EUR/CAD", "EUR/CHF", "EUR/CZK", "EUR/DKK", "EUR/GBP", "EUR/HUF",
+    "EUR/JPY", "EUR/NOK", "EUR/NZD", "EUR/PLN", "EUR/SEK", "EUR/TRY", "EUR/USD",
+    "GBP/AUD", "GBP/CAD", "GBP/CHF", "GBP/JPY", "GBP/NOK", "GBP/NZD", "GBP/PLN",
+    "GBP/SEK", "GBP/TRY", "GBP/USD", "GBP/ZAR",
+    "NZD/CAD", "NZD/CHF", "NZD/JPY", "NZD/SGD",
+    "USD/ARS", "USD/BRL", "USD/CAD", "USD/CLP", "USD/CNH", "USD/COP", "USD/CZK",
+    "USD/DKK", "USD/EGP", "USD/HKD", "USD/HUF", "USD/IDR", "USD/ILS", "USD/INR",
+    "USD/JPY", "USD/KRW", "USD/MXN", "USD/MYR", "USD/NOK", "USD/PHP", "USD/PKR",
+    "USD/PLN", "USD/SEK", "USD/SGD", "USD/THB", "USD/TRY", "USD/TWD", "USD/ZAR"
+]
+
+# Commodities (5 pairs)
+COMMODITIES_SYMBOLS = [
+    "XAG/USD", "XAU/USD", "XPD/USD", "XPT/USD"
+]
+
+# Stocks (65 symbols)
+STOCK_SYMBOLS = [
+    "ABBV", "ABNB", "ABT", "ADBE", "AMD", "AVGO", "AXP", "BA", "BAC", "BKNG",
+    "BLK", "C", "CAT", "COIN", "COP", "COST", "CRM", "CSCO", "CVS", "CVX",
+    "DIS", "GE", "GS", "HD", "INTC", "INTU", "JNJ", "JPM", "KO", "LLY",
+    "LOW", "MA", "MCD", "META", "MRK", "MS", "NFLX", "NKE", "NOW", "NVDA",
+    "ORCL", "PEP", "PFE", "PG", "PYPL", "QCOM", "SBUX", "SCHW", "SNOW", "SQ",
+    "TGT", "TMO", "TSLA", "TXN", "UBER", "UNH", "USB", "V", "WFC", "WMT", "XOM"
+]
+
+# ETFs & Indices (37 symbols)
+ETF_INDEX_SYMBOLS = [
+    "AEX", "ARKK", "BKX", "DIA", "FTSE", "GLD", "HSI", "HYG", "IBEX", "IWM",
+    "NBI", "NDX", "SLV", "SMI", "SPX", "TLT", "USO", "UTY", "VOO", "VTI",
+    "XLE", "XLF", "XLI", "XLK", "XLP", "XLU", "XLV", "XLY"
+]
+
+# Combine all symbols
+ALL_SYMBOLS = CRYPTO_SYMBOLS + FOREX_SYMBOLS + COMMODITIES_SYMBOLS + STOCK_SYMBOLS + ETF_INDEX_SYMBOLS
+
+# For WebSocket subscription (comma-separated string)
+SYMBOLS = ",".join(ALL_SYMBOLS)
 
 WS_URL = f"wss://ws.twelvedata.com/v1/quotes/price?apikey={TD_API_KEY}"
 TD_REST_URL = "https://api.twelvedata.com/time_series"
 
+# Economic calendar scraping interval (in seconds)
+ECON_SCRAPE_INTERVAL = 3600
+
 # FRED API Base URL
 FRED_API_BASE = "https://api.stlouisfed.org/fred"
 
-# ======================== RELIABILITY SETTINGS ========================
-WATCHDOG_TIMEOUT_SECS = 30          # Force reconnect if no ticks for 30s
-BACKFILL_HOURS = 24                  # Backfill last 24 hours on startup
-GAP_CHECK_INTERVAL_SECS = 300        # Check for gaps every 5 minutes
-GAP_SCAN_HOURS = 6                   # Scan last 6 hours for gaps
-MAX_BACKFILL_RETRIES = 3             # Max retries per symbol backfill
-MARKET_BRIEF_INTERVAL = 1800         # 30 minutes
+# ==================== BULLETPROOF TICK STREAMING CONFIG ====================
+BATCH_MAX = 500
+BATCH_FLUSH_SECS = 2
+WATCHDOG_TIMEOUT_SECS = 30      # Kill connection if no tick for 30s
+CONNECTION_TIMEOUT_SECS = 15     # Timeout for initial connection
+MAX_RECONNECT_DELAY = 30         # Max backoff delay
+HEALTH_LOG_INTERVAL = 60         # Log health status every 60s
 
-# ======================== CLIENTS/LOGGING ========================
+# Gap fill settings
+GAP_SCAN_INTERVAL = 300          # Check for gaps every 5 minutes
+MAX_GAP_HOURS = 4                # Look back 4 hours for gaps
+MIN_GAP_MINUTES = 3              # Only fill gaps > 3 minutes
+BACKFILL_RATE_LIMIT = 0.5        # Delay between REST API calls
+
+# --------------------------- CLIENTS/LOG -------------------------
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-deepseek_client = openai.OpenAI(
-    api_key=DEEPSEEK_API_KEY, 
-    base_url="https://api.deepseek.com"
-) if DEEPSEEK_API_KEY else None
+deepseek_client = openai.OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com") if DEEPSEEK_API_KEY else None
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("bulletproof-worker")
+log = logging.getLogger("worker")
 
-# ======================== GLOBAL STATE ========================
-_batch = []
-_lock = asyncio.Lock()
-_stop = asyncio.Event()
+# ==================== BULLETPROOF TICK STREAMING ====================
 
-# Watchdog state
-_last_tick_time = time.time()
-_tick_count = 0
-_reconnect_count = 0
-
-# Health metrics
-_health_metrics = {
-    "last_tick_time": None,
-    "ticks_per_minute": 0,
-    "gaps_detected": 0,
-    "gaps_filled": 0,
-    "backfills_completed": 0,
-    "ws_reconnects": 0,
-    "last_gap_check": None,
-    "startup_time": datetime.now(timezone.utc).isoformat(),
-}
-
-# ======================== UTILITY FUNCTIONS ========================
-
-def _to_float(x):
-    """Safely convert to float."""
-    try:
-        return float(x) if x is not None else None
-    except Exception:
-        return None
-
-
-def _to_decimal(x):
-    """Safely convert to Decimal for precision."""
-    try:
+class BulletproofTickStreamer:
+    """
+    Bulletproof WebSocket tick streamer with:
+    - Watchdog timer (kills stale connections)
+    - Heartbeat monitoring
+    - Aggressive reconnection
+    - Health logging
+    - Graceful shutdown
+    """
+    
+    def __init__(self):
+        self._batch: List[dict] = []
+        self._lock = asyncio.Lock()
+        self._shutdown = asyncio.Event()
+        self._ws: Optional[websockets.WebSocketClientProtocol] = None
+        self._last_tick_time: datetime = datetime.now(timezone.utc)
+        self._tick_count: int = 0
+        self._connection_count: int = 0
+        self._last_health_log: datetime = datetime.now(timezone.utc)
+        self._is_connected: bool = False
+        
+    def _to_float(self, x) -> Optional[float]:
+        """Convert to float preserving precision."""
         if x is None:
             return None
-        return Decimal(str(x))
-    except Exception:
-        return None
+        try:
+            return float(Decimal(str(x)))
+        except (InvalidOperation, ValueError, TypeError):
+            return None
 
+    def _to_ts(self, v) -> datetime:
+        """Return aware UTC datetime from epoch ms, epoch s, or ISO string."""
+        if v is None:
+            return datetime.now(timezone.utc)
 
-def _to_ts(v):
-    """Return aware UTC datetime from epoch ms, epoch s, or ISO string."""
-    if v is None:
-        return datetime.now(timezone.utc)
+        try:
+            t = float(v)
+            if t > 10**12:
+                t /= 1000.0
+            return datetime.fromtimestamp(t, tz=timezone.utc)
+        except Exception:
+            pass
 
-    try:
-        t = float(v)
-        if t > 10**12:
-            t /= 1000.0
-        return datetime.fromtimestamp(t, tz=timezone.utc)
-    except Exception:
-        pass
+        try:
+            dt = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            return datetime.now(timezone.utc)
 
-    try:
-        dt = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except Exception:
-        return datetime.now(timezone.utc)
+    async def _flush(self):
+        """Flush batch to Supabase."""
+        async with self._lock:
+            if not self._batch:
+                return
+            payload, self._batch = self._batch, []
 
+        try:
+            sb.table(SUPABASE_TABLE).insert(payload).execute()
+            log.info("✅ Inserted %d rows into %s", len(payload), SUPABASE_TABLE)
+        except Exception as e:
+            log.error("❌ Insert failed: %s - re-queuing %d rows", e, len(payload))
+            async with self._lock:
+                self._batch[:0] = payload
 
-def symbol_to_table(symbol: str) -> str:
-    """Convert symbol like 'BTC/USD' to table name 'candles_btc_usd'."""
-    return "candles_" + symbol.lower().replace("/", "_")
+    async def _periodic_flush(self):
+        """Flush batch every BATCH_FLUSH_SECS."""
+        while not self._shutdown.is_set():
+            await asyncio.sleep(BATCH_FLUSH_SECS)
+            await self._flush()
 
-
-def is_market_open(symbol: str) -> bool:
-    """Check if market is open for a given symbol."""
-    now = datetime.now(timezone.utc)
-    day = now.weekday()
-    hour = now.hour
-    
-    # Crypto: 24/7
-    crypto_symbols = ["BTC/USD", "ETH/USD", "XRP/USD", "XMR/USD", "SOL/USD", 
-                      "BNB/USD", "ADA/USD", "DOGE/USD"]
-    if symbol in crypto_symbols:
-        return True
-    
-    # Forex/Commodities: Sunday 22:00 UTC - Friday 22:00 UTC
-    if day == 6:  # Sunday
-        return hour >= 22
-    elif day == 5:  # Friday
-        return hour < 22
-    elif day == 4:  # Saturday
-        return False
-    else:
-        return True
-
-
-# ======================== TICK STREAMING WITH WATCHDOG ========================
-
-async def _flush():
-    """Flush tick batch to Supabase."""
-    global _batch
-    async with _lock:
-        if not _batch:
+    async def _handle(self, msg: dict):
+        """Handle incoming tick message."""
+        if msg.get("event") != "price":
             return
-        payload, _batch = _batch, []
 
-    try:
-        sb.table(SUPABASE_TABLE).insert(payload).execute()
-        log.info(f"✅ Inserted {len(payload)} ticks into {SUPABASE_TABLE}")
-    except Exception as e:
-        log.error(f"❌ Tick insert failed: {e}")
-        # Re-queue failed batch
-        async with _lock:
-            _batch[:0] = payload
+        row = {
+            "symbol": msg.get("symbol"),
+            "ts": self._to_ts(msg.get("timestamp")).isoformat(),
+            "price": self._to_float(msg.get("price")),
+            "bid": self._to_float(msg.get("bid")),
+            "ask": self._to_float(msg.get("ask")),
+            "day_volume": (
+                self._to_float(msg.get("day_volume"))
+                or self._to_float(msg.get("dayVolume"))
+                or self._to_float(msg.get("volume"))
+            ),
+        }
 
+        if not row["symbol"] or row["price"] is None:
+            return
 
-async def _periodic_flush():
-    """Periodically flush tick batch."""
-    while not _stop.is_set():
-        try:
-            await asyncio.wait_for(_stop.wait(), timeout=2)
-        except asyncio.TimeoutError:
-            await _flush()
+        # Update watchdog
+        self._last_tick_time = datetime.now(timezone.utc)
+        self._tick_count += 1
 
+        async with self._lock:
+            self._batch.append(row)
+            if len(self._batch) >= BATCH_MAX:
+                await self._flush()
 
-async def _handle_tick(msg: dict):
-    """Handle incoming tick message."""
-    global _last_tick_time, _tick_count
-    
-    if msg.get("event") != "price":
-        return
-
-    row = {
-        "symbol": msg.get("symbol"),
-        "ts": _to_ts(msg.get("timestamp")).isoformat(),
-        "price": _to_float(msg.get("price")),
-        "bid": _to_float(msg.get("bid")),
-        "ask": _to_float(msg.get("ask")),
-        "day_volume": (
-            _to_float(msg.get("day_volume"))
-            or _to_float(msg.get("dayVolume"))
-            or _to_float(msg.get("volume"))
-        ),
-    }
-
-    if not row["symbol"] or row["price"] is None:
-        return
-
-    # Update watchdog timer
-    _last_tick_time = time.time()
-    _tick_count += 1
-    _health_metrics["last_tick_time"] = datetime.now(timezone.utc).isoformat()
-
-    async with _lock:
-        _batch.append(row)
-        if len(_batch) >= 500:
-            await _flush()
-
-
-async def _watchdog_monitor():
-    """
-    Watchdog: Monitor tick flow and raise exception if stale.
-    This runs alongside the WebSocket receiver.
-    """
-    global _last_tick_time
-    
-    while not _stop.is_set():
-        await asyncio.sleep(5)  # Check every 5 seconds
+    async def _watchdog(self):
+        """
+        WATCHDOG: Monitor for stale connections.
+        If no tick received for WATCHDOG_TIMEOUT_SECS, force close the WebSocket.
+        """
+        log.info("🐕 Watchdog started (timeout: %ds)", WATCHDOG_TIMEOUT_SECS)
         
-        elapsed = time.time() - _last_tick_time
-        
-        if elapsed > WATCHDOG_TIMEOUT_SECS:
-            log.warning(f"🐕 WATCHDOG: No ticks for {elapsed:.0f}s - forcing reconnect!")
-            raise Exception(f"Watchdog timeout: No ticks for {elapsed:.0f}s")
+        while not self._shutdown.is_set():
+            await asyncio.sleep(5)
+            
+            if not self._is_connected:
+                continue
+                
+            elapsed = (datetime.now(timezone.utc) - self._last_tick_time).total_seconds()
+            
+            if elapsed > WATCHDOG_TIMEOUT_SECS:
+                log.warning("🐕 WATCHDOG: No tick for %.1fs - forcing reconnection!", elapsed)
+                if self._ws:
+                    try:
+                        await self._ws.close()
+                    except Exception:
+                        pass
+                self._is_connected = False
 
+    async def _health_logger(self):
+        """Log health status periodically."""
+        while not self._shutdown.is_set():
+            await asyncio.sleep(HEALTH_LOG_INTERVAL)
+            
+            elapsed = (datetime.now(timezone.utc) - self._last_tick_time).total_seconds()
+            status = "🟢 HEALTHY" if elapsed < 10 else "🟡 STALE" if elapsed < WATCHDOG_TIMEOUT_SECS else "🔴 DEAD"
+            
+            log.info(
+                "💓 HEALTH: %s | Connected: %s | Ticks: %d | Last tick: %.1fs ago | Reconnects: %d | Symbols: %d",
+                status,
+                self._is_connected,
+                self._tick_count,
+                elapsed,
+                self._connection_count,
+                len(ALL_SYMBOLS)
+            )
 
-async def _run_websocket():
-    """Run WebSocket connection with watchdog."""
-    global _last_tick_time, _reconnect_count
-    
-    _last_tick_time = time.time()  # Reset watchdog
-    
-    async with websockets.connect(
-        WS_URL,
-        ping_interval=20,
-        ping_timeout=20,
-        max_queue=1000,
-    ) as ws:
-        # Subscribe to symbols
-        await ws.send(json.dumps({
-            "action": "subscribe",
-            "params": {"symbols": SYMBOLS}
-        }))
-        log.info(f"🚀 WebSocket connected - Subscribed to {len(SYMBOLS_LIST)} symbols")
-        
-        # Start periodic flusher and watchdog
-        flusher = asyncio.create_task(_periodic_flush())
-        watchdog = asyncio.create_task(_watchdog_monitor())
+    async def _connect_and_stream(self):
+        """Single connection attempt with proper error handling."""
+        self._connection_count += 1
+        log.info("🔌 Connection attempt #%d...", self._connection_count)
         
         try:
-            async for raw in ws:
+            # Connect with timeout
+            self._ws = await asyncio.wait_for(
+                websockets.connect(
+                    WS_URL,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    close_timeout=10,
+                    max_queue=1000,
+                ),
+                timeout=CONNECTION_TIMEOUT_SECS
+            )
+            
+            # Subscribe
+            await self._ws.send(json.dumps({
+                "action": "subscribe",
+                "params": {"symbols": SYMBOLS}
+            }))
+            
+            log.info("🚀 Connected and subscribed to %d symbols", len(ALL_SYMBOLS))
+            self._is_connected = True
+            self._last_tick_time = datetime.now(timezone.utc)
+            
+            # Stream messages
+            async for raw in self._ws:
+                if self._shutdown.is_set():
+                    break
                 try:
                     data = json.loads(raw)
-                    await _handle_tick(data)
+                    await self._handle(data)
                 except json.JSONDecodeError:
                     continue
+                    
+        except asyncio.TimeoutError:
+            log.error("⏱️ Connection timeout after %ds", CONNECTION_TIMEOUT_SECS)
+        except websockets.exceptions.ConnectionClosed as e:
+            log.warning("🔌 Connection closed: code=%s reason=%s", e.code, e.reason)
+        except Exception as e:
+            log.error("❌ Connection error: %s", e)
         finally:
+            self._is_connected = False
+            if self._ws:
+                with suppress(Exception):
+                    await self._ws.close()
+            self._ws = None
+
+    async def run(self):
+        """
+        Main run loop with bulletproof reconnection.
+        Never exits unless shutdown is requested.
+        """
+        log.info("=" * 60)
+        log.info("🚀 BULLETPROOF TICK STREAMER STARTING")
+        log.info("=" * 60)
+        log.info("📊 Total symbols: %d", len(ALL_SYMBOLS))
+        log.info("   Crypto: %d | Forex: %d | Commodities: %d", 
+                 len(CRYPTO_SYMBOLS), len(FOREX_SYMBOLS), len(COMMODITIES_SYMBOLS))
+        log.info("   Stocks: %d | ETFs/Indices: %d",
+                 len(STOCK_SYMBOLS), len(ETF_INDEX_SYMBOLS))
+        log.info("🐕 Watchdog timeout: %ds", WATCHDOG_TIMEOUT_SECS)
+        log.info("🔄 Max reconnect delay: %ds", MAX_RECONNECT_DELAY)
+        log.info("=" * 60)
+        
+        # Start background tasks
+        flusher = asyncio.create_task(self._periodic_flush())
+        watchdog = asyncio.create_task(self._watchdog())
+        health = asyncio.create_task(self._health_logger())
+        
+        backoff = 1
+        
+        try:
+            while not self._shutdown.is_set():
+                try:
+                    await self._connect_and_stream()
+                    
+                    if self._shutdown.is_set():
+                        break
+                    
+                    # Connection ended - prepare to reconnect
+                    log.info("🔄 Reconnecting in %ds...", backoff)
+                    await asyncio.sleep(backoff)
+                    backoff = min(MAX_RECONNECT_DELAY, backoff * 2)
+                    
+                except Exception as e:
+                    log.error("💥 Unexpected error in main loop: %s", e)
+                    await asyncio.sleep(backoff)
+                    backoff = min(MAX_RECONNECT_DELAY, backoff * 2)
+                    
+                # Reset backoff on successful long connection
+                if self._tick_count > 0:
+                    elapsed = (datetime.now(timezone.utc) - self._last_tick_time).total_seconds()
+                    if elapsed < 5:
+                        backoff = 1
+                        
+        finally:
+            log.info("🛑 Shutting down tick streamer...")
+            await self._flush()
             flusher.cancel()
             watchdog.cancel()
-            await _flush()
+            health.cancel()
+            with suppress(asyncio.CancelledError):
+                await flusher
+                await watchdog
+                await health
+
+    def shutdown(self):
+        """Request graceful shutdown."""
+        log.info("🛑 Shutdown requested")
+        self._shutdown.set()
+
+
+# Global instance
+tick_streamer = BulletproofTickStreamer()
 
 
 async def tick_streaming_task():
-    """
-    Main tick streaming task with watchdog and exponential backoff reconnection.
-    """
-    global _reconnect_count
-    
-    log.info("📡 Tick streaming task started with watchdog")
-    backoff = 1
-    
-    while not _stop.is_set():
-        try:
-            await _run_websocket()
-            backoff = 1  # Reset on clean exit
-        except Exception as e:
-            _reconnect_count += 1
-            _health_metrics["ws_reconnects"] = _reconnect_count
-            
-            log.warning(f"⚠️ WebSocket error: {e}")
-            log.info(f"🔄 Reconnecting in {backoff}s (attempt #{_reconnect_count})")
-            
-            await asyncio.sleep(backoff)
-            backoff = min(60, backoff * 2)  # Cap at 60 seconds
+    """Entry point for tick streaming."""
+    await tick_streamer.run()
 
 
-# ======================== 24-HOUR CANDLE BACKFILL ========================
-
-def fetch_candles_from_twelvedata(
-    symbol: str,
-    interval: str = "1min",
-    outputsize: int = 1440  # 24 hours of 1-min candles
-) -> List[Dict]:
-    """
-    Fetch historical candles from TwelveData REST API.
-    Returns list of candles with timestamp, open, high, low, close.
-    """
-    try:
-        params = {
-            "symbol": symbol,
-            "interval": interval,
-            "outputsize": outputsize,
-            "apikey": TD_API_KEY,
-            "timezone": "UTC"
-        }
-        
-        response = requests.get(TD_REST_URL, params=params, timeout=30)
-        response.raise_for_status()
-        data = response.json()
-        
-        if "values" not in data:
-            if "message" in data:
-                log.warning(f"⚠️ TwelveData API error for {symbol}: {data['message']}")
-            return []
-        
-        candles = []
-        for v in data["values"]:
-            try:
-                candles.append({
-                    "timestamp": v["datetime"],
-                    "open": Decimal(str(v["open"])),
-                    "high": Decimal(str(v["high"])),
-                    "low": Decimal(str(v["low"])),
-                    "close": Decimal(str(v["close"])),
-                    "symbol": symbol
-                })
-            except (KeyError, ValueError) as e:
-                log.debug(f"Skipping invalid candle: {e}")
-                continue
-        
-        return candles
-        
-    except requests.exceptions.RequestException as e:
-        log.error(f"❌ TwelveData request failed for {symbol}: {e}")
-        return []
-    except Exception as e:
-        log.error(f"❌ Unexpected error fetching {symbol}: {e}")
-        return []
-
-
-def upsert_candles_to_supabase(symbol: str, candles: List[Dict]) -> int:
-    """
-    Upsert candles to the appropriate candles_* table.
-    Returns number of candles upserted.
-    """
-    if not candles:
-        return 0
-    
-    table_name = symbol_to_table(symbol)
-    
-    try:
-        # Prepare rows for upsert
-        rows = []
-        for c in candles:
-            # Parse timestamp
-            ts = c["timestamp"]
-            if isinstance(ts, str):
-                # TwelveData format: "2024-11-27 15:30:00"
-                try:
-                    dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
-                    dt = dt.replace(tzinfo=timezone.utc)
-                    ts = dt.isoformat()
-                except:
-                    ts = ts
-            
-            rows.append({
-                "timestamp": ts,
-                "open": float(c["open"]),
-                "high": float(c["high"]),
-                "low": float(c["low"]),
-                "close": float(c["close"]),
-                "symbol": symbol,
-                "created_at": datetime.now(timezone.utc).isoformat()
-            })
-        
-        # Upsert in batches of 500
-        batch_size = 500
-        total_upserted = 0
-        
-        for i in range(0, len(rows), batch_size):
-            batch = rows[i:i+batch_size]
-            try:
-                sb.table(table_name).upsert(
-                    batch,
-                    on_conflict="timestamp"
-                ).execute()
-                total_upserted += len(batch)
-            except Exception as e:
-                log.warning(f"⚠️ Upsert batch failed for {symbol}: {e}")
-                continue
-        
-        return total_upserted
-        
-    except Exception as e:
-        log.error(f"❌ Upsert failed for {symbol}: {e}")
-        return 0
-
-
-async def backfill_candles_startup():
-    """
-    Backfill last 24 hours of candles for all symbols on startup.
-    This ensures we have data even after downtime.
-    """
-    log.info(f"🔄 Starting 24-hour candle backfill for {len(SYMBOLS_LIST)} symbols...")
-    
-    loop = asyncio.get_event_loop()
-    total_candles = 0
-    successful_symbols = 0
-    
-    for symbol in SYMBOLS_LIST:
-        for attempt in range(MAX_BACKFILL_RETRIES):
-            try:
-                log.info(f"   ⬇️ Fetching {symbol} (attempt {attempt + 1})...")
-                
-                # Fetch from TwelveData
-                candles = await loop.run_in_executor(
-                    None,
-                    fetch_candles_from_twelvedata,
-                    symbol,
-                    "1min",
-                    1440  # 24 hours
-                )
-                
-                if not candles:
-                    log.warning(f"   ⚠️ No candles returned for {symbol}")
-                    await asyncio.sleep(1)
-                    continue
-                
-                # Upsert to Supabase
-                upserted = await loop.run_in_executor(
-                    None,
-                    upsert_candles_to_supabase,
-                    symbol,
-                    candles
-                )
-                
-                if upserted > 0:
-                    total_candles += upserted
-                    successful_symbols += 1
-                    log.info(f"   ✅ {symbol}: {upserted} candles backfilled")
-                    break
-                    
-            except Exception as e:
-                log.warning(f"   ⚠️ Backfill attempt {attempt + 1} failed for {symbol}: {e}")
-                await asyncio.sleep(2)
-        
-        # Rate limiting - TwelveData has limits
-        await asyncio.sleep(0.5)
-    
-    _health_metrics["backfills_completed"] += 1
-    log.info(f"✅ Backfill complete: {total_candles} candles for {successful_symbols}/{len(SYMBOLS_LIST)} symbols")
-    
-    return total_candles
-
-
-# ======================== GAP DETECTION & AUTO-FILL ========================
-
-def detect_gaps_for_symbol(symbol: str, hours: int = 6) -> List[datetime]:
-    """
-    Detect missing 1-minute candles for a symbol.
-    Returns list of missing minute timestamps.
-    """
-    table_name = symbol_to_table(symbol)
-    
-    try:
-        # Get candles from last N hours
-        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
-        
-        result = sb.table(table_name).select("timestamp").gte(
-            "timestamp", cutoff
-        ).order("timestamp", desc=False).execute()
-        
-        if not result.data:
-            return []
-        
-        # Parse timestamps
-        existing_minutes = set()
-        for row in result.data:
-            try:
-                ts = row["timestamp"]
-                if isinstance(ts, str):
-                    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                else:
-                    dt = ts
-                # Truncate to minute
-                dt = dt.replace(second=0, microsecond=0)
-                existing_minutes.add(dt)
-            except:
-                continue
-        
-        if not existing_minutes:
-            return []
-        
-        # Generate expected minutes
-        start = min(existing_minutes)
-        end = max(existing_minutes)
-        
-        expected_minutes = set()
-        current = start
-        while current <= end:
-            # Only expect candles during market hours
-            if is_market_open(symbol):
-                expected_minutes.add(current)
-            current += timedelta(minutes=1)
-        
-        # Find gaps
-        gaps = sorted(expected_minutes - existing_minutes)
-        
-        return gaps
-        
-    except Exception as e:
-        log.error(f"❌ Gap detection failed for {symbol}: {e}")
-        return []
-
-
-async def fill_gaps_for_symbol(symbol: str, gaps: List[datetime]) -> int:
-    """
-    Fill detected gaps by fetching from TwelveData.
-    Returns number of gaps filled.
-    """
-    if not gaps:
-        return 0
-    
-    log.info(f"   🔧 Filling {len(gaps)} gaps for {symbol}")
-    
-    loop = asyncio.get_event_loop()
-    
-    try:
-        # Fetch enough candles to cover the gap period
-        hours_to_fetch = min(24, (len(gaps) // 60) + 2)
-        outputsize = hours_to_fetch * 60
-        
-        candles = await loop.run_in_executor(
-            None,
-            fetch_candles_from_twelvedata,
-            symbol,
-            "1min",
-            outputsize
-        )
-        
-        if not candles:
-            return 0
-        
-        # Upsert all fetched candles (will fill gaps)
-        filled = await loop.run_in_executor(
-            None,
-            upsert_candles_to_supabase,
-            symbol,
-            candles
-        )
-        
-        return filled
-        
-    except Exception as e:
-        log.error(f"❌ Gap fill failed for {symbol}: {e}")
-        return 0
-
-
-async def gap_detection_task():
-    """
-    Continuous gap detection and auto-fill task.
-    Runs every 5 minutes, scans for gaps, and fills them.
-    """
-    log.info(f"🔍 Gap detection task started (every {GAP_CHECK_INTERVAL_SECS}s)")
-    
-    # Wait for initial backfill to complete
-    await asyncio.sleep(60)
-    
-    while not _stop.is_set():
-        try:
-            log.info("🔍 Scanning for candle gaps...")
-            
-            loop = asyncio.get_event_loop()
-            total_gaps = 0
-            total_filled = 0
-            
-            for symbol in SYMBOLS_LIST:
-                # Only check if market is/was open
-                if not is_market_open(symbol):
-                    continue
-                
-                # Detect gaps
-                gaps = await loop.run_in_executor(
-                    None,
-                    detect_gaps_for_symbol,
-                    symbol,
-                    GAP_SCAN_HOURS
-                )
-                
-                if gaps:
-                    total_gaps += len(gaps)
-                    _health_metrics["gaps_detected"] += len(gaps)
-                    log.info(f"   ⚠️ {symbol}: {len(gaps)} gaps found")
-                    
-                    # Fill gaps
-                    filled = await fill_gaps_for_symbol(symbol, gaps)
-                    total_filled += filled
-                    _health_metrics["gaps_filled"] += filled
-                
-                await asyncio.sleep(0.3)  # Rate limiting
-            
-            _health_metrics["last_gap_check"] = datetime.now(timezone.utc).isoformat()
-            
-            if total_gaps > 0:
-                log.info(f"✅ Gap scan complete: {total_gaps} gaps found, ~{total_filled} candles inserted")
-            else:
-                log.info("✅ Gap scan complete: No gaps detected")
-            
-            await asyncio.sleep(GAP_CHECK_INTERVAL_SECS)
-            
-        except Exception as e:
-            log.error(f"❌ Error in gap detection task: {e}")
-            await asyncio.sleep(60)
-
-
-# ======================== ECONOMIC CALENDAR ========================
-
-def get_next_quarter_hour() -> datetime:
-    """Calculate next quarter-hour mark (00, 15, 30, 45 minutes)."""
-    now = datetime.now(timezone.utc)
-    minute = now.minute
-    
-    # Find next quarter hour
-    if minute < 15:
-        next_minute = 15
-    elif minute < 30:
-        next_minute = 30
-    elif minute < 45:
-        next_minute = 45
-    else:
-        next_minute = 0
-    
-    # Build next quarter hour datetime
-    if next_minute == 0:
-        # Roll to next hour
-        next_time = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-    else:
-        next_time = now.replace(minute=next_minute, second=0, microsecond=0)
-    
-    return next_time
-
+# ====================== ECONOMIC CALENDAR ======================
 
 def scrape_trading_economics():
-    """Scrape economic calendar data from Trading Economics."""
+    """Scrape economic calendar data from Trading Economics"""
     try:
         url = "https://tradingeconomics.com/calendar"
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
 
+        log.info("📅 Fetching Trading Economics calendar...")
         response = requests.get(url, headers=headers, timeout=30)
         response.raise_for_status()
 
@@ -760,6 +478,7 @@ def scrape_trading_economics():
                 events.append(event_data)
 
             except Exception as e:
+                log.warning(f"⚠️ Error parsing row: {e}")
                 continue
 
         log.info(f"📋 Scraped {len(events)} events from Trading Economics")
@@ -802,109 +521,217 @@ def upsert_economic_events(events):
                     sb.table('Economic_calander').insert(event).execute()
 
             except Exception as e:
+                log.warning(f"⚠️ Error upserting event {event['event']}: {e}")
                 continue
 
-        log.info(f"✅ Processed {len(events)} economic events")
+        log.info(f"✅ Successfully processed {len(events)} economic events")
 
     except Exception as e:
-        log.error(f"❌ Error upserting events: {e}")
+        log.error(f"❌ Error upserting events to Supabase: {e}")
 
 
 async def economic_calendar_task():
-    """
-    Scrape economic calendar at precise quarter-hour intervals.
-    Pattern: :00/:15/:30/:45 + 5 seconds after each
-    """
+    """Periodically scrape and update economic calendar."""
     log.info("📅 Economic calendar scraper started")
-    log.info("   ⏰ Scraping at :00, :15, :30, :45 + 5 seconds after")
 
-    while not _stop.is_set():
+    while not tick_streamer._shutdown.is_set():
         try:
-            # Calculate wait time until next quarter hour
-            next_quarter = get_next_quarter_hour()
-            now = datetime.now(timezone.utc)
-            wait_seconds = (next_quarter - now).total_seconds()
-            
-            if wait_seconds > 0:
-                log.info(f"📅 Next calendar scrape at {next_quarter.strftime('%H:%M:%S')} UTC (in {int(wait_seconds)}s)")
-                await asyncio.sleep(wait_seconds)
-            
-            # First scrape at :00/:15/:30/:45
             loop = asyncio.get_event_loop()
-            log.info(f"📅 Scraping economic calendar [{datetime.now(timezone.utc).strftime('%H:%M:%S')}]...")
-            
             events = await loop.run_in_executor(None, scrape_trading_economics)
+
             if events:
                 await loop.run_in_executor(None, upsert_economic_events, events)
-            
-            # Wait 5 seconds, then scrape again (catch delayed actual values)
-            await asyncio.sleep(5)
-            
-            log.info(f"📅 Follow-up scrape [{datetime.now(timezone.utc).strftime('%H:%M:%S')}]...")
-            events = await loop.run_in_executor(None, scrape_trading_economics)
-            if events:
-                await loop.run_in_executor(None, upsert_economic_events, events)
-            
-            # Small buffer to prevent double-firing
-            await asyncio.sleep(2)
+
+            await asyncio.sleep(ECON_SCRAPE_INTERVAL)
 
         except Exception as e:
             log.error(f"❌ Error in economic calendar task: {e}")
             await asyncio.sleep(60)
 
 
-# ======================== FINANCIAL NEWS ========================
+# ==================== FINANCIAL NEWS SCRAPER ====================
+# EXPANDED RSS FEEDS - 30+ sources for comprehensive macro coverage
 
 RSS_FEEDS = [
+    # --- BBC News ---
     {"url": "http://feeds.bbci.co.uk/news/rss.xml", "name": "BBC News (Main)"},
     {"url": "http://feeds.bbci.co.uk/news/business/rss.xml", "name": "BBC News (Business)"},
     {"url": "http://feeds.bbci.co.uk/news/world/rss.xml", "name": "BBC News (World)"},
+    
+    # --- CNBC ---
     {"url": "https://www.cnbc.com/id/100003114/device/rss/rss.html", "name": "CNBC (Top News)"},
     {"url": "https://www.cnbc.com/id/100727362/device/rss/rss.html", "name": "CNBC (World)"},
-    {"url": "http://feeds.marketwatch.com/marketwatch/realtimeheadlines", "name": "MarketWatch"},
+    {"url": "https://www.cnbc.com/id/15837362/device/rss/rss.html", "name": "CNBC (US News)"},
+    {"url": "https://www.cnbc.com/id/20910258/device/rss/rss.html", "name": "CNBC (Economy)"},
+    {"url": "https://www.cnbc.com/id/10000664/device/rss/rss.html", "name": "CNBC (Finance)"},
+    {"url": "https://www.cnbc.com/id/10001147/device/rss/rss.html", "name": "CNBC (Earnings)"},
+    {"url": "https://www.cnbc.com/id/15839135/device/rss/rss.html", "name": "CNBC (Commodities)"},
+    {"url": "https://www.cnbc.com/id/19836768/device/rss/rss.html", "name": "CNBC (Energy)"},
+    
+    # --- MarketWatch ---
+    {"url": "http://feeds.marketwatch.com/marketwatch/realtimeheadlines", "name": "MarketWatch (Real-time)"},
+    {"url": "http://feeds.marketwatch.com/marketwatch/topstories", "name": "MarketWatch (Top Stories)"},
+    {"url": "http://feeds.marketwatch.com/marketwatch/marketpulse", "name": "MarketWatch (Market Pulse)"},
+    {"url": "http://feeds.marketwatch.com/marketwatch/StockstoWatch", "name": "MarketWatch (Stocks)"},
+    
+    # --- Crypto ---
     {"url": "https://www.coindesk.com/arc/outboundfeeds/rss/", "name": "CoinDesk"},
     {"url": "https://cointelegraph.com/rss", "name": "Cointelegraph"},
+    {"url": "https://bitcoinmagazine.com/.rss/full/", "name": "Bitcoin Magazine"},
+    {"url": "https://decrypt.co/feed", "name": "Decrypt"},
+    {"url": "https://thedefiant.io/feed", "name": "The Defiant"},
+    
+    # --- The Guardian ---
     {"url": "https://www.theguardian.com/world/rss", "name": "The Guardian (World)"},
     {"url": "https://www.theguardian.com/uk/business/rss", "name": "The Guardian (Business)"},
+    {"url": "https://www.theguardian.com/business/economics/rss", "name": "The Guardian (Economics)"},
+    {"url": "https://www.theguardian.com/business/stock-markets/rss", "name": "The Guardian (Markets)"},
+    
+    # --- Al Jazeera ---
     {"url": "https://www.aljazeera.com/xml/rss/all.xml", "name": "Al Jazeera"},
+    {"url": "https://www.aljazeera.com/economy/rss.xml", "name": "Al Jazeera (Economy)"},
+    
+    # --- NPR ---
+    {"url": "https://feeds.npr.org/1001/rss.xml", "name": "NPR (News)"},
+    {"url": "https://feeds.npr.org/1006/rss.xml", "name": "NPR (Business)"},
+    {"url": "https://feeds.npr.org/1014/rss.xml", "name": "NPR (Politics)"},
+    
+    # --- Yahoo Finance ---
+    {"url": "https://finance.yahoo.com/news/rssindex", "name": "Yahoo Finance"},
+    
+    # --- Investing.com ---
+    {"url": "https://www.investing.com/rss/news.rss", "name": "Investing.com (News)"},
+    {"url": "https://www.investing.com/rss/news_25.rss", "name": "Investing.com (Economy)"},
+    {"url": "https://www.investing.com/rss/news_14.rss", "name": "Investing.com (Forex)"},
+    {"url": "https://www.investing.com/rss/news_285.rss", "name": "Investing.com (Commodities)"},
+    {"url": "https://www.investing.com/rss/news_301.rss", "name": "Investing.com (Crypto)"},
+    
+    # --- Economic Policy / Central Banks ---
+    {"url": "https://www.federalreserve.gov/feeds/press_all.xml", "name": "Federal Reserve"},
+    {"url": "https://www.ecb.europa.eu/rss/press.html", "name": "European Central Bank"},
+    {"url": "https://www.bankofengland.co.uk/rss/news", "name": "Bank of England"},
+    
+    # --- FXStreet (Forex Focus) ---
+    {"url": "https://www.fxstreet.com/rss/news", "name": "FXStreet (News)"},
+    {"url": "https://www.fxstreet.com/rss/analysis", "name": "FXStreet (Analysis)"},
+    
+    # --- DailyFX ---
+    {"url": "https://www.dailyfx.com/feeds/all", "name": "DailyFX"},
+    
+    # --- Seeking Alpha ---
+    {"url": "https://seekingalpha.com/market_currents.xml", "name": "Seeking Alpha (Market Currents)"},
+    {"url": "https://seekingalpha.com/tag/macro-view.xml", "name": "Seeking Alpha (Macro)"},
+    
+    # --- Zero Hedge (Macro/Alternative) ---
+    {"url": "https://feeds.feedburner.com/zerohedge/feed", "name": "Zero Hedge"},
+    
+    # --- Politico (Policy News) ---
+    {"url": "https://www.politico.com/rss/economy.xml", "name": "Politico (Economy)"},
+    {"url": "https://www.politico.com/rss/politicopicks.xml", "name": "Politico (Top)"},
+    
+    # --- The Economist ---
+    {"url": "https://www.economist.com/finance-and-economics/rss.xml", "name": "The Economist (Finance)"},
+    {"url": "https://www.economist.com/business/rss.xml", "name": "The Economist (Business)"},
+    
+    # --- Barrons ---
+    {"url": "https://www.barrons.com/xml/rss/3_7031.xml", "name": "Barrons"},
+    
+    # --- Oil & Energy ---
+    {"url": "https://oilprice.com/rss/main", "name": "OilPrice.com"},
+    
+    # --- Metals/Gold ---
+    {"url": "https://www.kitco.com/rss/kitco_gold.xml", "name": "Kitco (Gold)"},
 ]
 
 INCLUDE_KEYWORDS = [
+    # Geopolitical
     "war", "attack", "invasion", "military", "strike", "missile", "conflict", "terrorism", "coup",
+    "sanctions", "embargo", "nuclear", "drone", "ceasefire", "escalation",
+    
+    # Political
     "trump", "biden", "election", "president", "prime minister", "government", "resign",
-    "fed", "federal reserve", "powell", "ecb", "lagarde", "bank of england", "rate", "interest",
-    "monetary", "qe", "quantitative", "inflation", "cpi", "ppi", "gdp", "unemployment", "jobs",
-    "nfp", "payroll", "retail sales", "economic", "recession", "tariff", "sanction", "trade war",
-    "bitcoin", "btc", "ethereum", "eth", "crypto", "cryptocurrency", "blockchain",
-    "crash", "plunge", "surge", "rally", "collapse", "soar", "tumble", "selloff",
-    "oil", "opec", "gold", "crude", "brent", "wti", "commodity", "bank", "banking", "bailout",
-    "earthquake", "hurricane", "disaster", "emergency", "crisis", "pandemic",
+    "impeachment", "congress", "parliament", "vote", "referendum", "policy",
+    
+    # Central Banks & Monetary Policy
+    "fed", "federal reserve", "powell", "ecb", "lagarde", "bank of england", "boe", "bailey",
+    "bank of japan", "boj", "ueda", "pboc", "rba", "rate", "interest", "monetary", "qe",
+    "quantitative", "tightening", "easing", "hawkish", "dovish", "fomc", "rate hike", "rate cut",
+    "basis points", "bps",
+    
+    # Economic Indicators
+    "inflation", "cpi", "ppi", "gdp", "unemployment", "jobs", "nfp", "payroll", "retail sales",
+    "economic", "recession", "pce", "manufacturing", "pmi", "ism", "consumer confidence",
+    "housing", "jobless claims", "labor market", "growth", "contraction", "deficit", "surplus",
+    "trade balance", "current account", "budget",
+    
+    # Trade & Tariffs
+    "tariff", "sanction", "trade war", "import", "export", "ban", "quota", "wto", "trade deal",
+    "trade agreement", "supply chain", "protectionism",
+    
+    # Crypto
+    "bitcoin", "btc", "ethereum", "eth", "crypto", "cryptocurrency", "blockchain", "stablecoin",
+    "defi", "nft", "altcoin", "binance", "coinbase", "sec crypto", "regulation crypto",
+    "bitcoin etf", "halving", "mining",
+    
+    # Market Movements
+    "crash", "plunge", "surge", "rally", "collapse", "soar", "tumble", "selloff", "correction",
+    "bull market", "bear market", "all-time high", "ath", "volatility", "vix", "circuit breaker",
+    "margin call", "liquidation",
+    
+    # Commodities
+    "oil", "opec", "gold", "crude", "brent", "wti", "commodity", "natural gas", "lng",
+    "copper", "silver", "platinum", "palladium", "wheat", "corn", "soybean", "agriculture",
+    "opec+", "production cut", "barrel",
+    
+    # Banking & Finance
+    "bank", "banking", "bailout", "liquidity", "credit", "lending", "mortgage", "bond",
+    "yield", "treasury", "debt ceiling", "default", "credit rating", "downgrade", "upgrade",
+    "bankruptcy", "insolvency", "stress test", "capital requirements", "basel",
+    
+    # Crisis & Disasters
+    "earthquake", "hurricane", "disaster", "emergency", "crisis", "pandemic", "outbreak",
+    "flood", "wildfire", "typhoon", "drought", "climate", "shutdown", "blackout",
+    
+    # Stocks & Earnings
+    "earnings", "revenue", "profit", "guidance", "forecast", "miss", "beat", "ipo", "buyback",
+    "dividend", "merger", "acquisition", "m&a", "spinoff", "layoff", "restructuring",
+    
+    # Tech Giants (Market Movers)
+    "nvidia", "apple", "microsoft", "amazon", "google", "meta", "tesla", "ai", "artificial intelligence",
+    "chip", "semiconductor", "data center",
 ]
 
 EXCLUDE_KEYWORDS = [
-    "sport", "football", "soccer", "cricket", "tennis", "basketball", "baseball",
-    "celebrity", "actor", "actress", "movie", "film", "tv show", "television",
+    "sport", "football", "soccer", "cricket", "tennis", "basketball", "baseball", "nfl", "nba",
+    "celebrity", "actor", "actress", "movie", "film", "tv show", "television", "entertainment",
     "recipe", "cooking", "fashion", "style", "beauty", "wedding", "divorce", "dating",
+    "horoscope", "lottery", "game show", "reality tv", "red carpet",
 ]
 
 
 def get_news_scan_interval():
-    """Get news scan interval based on market session."""
-    now = datetime.now(timezone.utc)
+    """Smart scheduling based on market hours."""
+    now = datetime.utcnow()
     day_of_week = now.weekday()
     hour_utc = now.hour
     
+    # Weekend - scan less frequently
     if day_of_week >= 5:
-        return 14400, "weekend"  # 4 hours
+        return 7200, "weekend"  # 2 hours
     
-    if (8 <= hour_utc < 20) or (0 <= hour_utc < 1):
+    # US Market Hours (14:30-21:00 UTC) or Asian Session (23:00-08:00 UTC)
+    if (14 <= hour_utc < 21) or (23 <= hour_utc or hour_utc < 8):
+        return 600, "active"  # 10 minutes
+    
+    # European Session (08:00-16:30 UTC)
+    if (8 <= hour_utc < 17):
         return 900, "active"  # 15 minutes
     
     return 1800, "quiet"  # 30 minutes
 
 
 def should_prefilter_article(title: str, summary: str) -> bool:
-    """Check if article should be processed."""
+    """Pre-filter articles based on keywords."""
     text = f"{title} {summary}".lower()
 
     for exclude_word in EXCLUDE_KEYWORDS:
@@ -921,34 +748,30 @@ def should_prefilter_article(title: str, summary: str) -> bool:
 
 
 def calculate_title_similarity(title1: str, title2: str) -> float:
-    """Calculate similarity between two titles."""
     return SequenceMatcher(None, title1.lower(), title2.lower()).ratio()
 
 
 def optimize_articles_for_cost(articles: list) -> list:
-    """Optimize articles for DeepSeek API cost."""
+    """Optimize articles to reduce AI classification costs."""
     if not articles:
         return []
 
     log.info(f"💰 Cost optimization: Starting with {len(articles)} articles")
 
-    # Keep all articles (images are nice-to-have)
+    # Filter articles with images
     articles_with_images = [a for a in articles if a.get('image_url')]
-    articles_without_images = [a for a in articles if not a.get('image_url')]
-    log.info(f"   📷 {len(articles_with_images)} with images, {len(articles_without_images)} without")
-    
-    # Prioritize articles with images, include some without
-    all_articles = articles_with_images + articles_without_images[:10]
+    removed_no_images = len(articles) - len(articles_with_images)
+    log.info(f"   Removed {removed_no_images} articles without images")
 
-    # Deduplicate by title similarity
+    # Remove duplicates
     unique_articles = []
     seen_topics = []
 
-    for article in all_articles:
+    for article in articles_with_images:
         is_duplicate = False
         for seen_title in seen_topics:
             similarity = calculate_title_similarity(article['title'], seen_title)
-            if similarity >= 0.75:
+            if similarity >= 0.70:  # 70% similarity threshold
                 is_duplicate = True
                 break
 
@@ -956,17 +779,19 @@ def optimize_articles_for_cost(articles: list) -> list:
             unique_articles.append(article)
             seen_topics.append(article['title'])
 
-    removed_similar = len(all_articles) - len(unique_articles)
+    removed_similar = len(articles_with_images) - len(unique_articles)
     log.info(f"   Removed {removed_similar} similar articles")
 
-    # Category limits
-    category_counts = {'crypto': 0, 'political': 0, 'central_bank': 0, 'market': 0}
-    category_limits = {'crypto': 5, 'political': 5, 'central_bank': 5, 'market': 5}
+    # Category limits (increased for more coverage)
+    category_counts = {'crypto': 0, 'political': 0, 'central_bank': 0, 'market': 0, 'commodity': 0, 'macro': 0}
+    category_limits = {'crypto': 4, 'political': 4, 'central_bank': 4, 'market': 4, 'commodity': 3, 'macro': 4}
 
-    crypto_kw = ['bitcoin', 'btc', 'ethereum', 'eth', 'crypto', 'solana', 'xrp']
-    political_kw = ['trump', 'biden', 'election', 'president', 'white house']
-    central_bank_kw = ['fed', 'powell', 'ecb', 'lagarde', 'rate', 'monetary']
-    market_kw = ['stock', 'nasdaq', 's&p', 'dow', 'market']
+    crypto_kw = ['bitcoin', 'btc', 'ethereum', 'eth', 'crypto', 'solana', 'xrp', 'binance', 'coinbase']
+    political_kw = ['trump', 'biden', 'election', 'president', 'white house', 'congress', 'parliament']
+    central_bank_kw = ['fed', 'powell', 'ecb', 'lagarde', 'rate', 'monetary', 'fomc', 'boe', 'boj']
+    market_kw = ['stock', 'nasdaq', 's&p', 'dow', 'market', 'rally', 'crash', 'earnings']
+    commodity_kw = ['oil', 'gold', 'opec', 'crude', 'commodity', 'copper', 'silver']
+    macro_kw = ['gdp', 'inflation', 'cpi', 'unemployment', 'jobs', 'pmi', 'recession']
 
     final_articles = []
     for article in unique_articles:
@@ -975,10 +800,14 @@ def optimize_articles_for_cost(articles: list) -> list:
         category = None
         if any(kw in text for kw in crypto_kw):
             category = 'crypto'
-        elif any(kw in text for kw in political_kw):
-            category = 'political'
         elif any(kw in text for kw in central_bank_kw):
             category = 'central_bank'
+        elif any(kw in text for kw in macro_kw):
+            category = 'macro'
+        elif any(kw in text for kw in political_kw):
+            category = 'political'
+        elif any(kw in text for kw in commodity_kw):
+            category = 'commodity'
         elif any(kw in text for kw in market_kw):
             category = 'market'
 
@@ -989,16 +818,21 @@ def optimize_articles_for_cost(articles: list) -> list:
 
         final_articles.append(article)
 
+    removed_by_limit = len(unique_articles) - len(final_articles)
+    total_removed = len(articles) - len(final_articles)
+    savings_pct = int((total_removed / len(articles)) * 100) if articles else 0
+
     log.info(f"   Category breakdown: {dict(category_counts)}")
+    log.info(f"   💰 Cost savings: {savings_pct}% ({total_removed} articles filtered)")
     log.info(f"   ✅ Final articles to classify: {len(final_articles)}")
 
     return final_articles
 
 
 def fetch_rss_feed(feed_url: str, source_name: str) -> list:
-    """Fetch articles from RSS feed."""
+    """Fetch and parse RSS feed."""
     try:
-        headers = {'User-Agent': 'Mozilla/5.0 (compatible; FinancialNewsBot/1.0)'}
+        headers = {'User-Agent': 'Mozilla/5.0 (compatible; LondonStrategicEdge/1.0)'}
         response = requests.get(feed_url, headers=headers, timeout=15)
         response.raise_for_status()
 
@@ -1037,6 +871,12 @@ def fetch_rss_feed(feed_url: str, source_name: str) -> list:
                         image_url = enclosure.get('href') or enclosure.get('url')
                         break
 
+            if not image_url and hasattr(entry, 'links'):
+                for link in entry.links:
+                    if link.get('type', '').startswith('image/'):
+                        image_url = link.get('href')
+                        break
+
             articles.append({
                 'title': title,
                 'url': url,
@@ -1056,6 +896,7 @@ def fetch_rss_feed(feed_url: str, source_name: str) -> list:
 def classify_article_with_deepseek(article: dict) -> dict:
     """Classify article using DeepSeek API."""
     if not deepseek_client:
+        log.warning("⚠️ DeepSeek API key not configured")
         return None
         
     try:
@@ -1068,7 +909,7 @@ SOURCE: {article['source']}
 Respond with ONLY valid JSON (no markdown, no explanation):
 {{"is_important": true, "event_type": "war", "impact_level": "high", "affected_symbols": ["BTC/USD", "XAU/USD"], "sentiment": "bearish", "summary": "2-3 sentence market impact summary", "keywords": ["keyword1", "keyword2"]}}
 
-Valid event_types: war, political_shock, economic_data, central_bank, trade_war, commodity_shock, market_crash, crypto_crash, crypto_rally, natural_disaster, bank_crisis, energy_crisis, pandemic_health, market_rally
+Valid event_types: war, political_shock, economic_data, central_bank, trade_war, commodity_shock, market_crash, crypto_crash, crypto_rally, natural_disaster, bank_crisis, energy_crisis, pandemic_health, market_rally, earnings, regulatory
 Valid impact_levels: critical, high, medium, low
 Valid sentiments: bullish, bearish, neutral"""
 
@@ -1081,7 +922,6 @@ Valid sentiments: bullish, bearish, neutral"""
 
         response_text = response.choices[0].message.content.strip()
         
-        # Clean markdown if present
         if response_text.startswith("```"):
             response_text = response_text.split("```")[1]
             if response_text.startswith("json"):
@@ -1092,6 +932,9 @@ Valid sentiments: bullish, bearish, neutral"""
 
         return json.loads(response_text)
 
+    except json.JSONDecodeError as e:
+        log.warning(f"⚠️ DeepSeek JSON parse error: {e}")
+        return None
     except Exception as e:
         log.warning(f"⚠️ DeepSeek API error: {e}")
         return None
@@ -1119,21 +962,24 @@ def store_news_article(article: dict, classification: dict) -> bool:
         return True
 
     except Exception as e:
-        if 'duplicate key' not in str(e).lower():
+        if 'duplicate key value' in str(e).lower() or 'unique constraint' in str(e).lower():
+            return False
+        else:
             log.warning(f"⚠️ Database error storing news: {e}")
-        return False
+            return False
 
 
 async def financial_news_task():
-    """Financial news scraping task with smart scheduling."""
+    """Financial news scraping task."""
     log.info("📰 Financial news scraper started")
+    log.info(f"   RSS feeds: {len(RSS_FEEDS)}")
 
-    while not _stop.is_set():
+    while not tick_streamer._shutdown.is_set():
         try:
             interval, session_name = get_news_scan_interval()
             session_emoji = "🔥" if session_name == "active" else "😴" if session_name == "quiet" else "🌙"
             
-            log.info(f"🔎 Starting news scan cycle ({session_emoji} {session_name} session)")
+            log.info(f"📰 Starting news scan ({session_emoji} {session_name} session)")
 
             all_articles = []
             loop = asyncio.get_event_loop()
@@ -1141,7 +987,7 @@ async def financial_news_task():
             for feed in RSS_FEEDS:
                 articles = await loop.run_in_executor(None, fetch_rss_feed, feed['url'], feed['name'])
                 all_articles.extend(articles)
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.3)  # Be nice to servers
 
             log.info(f"📋 Fetched {len(all_articles)} total articles")
 
@@ -1153,7 +999,7 @@ async def financial_news_task():
                     seen_urls.add(article['url'])
                     unique_articles.append(article)
 
-            log.info(f"🔗 After deduplication: {len(unique_articles)} unique articles")
+            log.info(f"🔍 After deduplication: {len(unique_articles)} unique articles")
 
             # Pre-filter
             filtered_articles = [
@@ -1166,6 +1012,7 @@ async def financial_news_task():
             # Cost optimization
             filtered_articles = optimize_articles_for_cost(filtered_articles)
 
+            # Classify and store
             stored_count = 0
             classified_count = 0
 
@@ -1176,12 +1023,11 @@ async def financial_news_task():
                 if not classification:
                     continue
 
-                # Store critical, high, and medium impact
-                if not classification['is_important'] or classification['impact_level'] not in ['critical', 'high', 'medium']:
+                if not classification.get('is_important') or classification.get('impact_level') not in ['critical', 'high']:
                     continue
 
-                impact_emoji = "🚨" if classification['impact_level'] == 'critical' else "⚡" if classification['impact_level'] == 'high' else "📰"
-                log.info(f"{impact_emoji} STORING: {article['title'][:60]}... ({classification['impact_level']})")
+                impact_emoji = "🚨" if classification['impact_level'] == 'critical' else "⚡"
+                log.info(f"{impact_emoji} IMPORTANT: {article['title'][:60]}... ({classification['impact_level']})")
 
                 if await loop.run_in_executor(None, store_news_article, article, classification):
                     stored_count += 1
@@ -1189,8 +1035,8 @@ async def financial_news_task():
                 await asyncio.sleep(1)
 
             log.info(f"✅ News cycle complete: {stored_count} stored, {classified_count} classified")
-
-            log.info(f"😴 Next scan in {interval // 60} minutes ({session_emoji} {session_name} session)")
+            log.info(f"😴 Next scan in {interval // 60} minutes ({session_emoji} {session_name})")
+            
             await asyncio.sleep(interval)
 
         except Exception as e:
@@ -1198,7 +1044,209 @@ async def financial_news_task():
             await asyncio.sleep(60)
 
 
-# ======================== FRED MACRO DATA ========================
+# ==================== GAP FILL SERVICE ====================
+
+def symbol_to_table(symbol: str) -> str:
+    """Convert symbol to table name: BTC/USD -> candles_btc_usd, NVDA -> candles_nvda"""
+    return f"candles_{symbol.lower().replace('/', '_')}"
+
+
+def detect_gaps(symbol: str, lookback_hours: int = MAX_GAP_HOURS) -> List[tuple]:
+    """Detect gaps in candle data for a symbol."""
+    table_name = symbol_to_table(symbol)
+    
+    try:
+        since = (datetime.now(timezone.utc) - timedelta(hours=lookback_hours)).isoformat()
+        
+        result = sb.table(table_name).select('timestamp').gte(
+            'timestamp', since
+        ).order('timestamp', desc=False).execute()
+        
+        if not result.data or len(result.data) < 2:
+            return []
+        
+        gaps = []
+        timestamps = [datetime.fromisoformat(r['timestamp'].replace('Z', '+00:00')) for r in result.data]
+        
+        for i in range(1, len(timestamps)):
+            prev_ts = timestamps[i - 1]
+            curr_ts = timestamps[i]
+            gap_minutes = (curr_ts - prev_ts).total_seconds() / 60
+            
+            if gap_minutes > MIN_GAP_MINUTES:
+                gap_start = prev_ts + timedelta(minutes=1)
+                gap_end = curr_ts - timedelta(minutes=1)
+                gaps.append((gap_start, gap_end))
+                
+        return gaps
+        
+    except Exception as e:
+        # Table might not exist yet
+        return []
+
+
+def fetch_candles_rest(symbol: str, start_date: datetime, end_date: datetime) -> List[Dict]:
+    """Fetch historical candles from TwelveData REST API."""
+    try:
+        params = {
+            "symbol": symbol,
+            "interval": "1min",
+            "start_date": start_date.strftime("%Y-%m-%d %H:%M:%S"),
+            "end_date": end_date.strftime("%Y-%m-%d %H:%M:%S"),
+            "apikey": TD_API_KEY,
+            "format": "JSON",
+            "timezone": "UTC"
+        }
+        
+        response = requests.get(TD_REST_URL, params=params, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        
+        if "values" not in data:
+            if "message" in data:
+                log.warning(f"⚠️ TwelveData: {data.get('message', 'No data')}")
+            return []
+        
+        candles = []
+        for v in data["values"]:
+            try:
+                candles.append({
+                    "timestamp": datetime.strptime(v["datetime"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc),
+                    "open": float(Decimal(str(v["open"]))),
+                    "high": float(Decimal(str(v["high"]))),
+                    "low": float(Decimal(str(v["low"]))),
+                    "close": float(Decimal(str(v["close"]))),
+                    "symbol": symbol
+                })
+            except Exception:
+                continue
+        
+        return candles
+        
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 429:
+            log.warning(f"⚠️ Rate limited by TwelveData")
+        else:
+            log.error(f"❌ TwelveData API error: {e}")
+        return []
+    except Exception as e:
+        log.error(f"❌ Error fetching candles for {symbol}: {e}")
+        return []
+
+
+def insert_candles(symbol: str, candles: List[Dict]) -> int:
+    """Insert candles using upsert."""
+    if not candles:
+        return 0
+    
+    table_name = symbol_to_table(symbol)
+    
+    try:
+        rows = [
+            {
+                "timestamp": c["timestamp"].isoformat(),
+                "open": c["open"],
+                "high": c["high"],
+                "low": c["low"],
+                "close": c["close"],
+                "symbol": c["symbol"]
+            }
+            for c in candles
+        ]
+        
+        sb.table(table_name).upsert(rows, on_conflict="timestamp").execute()
+        return len(rows)
+        
+    except Exception as e:
+        log.error(f"❌ Error inserting candles for {symbol}: {e}")
+        return 0
+
+
+async def fill_gaps_for_symbol(symbol: str, gaps: List[tuple]) -> int:
+    """Fill all detected gaps for a symbol."""
+    total_filled = 0
+    
+    for gap_start, gap_end in gaps:
+        gap_minutes = int((gap_end - gap_start).total_seconds() / 60) + 1
+        log.info(f"🔧 Filling {symbol}: {gap_start.strftime('%H:%M')}-{gap_end.strftime('%H:%M')} ({gap_minutes}min)")
+        
+        loop = asyncio.get_event_loop()
+        candles = await loop.run_in_executor(None, fetch_candles_rest, symbol, gap_start, gap_end)
+        
+        if candles:
+            inserted = await loop.run_in_executor(None, insert_candles, symbol, candles)
+            total_filled += inserted
+            log.info(f"✅ Filled {inserted} candles for {symbol}")
+        
+        await asyncio.sleep(BACKFILL_RATE_LIMIT)
+    
+    return total_filled
+
+
+async def startup_backfill(hours: int = 2):
+    """On startup, backfill last N hours to catch gaps from downtime."""
+    log.info(f"🚀 Running startup backfill for last {hours} hours...")
+    
+    end_time = datetime.now(timezone.utc)
+    start_time = end_time - timedelta(hours=hours)
+    
+    total_candles = 0
+    loop = asyncio.get_event_loop()
+    
+    # Only backfill a subset of important symbols to avoid rate limits
+    priority_symbols = CRYPTO_SYMBOLS[:8] + FOREX_SYMBOLS[:8] + COMMODITIES_SYMBOLS + STOCK_SYMBOLS[:10]
+    
+    for symbol in priority_symbols:
+        log.info(f"⬇️ Backfilling {symbol}...")
+        
+        candles = await loop.run_in_executor(None, fetch_candles_rest, symbol, start_time, end_time)
+        
+        if candles:
+            inserted = await loop.run_in_executor(None, insert_candles, symbol, candles)
+            total_candles += inserted
+        
+        await asyncio.sleep(BACKFILL_RATE_LIMIT)
+    
+    log.info(f"🎉 Startup backfill complete: {total_candles} total candles")
+
+
+async def gap_fill_task():
+    """Periodic gap detection and filling."""
+    log.info("🔧 Gap fill service started")
+    log.info(f"   Scan interval: {GAP_SCAN_INTERVAL}s | Lookback: {MAX_GAP_HOURS}h")
+    
+    # Run startup backfill first
+    await startup_backfill(hours=2)
+    
+    while not tick_streamer._shutdown.is_set():
+        try:
+            log.info("🔍 Scanning for gaps...")
+            
+            total_gaps = 0
+            total_filled = 0
+            
+            for symbol in ALL_SYMBOLS:
+                gaps = detect_gaps(symbol)
+                
+                if gaps:
+                    total_gaps += len(gaps)
+                    filled = await fill_gaps_for_symbol(symbol, gaps)
+                    total_filled += filled
+                    await asyncio.sleep(BACKFILL_RATE_LIMIT)
+            
+            if total_gaps > 0:
+                log.info(f"📊 Gap scan: {total_gaps} gaps found, {total_filled} candles filled")
+            else:
+                log.info("✅ No gaps detected")
+            
+            await asyncio.sleep(GAP_SCAN_INTERVAL)
+            
+        except Exception as e:
+            log.error(f"❌ Gap fill error: {e}")
+            await asyncio.sleep(60)
+
+
+# ==================== FRED MACRO DATA ====================
 
 def fetch_fred_series_no_vintage(
     series_id: str,
@@ -1206,8 +1254,9 @@ def fetch_fred_series_no_vintage(
     observation_end: str,
     limit: Optional[int] = None
 ) -> List[Dict]:
-    """Fetch FRED data without vintage constraints."""
+    """Fetch FRED data WITHOUT vintage constraints."""
     if not FRED_API_KEY:
+        log.error("❌ FRED_API_KEY not set!")
         return []
     
     url = f"{FRED_API_BASE}/series/observations"
@@ -1229,21 +1278,33 @@ def fetch_fred_series_no_vintage(
         data = response.json()
         
         if 'observations' not in data:
+            log.warning(f"No observations found for {series_id}")
             return []
         
-        return [
-            {'date': obs['date'], 'value': obs['value']}
+        observations = [
+            {
+                'date': obs['date'], 
+                'value': obs['value']
+            }
             for obs in data['observations']
             if obs['value'] != '.'
         ]
+        
+        return observations
     
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 400:
+            log.warning(f"⚠️ FRED API 400 error for {series_id}")
+        else:
+            log.error(f"Error fetching FRED series {series_id}: {e}")
+        return []
     except Exception as e:
-        log.warning(f"⚠️ FRED API error for {series_id}: {e}")
+        log.error(f"Error fetching FRED series {series_id}: {e}")
         return []
 
 
 def get_active_indicators() -> List[Dict]:
-    """Get all active macro indicators from metadata table."""
+    """Get all active macro indicators from metadata table"""
     try:
         result = sb.table('macro_indicator_metadata').select('*').eq('is_active', True).execute()
         return result.data if result.data else []
@@ -1253,308 +1314,71 @@ def get_active_indicators() -> List[Dict]:
 
 
 async def macro_data_task():
-    """FRED macro data updater task."""
+    """Event-driven macro data updater."""
     log.info("📊 Macro data task started")
     
-    # Wait for other tasks to start
-    await asyncio.sleep(30)
-    
-    while not _stop.is_set():
+    while not tick_streamer._shutdown.is_set():
         try:
-            log.info("📊 Checking for macro data updates...")
-            
-            # Simple check - just log that it's running
-            # Full implementation from previous version
-            
-            await asyncio.sleep(3600)  # Check every hour
-            
+            log.info("🔍 Checking for macro data updates...")
+            await asyncio.sleep(3600)  # Check hourly
         except Exception as e:
             log.error(f"❌ Error in macro data task: {e}")
             await asyncio.sleep(300)
 
 
-# ======================== AI MARKET BRIEFS ========================
-
-def get_trading_session() -> str:
-    """Determine current trading session."""
-    hour = datetime.now(timezone.utc).hour
-    day = datetime.now(timezone.utc).weekday()
-    
-    if day >= 5:
-        return "weekend"
-    elif 22 <= hour or hour < 8:
-        return "asia"
-    elif 8 <= hour < 12:
-        return "london"
-    elif 12 <= hour < 21:
-        return "newyork"
-    else:
-        return "transition"
-
-
-def fetch_recent_news_for_brief() -> List[Dict]:
-    """Fetch news from last 2 hours for brief generation."""
-    try:
-        cutoff = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
-        result = sb.table('financial_news').select(
-            'title, source, impact_level, sentiment, affected_symbols, event_type'
-        ).gte('published_at', cutoff).order('published_at', desc=True).limit(10).execute()
-        
-        return result.data if result.data else []
-    except Exception as e:
-        log.warning(f"Error fetching news for brief: {e}")
-        return []
-
-
-def fetch_price_changes_for_brief() -> List[Dict]:
-    """Fetch recent price changes from candle tables."""
-    symbols = [
-        ('BTC/USD', 'candles_btc_usd'),
-        ('ETH/USD', 'candles_eth_usd'),
-        ('XAU/USD', 'candles_xau_usd'),
-        ('EUR/USD', 'candles_eur_usd'),
-        ('GBP/USD', 'candles_gbp_usd'),
-    ]
-    
-    movers = []
-    try:
-        for symbol, table in symbols:
-            result = sb.table(table).select('open, close, timestamp').order(
-                'timestamp', desc=True
-            ).limit(30).execute()
-            
-            if result.data and len(result.data) >= 2:
-                latest_close = float(result.data[0]['close'])
-                oldest_open = float(result.data[-1]['open'])
-                
-                if oldest_open > 0:
-                    change_pct = ((latest_close - oldest_open) / oldest_open) * 100
-                    movers.append({
-                        'symbol': symbol,
-                        'price': latest_close,
-                        'change_pct': round(change_pct, 2),
-                        'direction': 'up' if change_pct > 0 else 'down' if change_pct < 0 else 'flat'
-                    })
-    except Exception as e:
-        log.warning(f"Error fetching price changes: {e}")
-    
-    return sorted(movers, key=lambda x: abs(x['change_pct']), reverse=True)
-
-
-def generate_market_brief_with_deepseek(
-    news: List[Dict],
-    movers: List[Dict],
-    session: str
-) -> Optional[Dict]:
-    """Generate a 250-word market brief using DeepSeek."""
-    if not deepseek_client:
-        return None
-    
-    news_text = "\n".join([
-        f"- {n['title']} ({n['source']}, {n['impact_level']}, {n['sentiment']})"
-        for n in news[:6]
-    ]) if news else "No significant news in the last 2 hours."
-    
-    movers_text = "\n".join([
-        f"- {m['symbol']}: ${m['price']:,.2f} ({m['change_pct']:+.2f}%)"
-        for m in movers
-    ]) if movers else "Price data unavailable."
-    
-    prompt = f"""You are a professional financial market analyst writing a brief for traders. 
-Write a concise, actionable 250-word market brief.
-
-TRADING SESSION: {session.upper()} session
-
-RECENT NEWS (last 2 hours):
-{news_text}
-
-MARKET MOVERS (last 30 min):
-{movers_text}
-
-Write the brief in a professional Bloomberg/Reuters style:
-1. Start with overall market sentiment
-2. Highlight key movers and why they're moving
-3. Mention significant news driving markets
-4. End with a forward-looking statement
-
-Use specific numbers. Be direct and actionable. No bullet points - flowing paragraphs.
-Target exactly 250 words.
-
-Respond with ONLY valid JSON:
-{{"brief": "your 250 word brief here", "sentiment": "bullish/bearish/neutral/mixed"}}"""
-
-    try:
-        response = deepseek_client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=800,
-            temperature=0.7
-        )
-        
-        response_text = response.choices[0].message.content.strip()
-        tokens_used = response.usage.total_tokens if response.usage else 0
-        
-        if response_text.startswith("```"):
-            response_text = response_text.split("```")[1]
-            if response_text.startswith("json"):
-                response_text = response_text[4:]
-            response_text = response_text.strip()
-        if response_text.endswith("```"):
-            response_text = response_text[:-3].strip()
-        
-        result = json.loads(response_text)
-        result['tokens_used'] = tokens_used
-        return result
-        
-    except Exception as e:
-        log.warning(f"⚠️ DeepSeek brief error: {e}")
-        return None
-
-
-def store_market_brief(brief: str, sentiment: str, movers: List[Dict], news: List[Dict], session: str, tokens_used: int) -> bool:
-    """Store the market brief in Supabase."""
-    try:
-        data = {
-            'brief': brief,
-            'market_sentiment': sentiment,
-            'top_movers': movers[:5] if movers else [],
-            'news_sources': [
-                {'title': n['title'][:100], 'source': n['source'], 'impact_level': n['impact_level']}
-                for n in news[:5]
-            ] if news else [],
-            'session_type': session,
-            'model_used': 'deepseek-chat',
-            'tokens_used': tokens_used
-        }
-        
-        sb.table('market_briefs').insert(data).execute()
-        log.info(f"✅ Market brief stored ({len(brief)} chars, {tokens_used} tokens)")
-        return True
-        
-    except Exception as e:
-        log.error(f"❌ Error storing market brief: {e}")
-        return False
-
-
-async def market_brief_task():
-    """Generate AI market briefs every 30 minutes."""
-    log.info("📝 Market brief generator started (every 30 minutes)")
-    
-    # Wait for data to populate
-    await asyncio.sleep(120)
-    
-    while not _stop.is_set():
-        try:
-            session = get_trading_session()
-            log.info(f"📝 Generating market brief ({session} session)...")
-            
-            loop = asyncio.get_event_loop()
-            
-            news = await loop.run_in_executor(None, fetch_recent_news_for_brief)
-            movers = await loop.run_in_executor(None, fetch_price_changes_for_brief)
-            
-            log.info(f"   📰 {len(news)} news articles, 📊 {len(movers)} price movers")
-            
-            result = await loop.run_in_executor(
-                None,
-                generate_market_brief_with_deepseek,
-                news, movers, session
-            )
-            
-            if result and result.get('brief'):
-                await loop.run_in_executor(
-                    None,
-                    store_market_brief,
-                    result['brief'],
-                    result.get('sentiment', 'neutral'),
-                    movers,
-                    news,
-                    session,
-                    result.get('tokens_used', 0)
-                )
-            else:
-                log.warning("⚠️ Failed to generate market brief")
-            
-            log.info(f"😴 Next brief in 30 minutes...")
-            await asyncio.sleep(MARKET_BRIEF_INTERVAL)
-            
-        except Exception as e:
-            log.error(f"❌ Error in market brief task: {e}")
-            await asyncio.sleep(300)
-
-
-# ======================== HEALTH CHECK ========================
-
-def get_health_status() -> dict:
-    """Get current health metrics."""
-    return {
-        "status": "HEALTHY",
-        "uptime_seconds": (datetime.now(timezone.utc) - datetime.fromisoformat(_health_metrics["startup_time"].replace("Z", "+00:00"))).total_seconds(),
-        "metrics": _health_metrics,
-        "tick_count": _tick_count,
-        "reconnect_count": _reconnect_count,
-    }
-
-
-# ======================== MAIN ========================
+# ====================== MAIN ======================
 
 async def main():
-    """
-    Run all 6 tasks in parallel with bulletproof reliability:
-    1. Tick streaming (WebSocket + Watchdog)
-    2. Economic calendar (Quarter-hour scraping)
-    3. Financial news (15 RSS feeds + DeepSeek)
-    4. Macro data (FRED API)
-    5. AI Market Briefs (DeepSeek - every 30 min)
-    6. Gap Detection & Auto-Backfill
-    """
+    """Run all tasks in parallel with graceful shutdown."""
     log.info("=" * 70)
-    log.info("🚀 LONDON STRATEGIC EDGE - BULLETPROOF WORKER v4.0")
+    log.info("🚀 LONDON STRATEGIC EDGE - WORKER")
     log.info("=" * 70)
-    log.info("Starting 6 parallel tasks:")
-    log.info("   1️⃣  Tick streaming (TwelveData + Watchdog)")
-    log.info("   2️⃣  Economic calendar (Quarter-hour scraping)")
-    log.info("   3️⃣  Financial news (15 RSS feeds + DeepSeek)")
-    log.info("   4️⃣  Macro data (FRED API)")
-    log.info("   5️⃣  AI Market Briefs (DeepSeek - 30 min)")
-    log.info("   6️⃣  Gap Detection & Auto-Backfill")
-    log.info("-" * 70)
-    log.info(f"🔧 Reliability Settings:")
-    log.info(f"   • Watchdog timeout: {WATCHDOG_TIMEOUT_SECS}s")
-    log.info(f"   • Startup backfill: {BACKFILL_HOURS} hours")
-    log.info(f"   • Gap check interval: {GAP_CHECK_INTERVAL_SECS}s")
-    log.info(f"   • Gap scan window: {GAP_SCAN_HOURS} hours")
+    log.info("   1️⃣ Tick streaming (TwelveData) - %d symbols", len(ALL_SYMBOLS))
+    log.info("   2️⃣ Economic calendar (Trading Economics)")
+    log.info("   3️⃣ Financial news (%d RSS feeds + DeepSeek)", len(RSS_FEEDS))
+    log.info("   4️⃣ Macro data (FRED API)")
+    log.info("   5️⃣ Gap detection & backfill (AUTO-HEALING)")
+    log.info("=" * 70)
+    log.info("📊 Symbol breakdown:")
+    log.info("   Crypto: %d | Forex: %d | Commodities: %d",
+             len(CRYPTO_SYMBOLS), len(FOREX_SYMBOLS), len(COMMODITIES_SYMBOLS))
+    log.info("   Stocks: %d | ETFs/Indices: %d",
+             len(STOCK_SYMBOLS), len(ETF_INDEX_SYMBOLS))
     log.info("=" * 70)
 
-    # Run 24-hour backfill FIRST before starting other tasks
-    log.info("🔄 Running startup backfill...")
-    await backfill_candles_startup()
-    log.info("✅ Startup backfill complete - starting all tasks")
+    # Setup graceful shutdown
+    def signal_handler(sig, frame):
+        log.info(f"🛑 Received signal {sig}, initiating shutdown...")
+        tick_streamer.shutdown()
+    
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
 
-    # Create all tasks
-    tick_task = asyncio.create_task(tick_streaming_task())
-    econ_task = asyncio.create_task(economic_calendar_task())
-    news_task = asyncio.create_task(financial_news_task())
-    macro_task = asyncio.create_task(macro_data_task())
-    brief_task = asyncio.create_task(market_brief_task())
-    gap_task = asyncio.create_task(gap_detection_task())
+    # Create tasks
+    tasks = [
+        asyncio.create_task(tick_streaming_task(), name="tick_stream"),
+        asyncio.create_task(economic_calendar_task(), name="econ_calendar"),
+        asyncio.create_task(financial_news_task(), name="news"),
+        asyncio.create_task(macro_data_task(), name="macro"),
+        asyncio.create_task(gap_fill_task(), name="gap_fill"),
+    ]
 
     try:
-        await asyncio.gather(
-            tick_task, econ_task, news_task, 
-            macro_task, brief_task, gap_task
-        )
+        await asyncio.gather(*tasks, return_exceptions=True)
     except Exception as e:
         log.error(f"❌ Main loop error: {e}")
     finally:
-        _stop.set()
-        tick_task.cancel()
-        econ_task.cancel()
-        news_task.cancel()
-        macro_task.cancel()
-        brief_task.cancel()
-        gap_task.cancel()
+        tick_streamer.shutdown()
+        for task in tasks:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        log.info("👋 Worker shutdown complete")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.info("👋 Goodbye!")
+        sys.exit(0)
