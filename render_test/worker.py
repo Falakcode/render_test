@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-LONDON STRATEGIC EDGE - BULLETPROOF WORKER
+LONDON STRATEGIC EDGE - BULLETPROOF WORKER v5.0
 ================================================================================
-Production-grade data pipeline with self-healing capabilities.
+Production-grade data pipeline with AGGRESSIVE self-healing.
+
+FIXES in v5.0:
+  - Watchdog now FORCES immediate reconnect (no passive waiting)
+  - Added recv() timeout to prevent infinite blocking
+  - Added heartbeat sending to keep connection alive
+  - Better connection state tracking
+  - Reconnect immediately on ANY error (no long backoff on first retry)
 
 TASKS:
   1. Tick Streaming     - TwelveData WebSocket (201 symbols)
@@ -11,9 +18,6 @@ TASKS:
   3. Financial News     - 50+ RSS feeds + DeepSeek AI classification
   4. Gap Fill Service   - Auto-detect and repair missing candle data
   5. Bond Yields        - G20 sovereign yields (every 30 minutes)
-
-REMOVED:
-  - FRED Macro Task (data comes from Economic Calendar trigger instead)
 ================================================================================
 """
 
@@ -113,13 +117,15 @@ TD_REST_URL = "https://api.twelvedata.com/time_series"
 #                              CONFIGURATION
 # ============================================================================
 
-# Tick Streaming
+# Tick Streaming - AGGRESSIVE SETTINGS
 BATCH_MAX = 500
 BATCH_FLUSH_SECS = 2
-WATCHDOG_TIMEOUT_SECS = 30
+WATCHDOG_TIMEOUT_SECS = 30          # Kill connection if no tick for 30s
+RECV_TIMEOUT_SECS = 15              # Timeout for each recv() call - NEW!
 CONNECTION_TIMEOUT_SECS = 15
 MAX_RECONNECT_DELAY = 30
 HEALTH_LOG_INTERVAL = 60
+HEARTBEAT_INTERVAL_SECS = 10        # Send heartbeat every 10s - NEW!
 
 # Gap Fill
 GAP_SCAN_INTERVAL = 300
@@ -148,17 +154,19 @@ log = logging.getLogger("worker")
 
 
 # ============================================================================
-#                    TASK 1: BULLETPROOF TICK STREAMING
+#                    TASK 1: BULLETPROOF TICK STREAMING v5.0
 # ============================================================================
 
 class BulletproofTickStreamer:
     """
-    Bulletproof WebSocket tick streamer with:
-    - Watchdog timer (kills stale connections)
-    - Heartbeat monitoring
-    - Aggressive reconnection
-    - Health logging
-    - Graceful shutdown
+    Bulletproof WebSocket tick streamer v5.0 with AGGRESSIVE reconnection:
+    
+    FIXES:
+    - Watchdog forces IMMEDIATE reconnect (sets _force_reconnect flag)
+    - recv() has timeout to prevent infinite blocking
+    - Heartbeat task keeps connection alive
+    - Any error = instant reconnect (no long backoff on first try)
+    - Tracks last activity (not just last tick) to handle quiet markets
     """
     
     def __init__(self):
@@ -167,10 +175,12 @@ class BulletproofTickStreamer:
         self._shutdown = asyncio.Event()
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._last_tick_time: datetime = datetime.now(timezone.utc)
+        self._last_activity_time: datetime = datetime.now(timezone.utc)  # NEW: Any WS activity
         self._tick_count: int = 0
         self._connection_count: int = 0
         self._last_health_log: datetime = datetime.now(timezone.utc)
         self._is_connected: bool = False
+        self._force_reconnect: bool = False  # NEW: Watchdog sets this to force reconnect
         
     def _to_float(self, x) -> Optional[float]:
         """Convert to float preserving precision."""
@@ -224,8 +234,26 @@ class BulletproofTickStreamer:
             await self._flush()
 
     async def _handle(self, msg: dict):
-        """Handle incoming tick message."""
-        if msg.get("event") != "price":
+        """Handle incoming WebSocket message."""
+        event_type = msg.get("event")
+        
+        # Update activity time for ANY message (not just price)
+        self._last_activity_time = datetime.now(timezone.utc)
+        
+        # Handle different event types
+        if event_type == "subscribe-status":
+            success = msg.get("success", [])
+            fails = msg.get("fails", [])
+            log.info("📡 Subscribe status: %d success, %d fails", len(success), len(fails))
+            if fails:
+                log.warning("⚠️ Failed symbols: %s", fails[:10])  # Show first 10
+            return
+            
+        if event_type == "heartbeat":
+            log.debug("💓 Heartbeat received")
+            return
+            
+        if event_type != "price":
             return
 
         row = {
@@ -244,7 +272,7 @@ class BulletproofTickStreamer:
         if not row["symbol"] or row["price"] is None:
             return
 
-        # Update watchdog
+        # Update watchdog timer for price events
         self._last_tick_time = datetime.now(timezone.utc)
         self._tick_count += 1
 
@@ -255,49 +283,93 @@ class BulletproofTickStreamer:
 
     async def _watchdog(self):
         """
-        WATCHDOG: Monitor for stale connections.
-        If no tick received for WATCHDOG_TIMEOUT_SECS, force close the WebSocket.
+        AGGRESSIVE WATCHDOG: Force reconnect if connection appears dead.
+        
+        Checks both:
+        - Last tick time (for active trading)
+        - Last activity time (for any WS message)
+        
+        If both are stale, FORCE immediate reconnect.
         """
         log.info("🐕 Watchdog started (timeout: %ds)", WATCHDOG_TIMEOUT_SECS)
         
         while not self._shutdown.is_set():
-            await asyncio.sleep(5)
+            await asyncio.sleep(5)  # Check every 5 seconds
             
             if not self._is_connected:
                 continue
-                
-            elapsed = (datetime.now(timezone.utc) - self._last_tick_time).total_seconds()
             
-            if elapsed > WATCHDOG_TIMEOUT_SECS:
-                log.warning("🐕 WATCHDOG: No tick for %.1fs - forcing reconnection!", elapsed)
+            now = datetime.now(timezone.utc)
+            tick_elapsed = (now - self._last_tick_time).total_seconds()
+            activity_elapsed = (now - self._last_activity_time).total_seconds()
+            
+            # If no activity at all for timeout period, connection is dead
+            if activity_elapsed > WATCHDOG_TIMEOUT_SECS:
+                log.warning("🐕 WATCHDOG TRIGGERED: No activity for %.1fs - FORCING RECONNECT!", activity_elapsed)
+                self._force_reconnect = True  # Signal main loop to reconnect
+                self._is_connected = False
+                
+                # Force close the WebSocket
                 if self._ws:
                     try:
                         await self._ws.close()
                     except Exception:
                         pass
-                self._is_connected = False
+                    self._ws = None
+                    
+            # If we have activity but no ticks for a long time, log warning (might be market closed)
+            elif tick_elapsed > WATCHDOG_TIMEOUT_SECS * 2:
+                log.warning("🐕 WATCHDOG: No ticks for %.1fs (but connection active - market may be closed)", tick_elapsed)
 
     async def _health_logger(self):
         """Log health status periodically."""
         while not self._shutdown.is_set():
             await asyncio.sleep(HEALTH_LOG_INTERVAL)
             
-            elapsed = (datetime.now(timezone.utc) - self._last_tick_time).total_seconds()
-            status = "🟢 HEALTHY" if elapsed < 10 else "🟡 STALE" if elapsed < WATCHDOG_TIMEOUT_SECS else "🔴 DEAD"
+            tick_elapsed = (datetime.now(timezone.utc) - self._last_tick_time).total_seconds()
+            activity_elapsed = (datetime.now(timezone.utc) - self._last_activity_time).total_seconds()
+            
+            if activity_elapsed < 10:
+                status = "🟢 HEALTHY"
+            elif activity_elapsed < WATCHDOG_TIMEOUT_SECS:
+                status = "🟡 STALE"
+            else:
+                status = "🔴 DEAD"
             
             log.info(
-                "💓 HEALTH: %s | Connected: %s | Ticks: %d | Last tick: %.1fs ago | Reconnects: %d | Symbols: %d",
+                "💓 HEALTH: %s | Connected: %s | Ticks: %d | Last tick: %.1fs ago | Last activity: %.1fs ago | Reconnects: %d | Symbols: %d",
                 status,
                 self._is_connected,
                 self._tick_count,
-                elapsed,
+                tick_elapsed,
+                activity_elapsed,
                 self._connection_count,
                 len(ALL_SYMBOLS)
             )
 
+    async def _heartbeat_sender(self):
+        """
+        Send periodic heartbeat to keep connection alive.
+        TwelveData may drop idle connections - this prevents that.
+        """
+        while not self._shutdown.is_set():
+            await asyncio.sleep(HEARTBEAT_INTERVAL_SECS)
+            
+            if self._is_connected and self._ws:
+                try:
+                    await self._ws.send(json.dumps({"action": "heartbeat"}))
+                    log.debug("💓 Heartbeat sent")
+                except Exception as e:
+                    log.warning("⚠️ Failed to send heartbeat: %s", e)
+
     async def _connect_and_stream(self):
-        """Single connection attempt with proper error handling."""
+        """
+        Single connection attempt with AGGRESSIVE error handling.
+        Uses recv() timeout to prevent infinite blocking.
+        """
         self._connection_count += 1
+        self._force_reconnect = False  # Reset flag
+        
         log.info("🔌 Connection attempt #%d...", self._connection_count)
         
         try:
@@ -322,14 +394,31 @@ class BulletproofTickStreamer:
             log.info("🚀 Connected and subscribed to %d symbols", len(ALL_SYMBOLS))
             self._is_connected = True
             self._last_tick_time = datetime.now(timezone.utc)
+            self._last_activity_time = datetime.now(timezone.utc)
             
-            # Stream messages
-            async for raw in self._ws:
-                if self._shutdown.is_set():
-                    break
+            # Stream messages with TIMEOUT on each recv()
+            while not self._shutdown.is_set() and not self._force_reconnect:
                 try:
+                    # Use timeout on recv() to prevent infinite blocking
+                    raw = await asyncio.wait_for(
+                        self._ws.recv(),
+                        timeout=RECV_TIMEOUT_SECS
+                    )
                     data = json.loads(raw)
                     await self._handle(data)
+                    
+                except asyncio.TimeoutError:
+                    # No message received within timeout - this is OK during quiet markets
+                    # But update activity time to show we're still trying
+                    log.debug("⏱️ recv() timeout - connection still alive, no new data")
+                    # Send a heartbeat to check if connection is alive
+                    try:
+                        await self._ws.send(json.dumps({"action": "heartbeat"}))
+                        self._last_activity_time = datetime.now(timezone.utc)
+                    except Exception:
+                        log.warning("⚠️ Heartbeat failed after recv timeout - connection may be dead")
+                        break
+                        
                 except json.JSONDecodeError:
                     continue
                     
@@ -337,6 +426,8 @@ class BulletproofTickStreamer:
             log.error("⏱️ Connection timeout after %ds", CONNECTION_TIMEOUT_SECS)
         except websockets.exceptions.ConnectionClosed as e:
             log.warning("🔌 Connection closed: code=%s reason=%s", e.code, e.reason)
+        except websockets.exceptions.ConnectionClosedError as e:
+            log.warning("🔌 Connection closed with error: code=%s reason=%s", e.code, e.reason)
         except Exception as e:
             log.error("❌ Connection error: %s", e)
         finally:
@@ -348,11 +439,15 @@ class BulletproofTickStreamer:
 
     async def run(self):
         """
-        Main run loop with bulletproof reconnection.
-        Never exits unless shutdown is requested.
+        Main run loop with AGGRESSIVE reconnection.
+        
+        KEY FIXES:
+        - First reconnect attempt is IMMEDIATE (no backoff)
+        - Watchdog can force reconnect via _force_reconnect flag
+        - Never exits unless shutdown is requested
         """
         log.info("=" * 60)
-        log.info("🚀 BULLETPROOF TICK STREAMER STARTING")
+        log.info("🚀 BULLETPROOF TICK STREAMER v5.0 STARTING")
         log.info("=" * 60)
         log.info("📊 Total symbols: %d", len(ALL_SYMBOLS))
         log.info("   Crypto: %d | Forex: %d | Commodities: %d", 
@@ -360,6 +455,8 @@ class BulletproofTickStreamer:
         log.info("   Stocks: %d | ETFs/Indices: %d",
                  len(STOCK_SYMBOLS), len(ETF_INDEX_SYMBOLS))
         log.info("🐕 Watchdog timeout: %ds", WATCHDOG_TIMEOUT_SECS)
+        log.info("⏱️ Recv timeout: %ds", RECV_TIMEOUT_SECS)
+        log.info("💓 Heartbeat interval: %ds", HEARTBEAT_INTERVAL_SECS)
         log.info("🔄 Max reconnect delay: %ds", MAX_RECONNECT_DELAY)
         log.info("=" * 60)
         
@@ -367,32 +464,47 @@ class BulletproofTickStreamer:
         flusher = asyncio.create_task(self._periodic_flush())
         watchdog = asyncio.create_task(self._watchdog())
         health = asyncio.create_task(self._health_logger())
+        heartbeat = asyncio.create_task(self._heartbeat_sender())
         
         backoff = 1
+        consecutive_failures = 0
         
         try:
             while not self._shutdown.is_set():
                 try:
+                    start_time = datetime.now(timezone.utc)
+                    
                     await self._connect_and_stream()
                     
                     if self._shutdown.is_set():
                         break
                     
-                    # Connection ended - prepare to reconnect
-                    log.info("🔄 Reconnecting in %ds...", backoff)
-                    await asyncio.sleep(backoff)
-                    backoff = min(MAX_RECONNECT_DELAY, backoff * 2)
+                    # Calculate how long the connection lasted
+                    connection_duration = (datetime.now(timezone.utc) - start_time).total_seconds()
+                    
+                    # If connection lasted more than 60 seconds, reset backoff
+                    if connection_duration > 60:
+                        backoff = 1
+                        consecutive_failures = 0
+                        log.info("✅ Connection lasted %.0fs - resetting backoff", connection_duration)
+                    else:
+                        consecutive_failures += 1
+                        
+                    # AGGRESSIVE RECONNECTION:
+                    # - First 3 attempts: immediate retry (1 second)
+                    # - After that: exponential backoff
+                    if consecutive_failures <= 3:
+                        log.info("🔄 Quick reconnect in 1s (attempt %d)...", consecutive_failures)
+                        await asyncio.sleep(1)
+                    else:
+                        log.info("🔄 Reconnecting in %ds (attempt %d)...", backoff, consecutive_failures)
+                        await asyncio.sleep(backoff)
+                        backoff = min(MAX_RECONNECT_DELAY, backoff * 2)
                     
                 except Exception as e:
                     log.error("💥 Unexpected error in main loop: %s", e)
-                    await asyncio.sleep(backoff)
-                    backoff = min(MAX_RECONNECT_DELAY, backoff * 2)
-                    
-                # Reset backoff on successful long connection
-                if self._tick_count > 0:
-                    elapsed = (datetime.now(timezone.utc) - self._last_tick_time).total_seconds()
-                    if elapsed < 5:
-                        backoff = 1
+                    consecutive_failures += 1
+                    await asyncio.sleep(min(backoff, 5))  # Quick retry on unexpected errors
                         
         finally:
             log.info("🛑 Shutting down tick streamer...")
@@ -400,10 +512,12 @@ class BulletproofTickStreamer:
             flusher.cancel()
             watchdog.cancel()
             health.cancel()
+            heartbeat.cancel()
             with suppress(asyncio.CancelledError):
                 await flusher
                 await watchdog
                 await health
+                await heartbeat
 
     def shutdown(self):
         """Request graceful shutdown."""
