@@ -597,49 +597,53 @@ async def economic_calendar_task():
     """
     log.info("📅 Economic calendar scraper started (double-scrape pattern)")
     log.info("   Schedule: :00/:05, :15/:20, :30/:35, :45/:50")
+    
+    # Scrape minutes: primary at :00/:15/:30/:45, follow-up at :05/:20/:35/:50
+    scrape_minutes = [0, 5, 15, 20, 30, 35, 45, 50]
 
     while not tick_streamer._shutdown.is_set():
         try:
             now = datetime.now(timezone.utc)
-            minute = now.minute
+            current_minute = now.minute
+            current_second = now.second
             
-            # Calculate next scrape time
-            # We want to scrape at :00, :05, :15, :20, :30, :35, :45, :50
-            scrape_minutes = [0, 5, 15, 20, 30, 35, 45, 50]
-            
-            # Find next scrape minute
-            next_scrape_minute = None
-            for sm in scrape_minutes:
-                if sm > minute:
-                    next_scrape_minute = sm
-                    break
-            
-            if next_scrape_minute is None:
-                # Next scrape is in the next hour at :00
-                next_scrape_minute = 0
-                wait_seconds = (60 - minute) * 60 - now.second
-            else:
-                wait_seconds = (next_scrape_minute - minute) * 60 - now.second
-            
-            # Ensure positive wait time
-            if wait_seconds < 0:
-                wait_seconds = 0
-            
-            log.info(f"📅 Next calendar scrape in {wait_seconds // 60}m {wait_seconds % 60}s (at :{next_scrape_minute:02d})")
-            await asyncio.sleep(wait_seconds)
-            
-            # Perform the scrape
-            is_followup = next_scrape_minute in [5, 20, 35, 50]
-            scrape_type = "follow-up" if is_followup else "primary"
-            
-            log.info(f"📅 Running {scrape_type} scrape...")
-            
-            loop = asyncio.get_event_loop()
-            events = await loop.run_in_executor(None, scrape_trading_economics)
+            # Check if we're AT a scrape minute (within first 30 seconds)
+            if current_minute in scrape_minutes and current_second < 30:
+                # Execute scrape now
+                is_followup = current_minute in [5, 20, 35, 50]
+                scrape_type = "follow-up" if is_followup else "primary"
+                
+                log.info(f"📅 Running {scrape_type} scrape at :{current_minute:02d}...")
+                
+                loop = asyncio.get_event_loop()
+                events = await loop.run_in_executor(None, scrape_trading_economics)
 
-            if events:
-                new_count = await loop.run_in_executor(None, upsert_economic_events, events)
-                log.info(f"📅 {scrape_type.capitalize()} scrape complete: {len(events)} events, {new_count} new")
+                if events:
+                    new_count = await loop.run_in_executor(None, upsert_economic_events, events)
+                    log.info(f"📅 {scrape_type.capitalize()} scrape complete: {len(events)} events, {new_count} new")
+                
+                # Wait until next minute to avoid re-triggering
+                await asyncio.sleep(60 - current_second + 5)
+            else:
+                # Find next scrape minute
+                next_scrape_minute = None
+                for sm in scrape_minutes:
+                    if sm > current_minute:
+                        next_scrape_minute = sm
+                        break
+                
+                if next_scrape_minute is None:
+                    # Next scrape is in the next hour at :00
+                    next_scrape_minute = 0
+                    wait_seconds = (60 - current_minute) * 60 - current_second
+                else:
+                    wait_seconds = (next_scrape_minute - current_minute) * 60 - current_second
+                
+                # Ensure positive wait time (minimum 1 second)
+                wait_seconds = max(1, wait_seconds)
+                
+                log.info(f"📅 Next calendar scrape in {wait_seconds // 60}m {wait_seconds % 60}s (at :{next_scrape_minute:02d})")
+                await asyncio.sleep(wait_seconds)
 
         except Exception as e:
             log.error(f"❌ Error in economic calendar task: {e}")
@@ -1619,8 +1623,17 @@ async def bond_yield_task():
     log.info(f"   Countries: {len(G20_BONDS)}")
     log.info(f"   Maturities: 6M, 1Y, 2Y, 10Y")
     
+    first_run = True
+    
     while not tick_streamer._shutdown.is_set():
         try:
+            # Run immediately on first iteration, then wait after each run
+            if not first_run:
+                log.info(f"😴 Next bond scrape in {BOND_SCRAPE_INTERVAL // 60} minutes...")
+                await asyncio.sleep(BOND_SCRAPE_INTERVAL)
+            
+            first_run = False
+            
             loop = asyncio.get_event_loop()
             yields = await loop.run_in_executor(None, scrape_all_g20_yields)
             
@@ -1630,12 +1643,9 @@ async def bond_yield_task():
                 has_2y = sum(1 for y in yields if y['yield_2y'] is not None)
                 inverted = sum(1 for y in yields if y['spread_10y_2y'] is not None and y['spread_10y_2y'] < 0)
                 
-                log.info(f"📊 Scrape complete: {has_10y}/17 10Y, {has_2y}/17 2Y, {inverted} inverted")
+                log.info(f"📊 Bond scrape complete: {has_10y}/17 10Y, {has_2y}/17 2Y, {inverted} inverted")
                 
                 await loop.run_in_executor(None, store_bond_yields, yields)
-            
-            log.info(f"😴 Next bond scrape in {BOND_SCRAPE_INTERVAL // 60} minutes...")
-            await asyncio.sleep(BOND_SCRAPE_INTERVAL)
         
         except Exception as e:
             log.error(f"❌ Error in bond yield task: {e}")
