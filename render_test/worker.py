@@ -13,7 +13,7 @@ FIXES in v5.0:
   - Reconnect immediately on ANY error (no long backoff on first retry)
 
 TASKS:
-  1. Tick Streaming     - TwelveData WebSocket (201 symbols)
+  1. Tick Streaming     - TwelveData WebSocket (237 symbols)
   2. Economic Calendar  - Trading Economics (double-scrape every 15 min)
   3. Financial News     - 50+ RSS feeds + DeepSeek AI classification
   4. Gap Fill Service   - Auto-detect and repair missing candle data
@@ -54,33 +54,36 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 SUPABASE_TABLE = os.environ.get("SUPABASE_TABLE", "tickdata")
 
 # ============================================================================
-#                           TRADING SYMBOLS (201)
+#                           TRADING SYMBOLS (237)
 # ============================================================================
 
 # Crypto (44 pairs)
 CRYPTO_SYMBOLS = [
     "1INCH/USD", "AAVE/USD", "ADA/BTC", "ADA/USD", "ALGO/USD", "APE/USD", "ARB/USD",
     "ATOM/USD", "AVAX/BTC", "AVAX/USD", "BCH/USD", "BNB/USD", "BTC/USD", "COMP/USD",
-    "CRV/USD", "DOGE/BTC", "DOGE/USD", "DOT/USD", "ETC/USD", "ETH/BTC", "ETH/USD",
-    "FIL/USD", "GRT/USD", "LDO/USD", "LINK/BTC", "LINK/USD", "LTC/USD", "MANA/USD",
-    "NEAR/USD", "OP/USD", "SAND/USD", "SHIB/USD", "SNX/USD", "SOL/BTC", "SOL/USD",
-    "SUSHI/USD", "TRX/USD", "UNI/USD", "VET/USD", "XLM/USD", "XMR/USD", "XRP/BTC",
-    "XRP/USD", "YFI/USD"
+    "CRV/USD", "DOGE/BTC", "DOGE/USD", "DOT/USD", "ETC/USD", "ETH/BTC", 
+    "ETH/USD", "FIL/USD", "GRT/USD", "LDO/USD", "LINK/BTC", "LINK/USD", "LTC/USD", 
+    "MANA/USD", "NEAR/USD", "OP/USD", "SAND/USD", "SHIB/USD", "SNX/USD", "SOL/BTC", 
+    "SOL/USD", "SUSHI/USD", "TRX/USD", "UNI/USD", "VET/USD", "XLM/USD", "XMR/USD", 
+    "XRP/BTC", "XRP/USD", "YFI/USD"
 ]
 
-# Forex (64 pairs)
+# Forex (69 pairs) - Added: AUD/USD, HKD/JPY, NZD/USD, SGD/JPY, USD/CHF
 FOREX_SYMBOLS = [
-    "AUD/CAD", "AUD/CHF", "AUD/JPY", "AUD/NZD", "AUD/SGD",
+    "AUD/CAD", "AUD/CHF", "AUD/JPY", "AUD/NZD", "AUD/SGD", "AUD/USD",
     "CAD/CHF", "CAD/JPY", "CHF/JPY",
     "EUR/AUD", "EUR/CAD", "EUR/CHF", "EUR/CZK", "EUR/DKK", "EUR/GBP", "EUR/HUF",
     "EUR/JPY", "EUR/NOK", "EUR/NZD", "EUR/PLN", "EUR/SEK", "EUR/TRY", "EUR/USD",
     "GBP/AUD", "GBP/CAD", "GBP/CHF", "GBP/JPY", "GBP/NOK", "GBP/NZD", "GBP/PLN",
     "GBP/SEK", "GBP/TRY", "GBP/USD", "GBP/ZAR",
-    "NZD/CAD", "NZD/CHF", "NZD/JPY", "NZD/SGD",
-    "USD/ARS", "USD/BRL", "USD/CAD", "USD/CLP", "USD/CNH", "USD/COP", "USD/CZK",
-    "USD/DKK", "USD/EGP", "USD/HKD", "USD/HUF", "USD/IDR", "USD/ILS", "USD/INR",
-    "USD/JPY", "USD/KRW", "USD/MXN", "USD/MYR", "USD/NOK", "USD/PHP", "USD/PKR",
-    "USD/PLN", "USD/SEK", "USD/SGD", "USD/THB", "USD/TRY", "USD/TWD", "USD/ZAR"
+    "HKD/JPY",
+    "NZD/CAD", "NZD/CHF", "NZD/JPY", "NZD/SGD", "NZD/USD",
+    "SGD/JPY",
+    "USD/ARS", "USD/BRL", "USD/CAD", "USD/CHF", "USD/CLP", "USD/CNH", "USD/COP", 
+    "USD/CZK", "USD/DKK", "USD/EGP", "USD/HKD", "USD/HUF", "USD/IDR", "USD/ILS", 
+    "USD/INR", "USD/JPY", "USD/KRW", "USD/MXN", "USD/MYR", "USD/NOK", "USD/PHP", 
+    "USD/PKR", "USD/PLN", "USD/SEK", "USD/SGD", "USD/THB", "USD/TRY", "USD/TWD", 
+    "USD/ZAR"
 ]
 
 # Commodities (4 pairs)
@@ -88,20 +91,26 @@ COMMODITIES_SYMBOLS = [
     "XAG/USD", "XAU/USD", "XPD/USD", "XPT/USD"
 ]
 
-# Stocks (61 symbols)
+# Stocks (92 symbols) - Added 31: AAPL, AMAT, AMGN, AMZN, ARM, ASML, BMY, DASH, DDOG, DE, GOOG, 
+#                       GOOGL, HON, KLAC, LRCX, LYFT, MDB, MSFT, MSTR, MU, NET, OXY, 
+#                       PLTR, QQQ, ROKU, SHOP, SLB, SPY, TSM, ZM
 STOCK_SYMBOLS = [
-    "ABBV", "ABNB", "ABT", "ADBE", "AMD", "AVGO", "AXP", "BA", "BAC", "BKNG",
-    "BLK", "C", "CAT", "COIN", "COP", "COST", "CRM", "CSCO", "CVS", "CVX",
-    "DIS", "GE", "GS", "HD", "INTC", "INTU", "JNJ", "JPM", "KO", "LLY",
-    "LOW", "MA", "MCD", "META", "MRK", "MS", "NFLX", "NKE", "NOW", "NVDA",
-    "ORCL", "PEP", "PFE", "PG", "PYPL", "QCOM", "SBUX", "SCHW", "SNOW", "SQ",
-    "TGT", "TMO", "TSLA", "TXN", "UBER", "UNH", "USB", "V", "WFC", "WMT", "XOM"
+    "AAPL", "ABBV", "ABNB", "ABT", "ADBE", "AMAT", "AMD", "AMGN", "AMZN", "ARM",
+    "ASML", "AVGO", "AXP", "BA", "BAC", "BKNG", "BLK", "BMY", "C", "CAT",
+    "COIN", "COP", "COST", "CRM", "CSCO", "CVS", "CVX", "DASH", "DDOG", "DE", 
+    "DIS", "GE", "GOOG", "GOOGL", "GS", "HD", "HON", "INTC", "INTU", "JNJ", 
+    "JPM", "KLAC", "KO", "LLY", "LOW", "LRCX", "LYFT", "MA", "MCD", "MDB", 
+    "META", "MRK", "MS", "MSFT", "MSTR", "MU", "NET", "NFLX", "NKE", "NOW", 
+    "NVDA", "ORCL", "OXY", "PEP", "PFE", "PG", "PLTR", "PYPL", "QCOM", "QQQ", 
+    "ROKU", "SBUX", "SCHW", "SHOP", "SLB", "SNOW", "SQ", "SPY", "TGT", "TLT", 
+    "TMO", "TSLA", "TSM", "TXN", "UBER", "UNH", "USB", "V", "WFC", "WMT", 
+    "XOM", "ZM"
 ]
 
 # ETFs & Indices (28 symbols)
 ETF_INDEX_SYMBOLS = [
     "AEX", "ARKK", "BKX", "DIA", "FTSE", "GLD", "HSI", "HYG", "IBEX", "IWM",
-    "NBI", "NDX", "SLV", "SMI", "SPX", "TLT", "USO", "UTY", "VOO", "VTI",
+    "NBI", "NDX", "SLV", "SMI", "SPX", "USO", "UTY", "VOO", "VTI",
     "XLE", "XLF", "XLI", "XLK", "XLP", "XLU", "XLV", "XLY"
 ]
 
