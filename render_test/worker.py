@@ -814,7 +814,7 @@ EXCLUDE_KEYWORDS = [
 
 def get_news_scan_interval() -> tuple:
     """Smart scheduling based on market hours."""
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     day_of_week = now.weekday()
     hour_utc = now.hour
     
@@ -1235,13 +1235,22 @@ def insert_candles(symbol: str, candles: List[Dict]) -> int:
     table_name = symbol_to_table(symbol)
     
     try:
-        # Add symbol to each candle
+        # Prepare candles with volume
+        prepared_candles = []
         for c in candles:
-            c["symbol"] = symbol
+            prepared_candles.append({
+                "timestamp": c["timestamp"],
+                "open": c["open"],
+                "high": c["high"],
+                "low": c["low"],
+                "close": c["close"],
+                "volume": c.get("volume"),  # Include volume (nullable)
+                "symbol": symbol
+            })
         
         # Upsert to handle duplicates
-        sb.table(table_name).upsert(candles, on_conflict="timestamp").execute()
-        return len(candles)
+        sb.table(table_name).upsert(prepared_candles, on_conflict="timestamp").execute()
+        return len(prepared_candles)
         
     except Exception as e:
         log.error(f"❌ Error inserting candles for {symbol}: {e}")
