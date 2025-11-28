@@ -1,9 +1,30 @@
+#!/usr/bin/env python3
+"""
+================================================================================
+LONDON STRATEGIC EDGE - BULLETPROOF WORKER
+================================================================================
+Production-grade data pipeline with self-healing capabilities.
+
+TASKS:
+  1. Tick Streaming     - TwelveData WebSocket (201 symbols)
+  2. Economic Calendar  - Trading Economics (double-scrape every 15 min)
+  3. Financial News     - 50+ RSS feeds + DeepSeek AI classification
+  4. Gap Fill Service   - Auto-detect and repair missing candle data
+  5. Bond Yields        - G20 sovereign yields (every 30 minutes)
+
+REMOVED:
+  - FRED Macro Task (data comes from Economic Calendar trigger instead)
+================================================================================
+"""
+
 import os
 import json
 import asyncio
 import logging
 import signal
 import sys
+import re
+import time
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
@@ -17,17 +38,22 @@ from supabase import create_client
 import feedparser
 import openai
 
-# ------------------------------ ENV ------------------------------
-TD_API_KEY   = os.environ["TWELVEDATA_API_KEY"]
+# ============================================================================
+#                              ENVIRONMENT
+# ============================================================================
+
+TD_API_KEY = os.environ["TWELVEDATA_API_KEY"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
-FRED_API_KEY = os.environ.get("FRED_API_KEY")
 
 SUPABASE_TABLE = os.environ.get("SUPABASE_TABLE", "tickdata")
 
-# ==================== 202 TRADING PAIRS ====================
-# Crypto (39 pairs)
+# ============================================================================
+#                           TRADING SYMBOLS (201)
+# ============================================================================
+
+# Crypto (44 pairs)
 CRYPTO_SYMBOLS = [
     "1INCH/USD", "AAVE/USD", "ADA/BTC", "ADA/USD", "ALGO/USD", "APE/USD", "ARB/USD",
     "ATOM/USD", "AVAX/BTC", "AVAX/USD", "BCH/USD", "BNB/USD", "BTC/USD", "COMP/USD",
@@ -38,7 +64,7 @@ CRYPTO_SYMBOLS = [
     "XRP/USD", "YFI/USD"
 ]
 
-# Forex (51 pairs)
+# Forex (64 pairs)
 FOREX_SYMBOLS = [
     "AUD/CAD", "AUD/CHF", "AUD/JPY", "AUD/NZD", "AUD/SGD",
     "CAD/CHF", "CAD/JPY", "CHF/JPY",
@@ -53,12 +79,12 @@ FOREX_SYMBOLS = [
     "USD/PLN", "USD/SEK", "USD/SGD", "USD/THB", "USD/TRY", "USD/TWD", "USD/ZAR"
 ]
 
-# Commodities (5 pairs)
+# Commodities (4 pairs)
 COMMODITIES_SYMBOLS = [
     "XAG/USD", "XAU/USD", "XPD/USD", "XPT/USD"
 ]
 
-# Stocks (65 symbols)
+# Stocks (61 symbols)
 STOCK_SYMBOLS = [
     "ABBV", "ABNB", "ABT", "ADBE", "AMD", "AVGO", "AXP", "BA", "BAC", "BKNG",
     "BLK", "C", "CAT", "COIN", "COP", "COST", "CRM", "CSCO", "CVS", "CVX",
@@ -68,45 +94,51 @@ STOCK_SYMBOLS = [
     "TGT", "TMO", "TSLA", "TXN", "UBER", "UNH", "USB", "V", "WFC", "WMT", "XOM"
 ]
 
-# ETFs & Indices (37 symbols)
+# ETFs & Indices (28 symbols)
 ETF_INDEX_SYMBOLS = [
     "AEX", "ARKK", "BKX", "DIA", "FTSE", "GLD", "HSI", "HYG", "IBEX", "IWM",
     "NBI", "NDX", "SLV", "SMI", "SPX", "TLT", "USO", "UTY", "VOO", "VTI",
     "XLE", "XLF", "XLI", "XLK", "XLP", "XLU", "XLV", "XLY"
 ]
 
-# Combine all symbols
+# Combined symbols
 ALL_SYMBOLS = CRYPTO_SYMBOLS + FOREX_SYMBOLS + COMMODITIES_SYMBOLS + STOCK_SYMBOLS + ETF_INDEX_SYMBOLS
-
-# For WebSocket subscription (comma-separated string)
 SYMBOLS = ",".join(ALL_SYMBOLS)
 
+# TwelveData URLs
 WS_URL = f"wss://ws.twelvedata.com/v1/quotes/price?apikey={TD_API_KEY}"
 TD_REST_URL = "https://api.twelvedata.com/time_series"
 
-# Economic calendar scraping interval (in seconds)
-ECON_SCRAPE_INTERVAL = 3600
+# ============================================================================
+#                              CONFIGURATION
+# ============================================================================
 
-# FRED API Base URL
-FRED_API_BASE = "https://api.stlouisfed.org/fred"
-
-# ==================== BULLETPROOF TICK STREAMING CONFIG ====================
+# Tick Streaming
 BATCH_MAX = 500
 BATCH_FLUSH_SECS = 2
-WATCHDOG_TIMEOUT_SECS = 30      # Kill connection if no tick for 30s
-CONNECTION_TIMEOUT_SECS = 15     # Timeout for initial connection
-MAX_RECONNECT_DELAY = 30         # Max backoff delay
-HEALTH_LOG_INTERVAL = 60         # Log health status every 60s
+WATCHDOG_TIMEOUT_SECS = 30
+CONNECTION_TIMEOUT_SECS = 15
+MAX_RECONNECT_DELAY = 30
+HEALTH_LOG_INTERVAL = 60
 
-# Gap fill settings
-GAP_SCAN_INTERVAL = 300          # Check for gaps every 5 minutes
-MAX_GAP_HOURS = 4                # Look back 4 hours for gaps
-MIN_GAP_MINUTES = 3              # Only fill gaps > 3 minutes
-BACKFILL_RATE_LIMIT = 0.5        # Delay between REST API calls
+# Gap Fill
+GAP_SCAN_INTERVAL = 300
+MAX_GAP_HOURS = 4
+MIN_GAP_MINUTES = 3
+BACKFILL_RATE_LIMIT = 0.5
 
-# --------------------------- CLIENTS/LOG -------------------------
+# Bond Yields
+BOND_SCRAPE_INTERVAL = 1800  # 30 minutes
+
+# ============================================================================
+#                           CLIENTS & LOGGING
+# ============================================================================
+
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-deepseek_client = openai.OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com") if DEEPSEEK_API_KEY else None
+deepseek_client = openai.OpenAI(
+    api_key=DEEPSEEK_API_KEY, 
+    base_url="https://api.deepseek.com"
+) if DEEPSEEK_API_KEY else None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -114,7 +146,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("worker")
 
-# ==================== BULLETPROOF TICK STREAMING ====================
+
+# ============================================================================
+#                    TASK 1: BULLETPROOF TICK STREAMING
+# ============================================================================
 
 class BulletproofTickStreamer:
     """
@@ -385,10 +420,12 @@ async def tick_streaming_task():
     await tick_streamer.run()
 
 
-# ====================== ECONOMIC CALENDAR ======================
+# ============================================================================
+#                    TASK 2: ECONOMIC CALENDAR (DOUBLE-SCRAPE)
+# ============================================================================
 
-def scrape_trading_economics():
-    """Scrape economic calendar data from Trading Economics"""
+def scrape_trading_economics() -> List[Dict]:
+    """Scrape economic calendar data from Trading Economics."""
     try:
         url = "https://tradingeconomics.com/calendar"
         headers = {
@@ -446,6 +483,7 @@ def scrape_trading_economics():
 
                 forecast = consensus if consensus else ""
 
+                # Determine importance from CSS classes
                 importance = "Medium"
                 event_class = cols[0].find('span')
                 if event_class and event_class.get('class'):
@@ -455,6 +493,7 @@ def scrape_trading_economics():
                     elif 'event-0' in classes:
                         importance = "Low"
 
+                # Validation
                 if not country or len(country) != 2:
                     continue
                 if not event or len(event) < 3:
@@ -489,15 +528,21 @@ def scrape_trading_economics():
         return []
 
 
-def upsert_economic_events(events):
-    """Insert or update economic events in Supabase."""
+def upsert_economic_events(events: List[Dict]) -> int:
+    """
+    Insert or update economic events in Supabase.
+    Returns count of NEW events inserted.
+    """
     if not events:
-        return
+        return 0
 
+    new_count = 0
+    
     try:
         for event in events:
             try:
-                existing = sb.table('Economic_calander').select('*').eq(
+                # Check if event already exists
+                existing = sb.table('Economic_calander').select('actual').eq(
                     'date', event['date']
                 ).eq(
                     'time', event['time']
@@ -508,57 +553,111 @@ def upsert_economic_events(events):
                 ).execute()
 
                 if existing.data:
-                    sb.table('Economic_calander').update(event).eq(
-                        'date', event['date']
-                    ).eq(
-                        'time', event['time']
-                    ).eq(
-                        'country', event['country']
-                    ).eq(
-                        'event', event['event']
-                    ).execute()
+                    # Update only if actual value changed
+                    old_actual = existing.data[0].get('actual')
+                    if old_actual != event['actual'] and event['actual']:
+                        sb.table('Economic_calander').update({
+                            'actual': event['actual'],
+                            'forecast': event['forecast'],
+                            'previous': event['previous'],
+                            'consensus': event['consensus']
+                        }).eq(
+                            'date', event['date']
+                        ).eq(
+                            'time', event['time']
+                        ).eq(
+                            'country', event['country']
+                        ).eq(
+                            'event', event['event']
+                        ).execute()
+                        log.info(f"📊 Updated: {event['country']} {event['event']} = {event['actual']}")
                 else:
+                    # Insert new event
                     sb.table('Economic_calander').insert(event).execute()
+                    new_count += 1
 
             except Exception as e:
                 log.warning(f"⚠️ Error upserting event {event['event']}: {e}")
                 continue
 
-        log.info(f"✅ Successfully processed {len(events)} economic events")
+        if new_count > 0:
+            log.info(f"✅ Inserted {new_count} new economic events")
 
     except Exception as e:
         log.error(f"❌ Error upserting events to Supabase: {e}")
 
+    return new_count
+
 
 async def economic_calendar_task():
-    """Periodically scrape and update economic calendar."""
-    log.info("📅 Economic calendar scraper started")
+    """
+    Economic calendar with DOUBLE-SCRAPE pattern.
+    Scrapes at :00, :15, :30, :45 AND again at :05, :20, :35, :50
+    This ensures we catch delayed data releases.
+    """
+    log.info("📅 Economic calendar scraper started (double-scrape pattern)")
+    log.info("   Schedule: :00/:05, :15/:20, :30/:35, :45/:50")
 
     while not tick_streamer._shutdown.is_set():
         try:
+            now = datetime.now(timezone.utc)
+            minute = now.minute
+            
+            # Calculate next scrape time
+            # We want to scrape at :00, :05, :15, :20, :30, :35, :45, :50
+            scrape_minutes = [0, 5, 15, 20, 30, 35, 45, 50]
+            
+            # Find next scrape minute
+            next_scrape_minute = None
+            for sm in scrape_minutes:
+                if sm > minute:
+                    next_scrape_minute = sm
+                    break
+            
+            if next_scrape_minute is None:
+                # Next scrape is in the next hour at :00
+                next_scrape_minute = 0
+                wait_seconds = (60 - minute) * 60 - now.second
+            else:
+                wait_seconds = (next_scrape_minute - minute) * 60 - now.second
+            
+            # Ensure positive wait time
+            if wait_seconds < 0:
+                wait_seconds = 0
+            
+            log.info(f"📅 Next calendar scrape in {wait_seconds // 60}m {wait_seconds % 60}s (at :{next_scrape_minute:02d})")
+            await asyncio.sleep(wait_seconds)
+            
+            # Perform the scrape
+            is_followup = next_scrape_minute in [5, 20, 35, 50]
+            scrape_type = "follow-up" if is_followup else "primary"
+            
+            log.info(f"📅 Running {scrape_type} scrape...")
+            
             loop = asyncio.get_event_loop()
             events = await loop.run_in_executor(None, scrape_trading_economics)
 
             if events:
-                await loop.run_in_executor(None, upsert_economic_events, events)
-
-            await asyncio.sleep(ECON_SCRAPE_INTERVAL)
+                new_count = await loop.run_in_executor(None, upsert_economic_events, events)
+                log.info(f"📅 {scrape_type.capitalize()} scrape complete: {len(events)} events, {new_count} new")
 
         except Exception as e:
             log.error(f"❌ Error in economic calendar task: {e}")
             await asyncio.sleep(60)
 
 
-# ==================== FINANCIAL NEWS SCRAPER ====================
-# EXPANDED RSS FEEDS - 30+ sources for comprehensive macro coverage
+# ============================================================================
+#                    TASK 3: FINANCIAL NEWS SCRAPER
+# ============================================================================
 
+# 50+ RSS Feeds for comprehensive coverage
 RSS_FEEDS = [
-    # --- BBC News ---
+    # BBC News
     {"url": "http://feeds.bbci.co.uk/news/rss.xml", "name": "BBC News (Main)"},
     {"url": "http://feeds.bbci.co.uk/news/business/rss.xml", "name": "BBC News (Business)"},
     {"url": "http://feeds.bbci.co.uk/news/world/rss.xml", "name": "BBC News (World)"},
     
-    # --- CNBC ---
+    # CNBC
     {"url": "https://www.cnbc.com/id/100003114/device/rss/rss.html", "name": "CNBC (Top News)"},
     {"url": "https://www.cnbc.com/id/100727362/device/rss/rss.html", "name": "CNBC (World)"},
     {"url": "https://www.cnbc.com/id/15837362/device/rss/rss.html", "name": "CNBC (US News)"},
@@ -568,78 +667,78 @@ RSS_FEEDS = [
     {"url": "https://www.cnbc.com/id/15839135/device/rss/rss.html", "name": "CNBC (Commodities)"},
     {"url": "https://www.cnbc.com/id/19836768/device/rss/rss.html", "name": "CNBC (Energy)"},
     
-    # --- MarketWatch ---
+    # MarketWatch
     {"url": "http://feeds.marketwatch.com/marketwatch/realtimeheadlines", "name": "MarketWatch (Real-time)"},
     {"url": "http://feeds.marketwatch.com/marketwatch/topstories", "name": "MarketWatch (Top Stories)"},
     {"url": "http://feeds.marketwatch.com/marketwatch/marketpulse", "name": "MarketWatch (Market Pulse)"},
     {"url": "http://feeds.marketwatch.com/marketwatch/StockstoWatch", "name": "MarketWatch (Stocks)"},
     
-    # --- Crypto ---
+    # Crypto
     {"url": "https://www.coindesk.com/arc/outboundfeeds/rss/", "name": "CoinDesk"},
     {"url": "https://cointelegraph.com/rss", "name": "Cointelegraph"},
     {"url": "https://bitcoinmagazine.com/.rss/full/", "name": "Bitcoin Magazine"},
     {"url": "https://decrypt.co/feed", "name": "Decrypt"},
     {"url": "https://thedefiant.io/feed", "name": "The Defiant"},
     
-    # --- The Guardian ---
+    # The Guardian
     {"url": "https://www.theguardian.com/world/rss", "name": "The Guardian (World)"},
     {"url": "https://www.theguardian.com/uk/business/rss", "name": "The Guardian (Business)"},
     {"url": "https://www.theguardian.com/business/economics/rss", "name": "The Guardian (Economics)"},
     {"url": "https://www.theguardian.com/business/stock-markets/rss", "name": "The Guardian (Markets)"},
     
-    # --- Al Jazeera ---
+    # Al Jazeera
     {"url": "https://www.aljazeera.com/xml/rss/all.xml", "name": "Al Jazeera"},
     {"url": "https://www.aljazeera.com/economy/rss.xml", "name": "Al Jazeera (Economy)"},
     
-    # --- NPR ---
+    # NPR
     {"url": "https://feeds.npr.org/1001/rss.xml", "name": "NPR (News)"},
     {"url": "https://feeds.npr.org/1006/rss.xml", "name": "NPR (Business)"},
     {"url": "https://feeds.npr.org/1014/rss.xml", "name": "NPR (Politics)"},
     
-    # --- Yahoo Finance ---
+    # Yahoo Finance
     {"url": "https://finance.yahoo.com/news/rssindex", "name": "Yahoo Finance"},
     
-    # --- Investing.com ---
+    # Investing.com
     {"url": "https://www.investing.com/rss/news.rss", "name": "Investing.com (News)"},
     {"url": "https://www.investing.com/rss/news_25.rss", "name": "Investing.com (Economy)"},
     {"url": "https://www.investing.com/rss/news_14.rss", "name": "Investing.com (Forex)"},
     {"url": "https://www.investing.com/rss/news_285.rss", "name": "Investing.com (Commodities)"},
     {"url": "https://www.investing.com/rss/news_301.rss", "name": "Investing.com (Crypto)"},
     
-    # --- Economic Policy / Central Banks ---
+    # Central Banks
     {"url": "https://www.federalreserve.gov/feeds/press_all.xml", "name": "Federal Reserve"},
     {"url": "https://www.ecb.europa.eu/rss/press.html", "name": "European Central Bank"},
     {"url": "https://www.bankofengland.co.uk/rss/news", "name": "Bank of England"},
     
-    # --- FXStreet (Forex Focus) ---
+    # FXStreet
     {"url": "https://www.fxstreet.com/rss/news", "name": "FXStreet (News)"},
     {"url": "https://www.fxstreet.com/rss/analysis", "name": "FXStreet (Analysis)"},
     
-    # --- DailyFX ---
+    # DailyFX
     {"url": "https://www.dailyfx.com/feeds/all", "name": "DailyFX"},
     
-    # --- Seeking Alpha ---
+    # Seeking Alpha
     {"url": "https://seekingalpha.com/market_currents.xml", "name": "Seeking Alpha (Market Currents)"},
     {"url": "https://seekingalpha.com/tag/macro-view.xml", "name": "Seeking Alpha (Macro)"},
     
-    # --- Zero Hedge (Macro/Alternative) ---
+    # Zero Hedge
     {"url": "https://feeds.feedburner.com/zerohedge/feed", "name": "Zero Hedge"},
     
-    # --- Politico (Policy News) ---
+    # Politico
     {"url": "https://www.politico.com/rss/economy.xml", "name": "Politico (Economy)"},
     {"url": "https://www.politico.com/rss/politicopicks.xml", "name": "Politico (Top)"},
     
-    # --- The Economist ---
+    # The Economist
     {"url": "https://www.economist.com/finance-and-economics/rss.xml", "name": "The Economist (Finance)"},
     {"url": "https://www.economist.com/business/rss.xml", "name": "The Economist (Business)"},
     
-    # --- Barrons ---
+    # Barrons
     {"url": "https://www.barrons.com/xml/rss/3_7031.xml", "name": "Barrons"},
     
-    # --- Oil & Energy ---
+    # Oil & Energy
     {"url": "https://oilprice.com/rss/main", "name": "OilPrice.com"},
     
-    # --- Metals/Gold ---
+    # Metals/Gold
     {"url": "https://www.kitco.com/rss/kitco_gold.xml", "name": "Kitco (Gold)"},
 ]
 
@@ -696,7 +795,7 @@ INCLUDE_KEYWORDS = [
     "earnings", "revenue", "profit", "guidance", "forecast", "miss", "beat", "ipo", "buyback",
     "dividend", "merger", "acquisition", "m&a", "spinoff", "layoff", "restructuring",
     
-    # Tech Giants (Market Movers)
+    # Tech Giants
     "nvidia", "apple", "microsoft", "amazon", "google", "meta", "tesla", "ai", "artificial intelligence",
     "chip", "semiconductor", "data center",
 ]
@@ -709,22 +808,22 @@ EXCLUDE_KEYWORDS = [
 ]
 
 
-def get_news_scan_interval():
+def get_news_scan_interval() -> tuple:
     """Smart scheduling based on market hours."""
     now = datetime.utcnow()
     day_of_week = now.weekday()
     hour_utc = now.hour
     
-    # Weekend - scan less frequently
+    # Weekend
     if day_of_week >= 5:
         return 7200, "weekend"  # 2 hours
     
-    # US Market Hours (14:30-21:00 UTC) or Asian Session (23:00-08:00 UTC)
+    # US Market Hours or Asian Session
     if (14 <= hour_utc < 21) or (23 <= hour_utc or hour_utc < 8):
         return 600, "active"  # 10 minutes
     
-    # European Session (08:00-16:30 UTC)
-    if (8 <= hour_utc < 17):
+    # European Session
+    if 8 <= hour_utc < 17:
         return 900, "active"  # 15 minutes
     
     return 1800, "quiet"  # 30 minutes
@@ -771,7 +870,7 @@ def optimize_articles_for_cost(articles: list) -> list:
         is_duplicate = False
         for seen_title in seen_topics:
             similarity = calculate_title_similarity(article['title'], seen_title)
-            if similarity >= 0.70:  # 70% similarity threshold
+            if similarity >= 0.70:
                 is_duplicate = True
                 break
 
@@ -782,7 +881,7 @@ def optimize_articles_for_cost(articles: list) -> list:
     removed_similar = len(articles_with_images) - len(unique_articles)
     log.info(f"   Removed {removed_similar} similar articles")
 
-    # Category limits (increased for more coverage)
+    # Category limits
     category_counts = {'crypto': 0, 'political': 0, 'central_bank': 0, 'market': 0, 'commodity': 0, 'macro': 0}
     category_limits = {'crypto': 4, 'political': 4, 'central_bank': 4, 'market': 4, 'commodity': 3, 'macro': 4}
 
@@ -893,7 +992,7 @@ def fetch_rss_feed(feed_url: str, source_name: str) -> list:
         return []
 
 
-def classify_article_with_deepseek(article: dict) -> dict:
+def classify_article_with_deepseek(article: dict) -> Optional[dict]:
     """Classify article using DeepSeek API."""
     if not deepseek_client:
         log.warning("⚠️ DeepSeek API key not configured")
@@ -987,7 +1086,7 @@ async def financial_news_task():
             for feed in RSS_FEEDS:
                 articles = await loop.run_in_executor(None, fetch_rss_feed, feed['url'], feed['name'])
                 all_articles.extend(articles)
-                await asyncio.sleep(0.3)  # Be nice to servers
+                await asyncio.sleep(0.3)
 
             log.info(f"📋 Fetched {len(all_articles)} total articles")
 
@@ -1044,7 +1143,9 @@ async def financial_news_task():
             await asyncio.sleep(60)
 
 
-# ==================== GAP FILL SERVICE ====================
+# ============================================================================
+#                    TASK 4: GAP FILL SERVICE
+# ============================================================================
 
 def symbol_to_table(symbol: str) -> str:
     """Convert symbol to table name: BTC/USD -> candles_btc_usd, NVDA -> candles_nvda"""
@@ -1080,8 +1181,7 @@ def detect_gaps(symbol: str, lookback_hours: int = MAX_GAP_HOURS) -> List[tuple]
                 
         return gaps
         
-    except Exception as e:
-        # Table might not exist yet
+    except Exception:
         return []
 
 
@@ -1103,59 +1203,41 @@ def fetch_candles_rest(symbol: str, start_date: datetime, end_date: datetime) ->
         data = response.json()
         
         if "values" not in data:
-            if "message" in data:
-                log.warning(f"⚠️ TwelveData: {data.get('message', 'No data')}")
             return []
         
         candles = []
         for v in data["values"]:
-            try:
-                candles.append({
-                    "timestamp": datetime.strptime(v["datetime"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc),
-                    "open": float(Decimal(str(v["open"]))),
-                    "high": float(Decimal(str(v["high"]))),
-                    "low": float(Decimal(str(v["low"]))),
-                    "close": float(Decimal(str(v["close"]))),
-                    "symbol": symbol
-                })
-            except Exception:
-                continue
+            candles.append({
+                "timestamp": v["datetime"],
+                "open": float(v["open"]),
+                "high": float(v["high"]),
+                "low": float(v["low"]),
+                "close": float(v["close"]),
+                "volume": float(v.get("volume", 0)) if v.get("volume") else None
+            })
         
         return candles
         
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 429:
-            log.warning(f"⚠️ Rate limited by TwelveData")
-        else:
-            log.error(f"❌ TwelveData API error: {e}")
-        return []
     except Exception as e:
-        log.error(f"❌ Error fetching candles for {symbol}: {e}")
+        log.warning(f"⚠️ REST API error for {symbol}: {e}")
         return []
 
 
 def insert_candles(symbol: str, candles: List[Dict]) -> int:
-    """Insert candles using upsert."""
+    """Insert candles into symbol-specific table."""
     if not candles:
         return 0
     
     table_name = symbol_to_table(symbol)
     
     try:
-        rows = [
-            {
-                "timestamp": c["timestamp"].isoformat(),
-                "open": c["open"],
-                "high": c["high"],
-                "low": c["low"],
-                "close": c["close"],
-                "symbol": c["symbol"]
-            }
-            for c in candles
-        ]
+        # Add symbol to each candle
+        for c in candles:
+            c["symbol"] = symbol
         
-        sb.table(table_name).upsert(rows, on_conflict="timestamp").execute()
-        return len(rows)
+        # Upsert to handle duplicates
+        sb.table(table_name).upsert(candles, on_conflict="timestamp").execute()
+        return len(candles)
         
     except Exception as e:
         log.error(f"❌ Error inserting candles for {symbol}: {e}")
@@ -1193,7 +1275,7 @@ async def startup_backfill(hours: int = 2):
     total_candles = 0
     loop = asyncio.get_event_loop()
     
-    # Only backfill a subset of important symbols to avoid rate limits
+    # Priority symbols for backfill
     priority_symbols = CRYPTO_SYMBOLS[:8] + FOREX_SYMBOLS[:8] + COMMODITIES_SYMBOLS + STOCK_SYMBOLS[:10]
     
     for symbol in priority_symbols:
@@ -1246,98 +1328,334 @@ async def gap_fill_task():
             await asyncio.sleep(60)
 
 
-# ==================== FRED MACRO DATA ====================
+# ============================================================================
+#                    TASK 5: G20 BOND YIELD SCRAPER
+# ============================================================================
 
-def fetch_fred_series_no_vintage(
-    series_id: str,
-    observation_start: str,
-    observation_end: str,
-    limit: Optional[int] = None
-) -> List[Dict]:
-    """Fetch FRED data WITHOUT vintage constraints."""
-    if not FRED_API_KEY:
-        log.error("❌ FRED_API_KEY not set!")
-        return []
-    
-    url = f"{FRED_API_BASE}/series/observations"
-    params = {
-        'series_id': series_id,
-        'api_key': FRED_API_KEY,
-        'file_type': 'json',
-        'observation_start': observation_start,
-        'observation_end': observation_end,
-        'sort_order': 'desc'
+# G20 Bond URLs - 6M, 1Y, 2Y, 10Y maturities
+G20_BONDS = {
+    "US": {
+        "name": "United States",
+        "flag": "🇺🇸",
+        "6m": "https://www.investing.com/rates-bonds/u.s.-6-month-bond-yield",
+        "1y": "https://www.investing.com/rates-bonds/u.s.-1-year-bond-yield",
+        "2y": "https://www.investing.com/rates-bonds/u.s.-2-year-bond-yield",
+        "10y": "https://www.investing.com/rates-bonds/u.s.-10-year-bond-yield"
+    },
+    "GB": {
+        "name": "United Kingdom",
+        "flag": "🇬🇧",
+        "6m": None,
+        "1y": "https://www.investing.com/rates-bonds/uk-1-year-bond-yield",
+        "2y": "https://www.investing.com/rates-bonds/uk-2-year-bond-yield",
+        "10y": "https://www.investing.com/rates-bonds/uk-10-year-bond-yield"
+    },
+    "DE": {
+        "name": "Germany",
+        "flag": "🇩🇪",
+        "6m": "https://www.investing.com/rates-bonds/germany-6-month-bond-yield",
+        "1y": "https://www.investing.com/rates-bonds/germany-1-year-bond-yield",
+        "2y": "https://www.investing.com/rates-bonds/germany-2-year-bond-yield",
+        "10y": "https://www.investing.com/rates-bonds/germany-10-year-bond-yield"
+    },
+    "JP": {
+        "name": "Japan",
+        "flag": "🇯🇵",
+        "6m": "https://www.investing.com/rates-bonds/japan-6-month-bond-yield",
+        "1y": "https://www.investing.com/rates-bonds/japan-1-year-bond-yield",
+        "2y": "https://www.investing.com/rates-bonds/japan-2-year-bond-yield",
+        "10y": "https://www.investing.com/rates-bonds/japan-10-year-bond-yield"
+    },
+    "FR": {
+        "name": "France",
+        "flag": "🇫🇷",
+        "6m": "https://www.investing.com/rates-bonds/france-6-month-bond-yield",
+        "1y": "https://www.investing.com/rates-bonds/france-1-year-bond-yield",
+        "2y": "https://www.investing.com/rates-bonds/france-2-year-bond-yield",
+        "10y": "https://www.investing.com/rates-bonds/france-10-year-bond-yield"
+    },
+    "IT": {
+        "name": "Italy",
+        "flag": "🇮🇹",
+        "6m": "https://www.investing.com/rates-bonds/italy-6-month-bond-yield",
+        "1y": "https://www.investing.com/rates-bonds/italy-1-year-bond-yield",
+        "2y": "https://www.investing.com/rates-bonds/italy-2-year-bond-yield",
+        "10y": "https://www.investing.com/rates-bonds/italy-10-year-bond-yield"
+    },
+    "CA": {
+        "name": "Canada",
+        "flag": "🇨🇦",
+        "6m": None,
+        "1y": "https://www.investing.com/rates-bonds/canada-1-year-bond-yield",
+        "2y": "https://www.investing.com/rates-bonds/canada-2-year-bond-yield",
+        "10y": "https://www.investing.com/rates-bonds/canada-10-year-bond-yield"
+    },
+    "AU": {
+        "name": "Australia",
+        "flag": "🇦🇺",
+        "6m": None,
+        "1y": "https://www.investing.com/rates-bonds/australia-1-year-bond-yield",
+        "2y": "https://www.investing.com/rates-bonds/australia-2-year-bond-yield",
+        "10y": "https://www.investing.com/rates-bonds/australia-10-year-bond-yield"
+    },
+    "KR": {
+        "name": "South Korea",
+        "flag": "🇰🇷",
+        "6m": None,
+        "1y": "https://www.investing.com/rates-bonds/south-korea-1-year-bond-yield",
+        "2y": "https://www.investing.com/rates-bonds/south-korea-2-year-bond-yield",
+        "10y": "https://www.investing.com/rates-bonds/south-korea-10-year-bond-yield"
+    },
+    "CN": {
+        "name": "China",
+        "flag": "🇨🇳",
+        "6m": None,
+        "1y": "https://www.investing.com/rates-bonds/china-1-year-bond-yield",
+        "2y": "https://www.investing.com/rates-bonds/china-2-year-bond-yield",
+        "10y": "https://www.investing.com/rates-bonds/china-10-year-bond-yield"
+    },
+    "IN": {
+        "name": "India",
+        "flag": "🇮🇳",
+        "6m": None,
+        "1y": "https://www.investing.com/rates-bonds/india-1-year-bond-yield",
+        "2y": "https://www.investing.com/rates-bonds/india-2-year-bond-yield",
+        "10y": "https://www.investing.com/rates-bonds/india-10-year-bond-yield"
+    },
+    "BR": {
+        "name": "Brazil",
+        "flag": "🇧🇷",
+        "6m": None,
+        "1y": "https://www.investing.com/rates-bonds/brazil-1-year-bond-yield",
+        "2y": "https://www.investing.com/rates-bonds/brazil-2-year-bond-yield",
+        "10y": "https://www.investing.com/rates-bonds/brazil-10-year-bond-yield"
+    },
+    "MX": {
+        "name": "Mexico",
+        "flag": "🇲🇽",
+        "6m": None,
+        "1y": None,
+        "2y": None,
+        "10y": "https://www.investing.com/rates-bonds/mexico-10-year"
+    },
+    "RU": {
+        "name": "Russia",
+        "flag": "🇷🇺",
+        "6m": None,
+        "1y": "https://www.investing.com/rates-bonds/russia-1-year-bond-yield",
+        "2y": "https://www.investing.com/rates-bonds/russia-2-year-bond-yield",
+        "10y": "https://www.investing.com/rates-bonds/russia-10-year-bond-yield"
+    },
+    "ZA": {
+        "name": "South Africa",
+        "flag": "🇿🇦",
+        "6m": None,
+        "1y": None,
+        "2y": None,
+        "10y": "https://www.investing.com/rates-bonds/south-africa-10-year-bond-yield"
+    },
+    "TR": {
+        "name": "Turkey",
+        "flag": "🇹🇷",
+        "6m": None,
+        "1y": None,
+        "2y": "https://www.investing.com/rates-bonds/turkey-2-year-bond-yield",
+        "10y": "https://www.investing.com/rates-bonds/turkey-10-year-bond-yield"
+    },
+    "ID": {
+        "name": "Indonesia",
+        "flag": "🇮🇩",
+        "6m": None,
+        "1y": None,
+        "2y": None,
+        "10y": "https://www.investing.com/rates-bonds/indonesia-10-year-bond-yield"
+    }
+}
+
+
+def scrape_bond_yield(url: str, session: requests.Session, max_retries: int = 2) -> Optional[Dict]:
+    """Scrape yield and change from Investing.com."""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
     }
     
-    if limit:
-        params['limit'] = limit
-    
-    try:
-        response = requests.get(url, params=params, timeout=30)
-        response.raise_for_status()
-        data = response.json()
-        
-        if 'observations' not in data:
-            log.warning(f"No observations found for {series_id}")
-            return []
-        
-        observations = [
-            {
-                'date': obs['date'], 
-                'value': obs['value']
+    for attempt in range(max_retries + 1):
+        try:
+            response = session.get(url, headers=headers, timeout=20)
+            response.encoding = 'utf-8'
+            
+            if response.status_code == 404:
+                return None
+            
+            if response.status_code != 200:
+                if attempt < max_retries:
+                    time.sleep(1)
+                    continue
+                return None
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Extract yield value
+            yield_elem = soup.find('div', {'data-test': 'instrument-price-last'})
+            if not yield_elem:
+                if attempt < max_retries:
+                    time.sleep(1)
+                    continue
+                return None
+            
+            yield_text = yield_elem.get_text(strip=True)
+            yield_text = re.sub(r'<!--.*?-->', '', yield_text)
+            yield_value = float(yield_text.replace(',', ''))
+            
+            # Extract change value
+            change_value = None
+            change_elem = soup.find('div', {'data-test': 'instrument-price-change'})
+            if change_elem:
+                change_text = change_elem.get_text(strip=True)
+                change_text = re.sub(r'<!--.*?-->', '', change_text)
+                try:
+                    change_value = float(change_text.replace(',', '').replace('+', ''))
+                except:
+                    pass
+            
+            return {
+                'yield': yield_value,
+                'change': change_value
             }
-            for obs in data['observations']
-            if obs['value'] != '.'
-        ]
-        
-        return observations
+            
+        except Exception as e:
+            if attempt < max_retries:
+                time.sleep(1)
+                continue
+            return None
     
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 400:
-            log.warning(f"⚠️ FRED API 400 error for {series_id}")
-        else:
-            log.error(f"Error fetching FRED series {series_id}: {e}")
-        return []
-    except Exception as e:
-        log.error(f"Error fetching FRED series {series_id}: {e}")
-        return []
+    return None
 
 
-def get_active_indicators() -> List[Dict]:
-    """Get all active macro indicators from metadata table"""
+def scrape_all_g20_yields() -> List[Dict]:
+    """Scrape yields for all G20 countries."""
+    results = []
+    session = requests.Session()
+    
+    log.info("🌍 Starting G20 bond yield scrape...")
+    
+    for country_code, config in G20_BONDS.items():
+        country_data = {
+            'country_code': country_code,
+            'country_name': config['name'],
+            'flag': config['flag'],
+            'yield_6m': None,
+            'yield_1y': None,
+            'yield_2y': None,
+            'yield_10y': None,
+            'change_6m': None,
+            'change_1y': None,
+            'change_2y': None,
+            'change_10y': None,
+            'spread_10y_2y': None,
+            'scraped_at': datetime.now(timezone.utc).isoformat()
+        }
+        
+        # Scrape each maturity
+        for maturity in ['6m', '1y', '2y', '10y']:
+            url = config.get(maturity)
+            
+            if url is None:
+                continue
+            
+            data = scrape_bond_yield(url, session)
+            
+            if data:
+                country_data[f'yield_{maturity}'] = data['yield']
+                country_data[f'change_{maturity}'] = data['change']
+            
+            time.sleep(1.5)  # Rate limiting
+        
+        # Calculate spread (10Y - 2Y)
+        if country_data['yield_10y'] is not None and country_data['yield_2y'] is not None:
+            country_data['spread_10y_2y'] = round(country_data['yield_10y'] - country_data['yield_2y'], 3)
+        
+        # Log result
+        y10 = country_data['yield_10y']
+        spread = country_data['spread_10y_2y']
+        if y10:
+            spread_str = f"spread {spread:+.2f}%" if spread else ""
+            inverted = "🔴 INVERTED" if spread and spread < 0 else ""
+            log.info(f"   {config['flag']} {country_code}: 10Y={y10:.2f}% {spread_str} {inverted}")
+        
+        results.append(country_data)
+    
+    return results
+
+
+def store_bond_yields(yields: List[Dict]) -> int:
+    """Store bond yields in Supabase."""
+    if not yields:
+        return 0
+    
     try:
-        result = sb.table('macro_indicator_metadata').select('*').eq('is_active', True).execute()
-        return result.data if result.data else []
+        # Filter to only countries with at least 10Y data
+        valid_yields = [y for y in yields if y['yield_10y'] is not None]
+        
+        if valid_yields:
+            sb.table('sovereign_yields').insert(valid_yields).execute()
+            log.info(f"✅ Stored {len(valid_yields)} bond yield records")
+            return len(valid_yields)
+    
     except Exception as e:
-        log.error(f"Error fetching indicator metadata: {e}")
-        return []
+        log.error(f"❌ Error storing bond yields: {e}")
+    
+    return 0
 
 
-async def macro_data_task():
-    """Event-driven macro data updater."""
-    log.info("📊 Macro data task started")
+async def bond_yield_task():
+    """Periodically scrape and store G20 bond yields."""
+    log.info("📈 Bond yield scraper started")
+    log.info(f"   Interval: {BOND_SCRAPE_INTERVAL // 60} minutes")
+    log.info(f"   Countries: {len(G20_BONDS)}")
+    log.info(f"   Maturities: 6M, 1Y, 2Y, 10Y")
     
     while not tick_streamer._shutdown.is_set():
         try:
-            log.info("🔍 Checking for macro data updates...")
-            await asyncio.sleep(3600)  # Check hourly
+            loop = asyncio.get_event_loop()
+            yields = await loop.run_in_executor(None, scrape_all_g20_yields)
+            
+            if yields:
+                # Stats
+                has_10y = sum(1 for y in yields if y['yield_10y'] is not None)
+                has_2y = sum(1 for y in yields if y['yield_2y'] is not None)
+                inverted = sum(1 for y in yields if y['spread_10y_2y'] is not None and y['spread_10y_2y'] < 0)
+                
+                log.info(f"📊 Scrape complete: {has_10y}/17 10Y, {has_2y}/17 2Y, {inverted} inverted")
+                
+                await loop.run_in_executor(None, store_bond_yields, yields)
+            
+            log.info(f"😴 Next bond scrape in {BOND_SCRAPE_INTERVAL // 60} minutes...")
+            await asyncio.sleep(BOND_SCRAPE_INTERVAL)
+        
         except Exception as e:
-            log.error(f"❌ Error in macro data task: {e}")
+            log.error(f"❌ Error in bond yield task: {e}")
             await asyncio.sleep(300)
 
 
-# ====================== MAIN ======================
+# ============================================================================
+#                              MAIN ENTRY POINT
+# ============================================================================
 
 async def main():
     """Run all tasks in parallel with graceful shutdown."""
     log.info("=" * 70)
-    log.info("🚀 LONDON STRATEGIC EDGE - WORKER")
+    log.info("🚀 LONDON STRATEGIC EDGE - BULLETPROOF WORKER")
     log.info("=" * 70)
-    log.info("   1️⃣ Tick streaming (TwelveData) - %d symbols", len(ALL_SYMBOLS))
-    log.info("   2️⃣ Economic calendar (Trading Economics)")
-    log.info("   3️⃣ Financial news (%d RSS feeds + DeepSeek)", len(RSS_FEEDS))
-    log.info("   4️⃣ Macro data (FRED API)")
-    log.info("   5️⃣ Gap detection & backfill (AUTO-HEALING)")
+    log.info("   1️⃣  Tick streaming (TwelveData) - %d symbols", len(ALL_SYMBOLS))
+    log.info("   2️⃣  Economic calendar (Trading Economics) - double-scrape")
+    log.info("   3️⃣  Financial news (%d RSS feeds + DeepSeek)", len(RSS_FEEDS))
+    log.info("   4️⃣  Gap detection & backfill (AUTO-HEALING)")
+    log.info("   5️⃣  Bond yields (G20 sovereign bonds) - 30 min")
     log.info("=" * 70)
     log.info("📊 Symbol breakdown:")
     log.info("   Crypto: %d | Forex: %d | Commodities: %d",
@@ -1359,8 +1677,8 @@ async def main():
         asyncio.create_task(tick_streaming_task(), name="tick_stream"),
         asyncio.create_task(economic_calendar_task(), name="econ_calendar"),
         asyncio.create_task(financial_news_task(), name="news"),
-        asyncio.create_task(macro_data_task(), name="macro"),
         asyncio.create_task(gap_fill_task(), name="gap_fill"),
+        asyncio.create_task(bond_yield_task(), name="bond_yields"),
     ]
 
     try:
