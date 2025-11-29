@@ -108,10 +108,11 @@ STOCK_SYMBOLS = [
 ]
 
 # TO (32 symbols - added EEM, LQD, SHY, VIX):
+# Use VIXY instead of VIX
 ETF_INDEX_SYMBOLS = [
     "AEX", "ARKK", "BKX", "DIA", "EEM", "FTSE", "GLD", "HSI", "HYG", "IBEX", 
     "IWM", "LQD", "NBI", "NDX", "SHY", "SLV", "SMI", "SPX", "USO", "UTY", 
-    "VIX", "VOO", "VTI", "XLE", "XLF", "XLI", "XLK", "XLP", "XLU", "XLV", "XLY"
+    "VIXY", "VOO", "VTI", "XLE", "XLF", "XLI", "XLK", "XLP", "XLU", "XLV", "XLY"
 ]
 
 # Combined symbols
