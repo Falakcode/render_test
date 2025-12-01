@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-LONDON STRATEGIC EDGE - BULLETPROOF WORKER v6.0
+LONDON STRATEGIC EDGE - BULLETPROOF WORKER v6.1
 ================================================================================
 Production-grade data pipeline with AGGRESSIVE self-healing.
 
-NEW in v6.0:
-  - Added Task 6: BTC Whale Flow Tracker v3.2 with smart detection
-  - 7 detection methods for exchange flow identification
-  - Address learning system for improved accuracy over time
-  - Real-time momentum scoring and regime classification
+FIXES in v6.1:
+  - Fixed momentum table column mapping (flow_score -> total_score)
+  - Improved learned wallet detection (stricter criteria)
+  - Fixed regime calculation to properly weight by USD value
+  - Added unknown flow tracking for better analysis
+  - likely_withdrawal now counts at 50% weight (was 100%)
 
 TASKS:
   1. Tick Streaming     - TwelveData WebSocket (237 symbols)
@@ -1859,12 +1860,19 @@ KNOWN_EXCHANGE_WALLETS = {
 class AddressMemory:
     """
     Learn from repeated addresses - addresses seen multiple times
-    are likely exchange hot wallets.
+    with high volume are likely exchange hot wallets.
+    
+    Stricter criteria to reduce false positives:
+    - Must be seen 5+ times (up from 3)
+    - Must have processed 10+ BTC total
+    - Must act as BOTH sender and receiver (exchanges do both)
     """
     def __init__(self):
         self._lock = threading.Lock()
         self._addresses: Dict[str, Dict] = {}
-        self._learn_threshold = 3  # Addresses seen 3+ times = likely exchange
+        self._learn_threshold = 5          # Must be seen 5+ times
+        self._volume_threshold = 10.0      # Must have 10+ BTC total volume
+        self._bidirectional_required = True # Must be both sender and receiver
     
     def record_address(self, address: str, role: str, amount_btc: float):
         """Record an address sighting."""
@@ -1892,11 +1900,35 @@ class AddressMemory:
                 stats['total_received'] += amount_btc
     
     def is_learned_exchange(self, address: str) -> bool:
-        """Check if address has been seen enough to be considered exchange."""
+        """
+        Check if address qualifies as a learned exchange.
+        
+        Stricter criteria:
+        1. Seen 5+ times
+        2. Total volume 10+ BTC
+        3. Must have been BOTH sender and receiver (exchanges do both)
+        """
         with self._lock:
             if address not in self._addresses:
                 return False
-            return self._addresses[address]['seen_count'] >= self._learn_threshold
+            
+            stats = self._addresses[address]
+            
+            # Check count threshold
+            if stats['seen_count'] < self._learn_threshold:
+                return False
+            
+            # Check volume threshold
+            total_volume = stats['total_sent'] + stats['total_received']
+            if total_volume < self._volume_threshold:
+                return False
+            
+            # Check bidirectional requirement
+            if self._bidirectional_required:
+                if stats['as_sender'] == 0 or stats['as_receiver'] == 0:
+                    return False
+            
+            return True
     
     def get_stats(self) -> Dict:
         """Get memory statistics."""
@@ -2078,7 +2110,13 @@ class WhaleFlowTracker:
         return ('unknown', None, None)
     
     def _calculate_momentum(self) -> Dict:
-        """Calculate momentum score from recent flows."""
+        """
+        Calculate momentum score from recent flows.
+        
+        IMPORTANT: Score is based on NET USD flow, not transaction count.
+        - Positive score = More USD leaving exchanges (BULLISH/ACCUMULATION)
+        - Negative score = More USD entering exchanges (BEARISH/DISTRIBUTION)
+        """
         now = datetime.now(timezone.utc)
         cutoff = now - timedelta(minutes=WHALE_MOMENTUM_WINDOW_MINS)
         
@@ -2089,37 +2127,59 @@ class WhaleFlowTracker:
         outflow_usd = 0.0
         inflow_count = 0
         outflow_count = 0
+        unknown_usd = 0.0
+        unknown_count = 0
         
         for flow in recent_flows:
             usd = flow['amount_usd']
             flow_type = flow['flow_type']
             
             if flow_type == 'exchange_inflow':
+                # Coins going TO exchange = bearish (people depositing to sell)
                 inflow_usd += usd
                 inflow_count += 1
-            elif flow_type in ['exchange_outflow', 'distribution', 'likely_withdrawal']:
+            elif flow_type in ['exchange_outflow', 'distribution']:
+                # Coins LEAVING exchange = bullish (people withdrawing to hold)
                 outflow_usd += usd
                 outflow_count += 1
+            elif flow_type == 'likely_withdrawal':
+                # Patterns suggest withdrawal but not confirmed
+                # Count as 50% weight toward outflow
+                outflow_usd += usd * 0.5
+                outflow_count += 1
+            elif flow_type == 'consolidation':
+                # Neutral - could go either way, don't count
+                pass
+            else:
+                # Unknown - track separately
+                unknown_usd += usd
+                unknown_count += 1
         
-        # Net flow score: positive = more outflow (bullish), negative = more inflow (bearish)
+        # Net flow: positive = more leaving exchanges (bullish)
+        # negative = more entering exchanges (bearish)  
         net_flow = outflow_usd - inflow_usd
         
-        # Normalize to -100 to +100 scale
-        total_flow = inflow_usd + outflow_usd
-        if total_flow > 0:
-            flow_score = int((net_flow / total_flow) * 100)
+        # Calculate score based on USD imbalance
+        total_classified = inflow_usd + outflow_usd
+        if total_classified > 0:
+            # Score from -100 (all inflow/bearish) to +100 (all outflow/bullish)
+            flow_score = int((net_flow / total_classified) * 100)
+            # Clamp to -100 to +100
+            flow_score = max(-100, min(100, flow_score))
         else:
             flow_score = 0
         
-        # Determine regime
+        # Determine regime based on score
+        # Note: High inflow (negative score) = DISTRIBUTION (bearish)
+        #       High outflow (positive score) = ACCUMULATION (bullish)
         if flow_score >= 50:
-            regime = "ACCUMULATION"
+            regime = "ACCUMULATION"        # Strong bullish - coins leaving exchanges
         elif flow_score >= 20:
-            regime = "MILD_ACCUMULATION"
+            regime = "MILD_ACCUMULATION"   # Mild bullish
         elif flow_score <= -50:
-            regime = "DISTRIBUTION"
+            regime = "DISTRIBUTION"        # Strong bearish - coins entering exchanges
         elif flow_score <= -20:
-            regime = "MILD_DISTRIBUTION"
+            regime = "MILD_DISTRIBUTION"   # Mild bearish
         else:
             regime = "NEUTRAL"
         
@@ -2131,6 +2191,8 @@ class WhaleFlowTracker:
             'inflow_count': inflow_count,
             'outflow_count': outflow_count,
             'net_flow_usd': net_flow,
+            'unknown_usd': unknown_usd,
+            'unknown_count': unknown_count,
             'window_minutes': WHALE_MOMENTUM_WINDOW_MINS
         }
     
@@ -2225,15 +2287,15 @@ class WhaleFlowTracker:
         try:
             momentum = self._calculate_momentum()
             
+            # Use total_score to match existing table schema
             data = {
                 'timestamp': datetime.now(timezone.utc).isoformat(),
-                'flow_score': momentum['flow_score'],
+                'total_score': momentum['flow_score'],  # Maps flow_score to total_score column
                 'regime': momentum['regime'],
                 'inflow_usd': momentum['inflow_usd'],
                 'outflow_usd': momentum['outflow_usd'],
                 'inflow_count': momentum['inflow_count'],
-                'outflow_count': momentum['outflow_count'],
-                'net_flow_usd': momentum['net_flow_usd']
+                'outflow_count': momentum['outflow_count']
             }
             
             sb.table('whale_flow_momentum').insert(data).execute()
@@ -2272,11 +2334,16 @@ class WhaleFlowTracker:
                         detected = (self._stats['total_whales'] - self._stats['unknown'])
                         detection_rate = (detected / self._stats['total_whales']) * 100
                     
+                    # Calculate net flow direction
+                    net_flow = momentum['outflow_usd'] - momentum['inflow_usd']
+                    net_direction = "📈" if net_flow > 0 else "📉" if net_flow < 0 else "➡️"
+                    
                     log.info(
                         f"🐋 WHALE STATS | Score: {momentum['flow_score']:+d} {momentum['regime']} | "
                         f"In: ${momentum['inflow_usd']/1e6:.1f}M ({momentum['inflow_count']}) | "
                         f"Out: ${momentum['outflow_usd']/1e6:.1f}M ({momentum['outflow_count']}) | "
-                        f"Detection: {detection_rate:.0f}% | Learned: {mem_stats['learned_exchanges']}"
+                        f"Net: {net_direction} ${abs(net_flow)/1e6:.1f}M | "
+                        f"Det: {detection_rate:.0f}% | Learned: {mem_stats['learned_exchanges']}"
                     )
                     last_stats_log = now
                 
