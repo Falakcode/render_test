@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-LONDON STRATEGIC EDGE - BULLETPROOF WORKER v6.1
+LONDON STRATEGIC EDGE - BULLETPROOF WORKER v6.2
 ================================================================================
 Production-grade data pipeline with AGGRESSIVE self-healing.
 
-FIXES in v6.1:
+FIXES in v6.2:
+  - Fixed deposit address detection (receive-only addresses now detected!)
+  - Added is_learned_deposit() for addresses that only receive
+  - Added is_learned_hot_wallet() for addresses that only send
+  - Inflows now properly tracked via deposit address pattern matching
+  - This fixes the zero-inflow bug from v6.1
+
+PREVIOUS FIXES (v6.1):
   - Fixed momentum table column mapping (flow_score -> total_score)
   - Improved learned wallet detection (stricter criteria)
   - Fixed regime calculation to properly weight by USD value
@@ -1860,19 +1867,21 @@ KNOWN_EXCHANGE_WALLETS = {
 class AddressMemory:
     """
     Learn from repeated addresses - addresses seen multiple times
-    with high volume are likely exchange hot wallets.
+    with high volume are likely exchange wallets.
     
-    Stricter criteria to reduce false positives:
-    - Must be seen 5+ times (up from 3)
-    - Must have processed 10+ BTC total
-    - Must act as BOTH sender and receiver (exchanges do both)
+    v6.2 FIX: Separate detection for deposit addresses vs hot wallets:
+    - Deposit addresses: RECEIVE-ONLY (users deposit to sell)
+    - Hot wallets: SEND frequently (exchange withdrawals)
+    - Full exchange: Does BOTH (highest confidence)
+    
+    This fixes the zero-inflow bug from v6.1 where deposit addresses
+    were never learned because they don't send.
     """
     def __init__(self):
         self._lock = threading.Lock()
         self._addresses: Dict[str, Dict] = {}
         self._learn_threshold = 5          # Must be seen 5+ times
         self._volume_threshold = 10.0      # Must have 10+ BTC total volume
-        self._bidirectional_required = True # Must be both sender and receiver
     
     def record_address(self, address: str, role: str, amount_btc: float):
         """Record an address sighting."""
@@ -1899,14 +1908,16 @@ class AddressMemory:
                 stats['as_receiver'] += 1
                 stats['total_received'] += amount_btc
     
-    def is_learned_exchange(self, address: str) -> bool:
+    def is_learned_deposit_address(self, address: str) -> bool:
         """
-        Check if address qualifies as a learned exchange.
+        Check if address is a learned DEPOSIT address (inflow detector).
         
-        Stricter criteria:
-        1. Seen 5+ times
-        2. Total volume 10+ BTC
-        3. Must have been BOTH sender and receiver (exchanges do both)
+        Deposit addresses characteristics:
+        - Receive-ONLY (never send, funds swept to cold storage)
+        - High receive frequency (many users depositing)
+        - High volume received
+        
+        v6.2 FIX: This enables inflow detection!
         """
         with self._lock:
             if address not in self._addresses:
@@ -1914,19 +1925,74 @@ class AddressMemory:
             
             stats = self._addresses[address]
             
-            # Check count threshold
+            # Must be seen as receiver 5+ times
+            if stats['as_receiver'] < self._learn_threshold:
+                return False
+            
+            # Must have received 10+ BTC
+            if stats['total_received'] < self._volume_threshold:
+                return False
+            
+            # Must be receive-ONLY or receive-MOSTLY (90%+ receives)
+            total_activity = stats['as_sender'] + stats['as_receiver']
+            if total_activity > 0:
+                receive_ratio = stats['as_receiver'] / total_activity
+                if receive_ratio < 0.9:  # Must be 90%+ receives
+                    return False
+            
+            return True
+    
+    def is_learned_hot_wallet(self, address: str) -> bool:
+        """
+        Check if address is a learned HOT WALLET (outflow detector).
+        
+        Hot wallet characteristics:
+        - Send frequently (processing withdrawals)
+        - May also receive (refills from cold storage)
+        - High send volume
+        """
+        with self._lock:
+            if address not in self._addresses:
+                return False
+            
+            stats = self._addresses[address]
+            
+            # Must be seen as sender 5+ times
+            if stats['as_sender'] < self._learn_threshold:
+                return False
+            
+            # Must have sent 10+ BTC
+            if stats['total_sent'] < self._volume_threshold:
+                return False
+            
+            return True
+    
+    def is_learned_exchange(self, address: str) -> bool:
+        """
+        Check if address qualifies as a learned exchange (bidirectional).
+        Highest confidence - address does BOTH sending and receiving.
+        
+        This is the original strict check for addresses that act as both
+        deposit and withdrawal (rare but highest confidence).
+        """
+        with self._lock:
+            if address not in self._addresses:
+                return False
+            
+            stats = self._addresses[address]
+            
+            # Must be seen 5+ times total
             if stats['seen_count'] < self._learn_threshold:
                 return False
             
-            # Check volume threshold
+            # Must have 10+ BTC total volume
             total_volume = stats['total_sent'] + stats['total_received']
             if total_volume < self._volume_threshold:
                 return False
             
-            # Check bidirectional requirement
-            if self._bidirectional_required:
-                if stats['as_sender'] == 0 or stats['as_receiver'] == 0:
-                    return False
+            # Must have done BOTH sending and receiving
+            if stats['as_sender'] == 0 or stats['as_receiver'] == 0:
+                return False
             
             return True
     
@@ -1934,12 +2000,58 @@ class AddressMemory:
         """Get memory statistics."""
         with self._lock:
             total = len(self._addresses)
-            learned = sum(1 for a in self._addresses.values() 
-                         if a['seen_count'] >= self._learn_threshold)
+            deposit_addrs = sum(1 for addr in self._addresses 
+                               if self._is_deposit_unlocked(addr))
+            hot_wallets = sum(1 for addr in self._addresses 
+                             if self._is_hot_wallet_unlocked(addr))
+            bidirectional = sum(1 for addr in self._addresses 
+                               if self._is_exchange_unlocked(addr))
             return {
                 'total_addresses': total,
-                'learned_exchanges': learned
+                'learned_deposit_addresses': deposit_addrs,
+                'learned_hot_wallets': hot_wallets,
+                'learned_bidirectional': bidirectional,
+                'total_learned': deposit_addrs + hot_wallets + bidirectional
             }
+    
+    def _is_deposit_unlocked(self, address: str) -> bool:
+        """Internal: check deposit without lock (for stats)."""
+        stats = self._addresses.get(address)
+        if not stats:
+            return False
+        if stats['as_receiver'] < self._learn_threshold:
+            return False
+        if stats['total_received'] < self._volume_threshold:
+            return False
+        total = stats['as_sender'] + stats['as_receiver']
+        if total > 0 and stats['as_receiver'] / total < 0.9:
+            return False
+        return True
+    
+    def _is_hot_wallet_unlocked(self, address: str) -> bool:
+        """Internal: check hot wallet without lock (for stats)."""
+        stats = self._addresses.get(address)
+        if not stats:
+            return False
+        if stats['as_sender'] < self._learn_threshold:
+            return False
+        if stats['total_sent'] < self._volume_threshold:
+            return False
+        return True
+    
+    def _is_exchange_unlocked(self, address: str) -> bool:
+        """Internal: check bidirectional without lock (for stats)."""
+        stats = self._addresses.get(address)
+        if not stats:
+            return False
+        if stats['seen_count'] < self._learn_threshold:
+            return False
+        total_vol = stats['total_sent'] + stats['total_received']
+        if total_vol < self._volume_threshold:
+            return False
+        if stats['as_sender'] == 0 or stats['as_receiver'] == 0:
+            return False
+        return True
 
 
 class WhaleFlowTracker:
@@ -2055,16 +2167,31 @@ class WhaleFlowTracker:
                 self._stats['known_wallet'] += 1
                 return ('exchange_inflow', KNOWN_EXCHANGE_WALLETS[addr], 'known_wallet')
         
-        # METHOD 2: Learned wallet matching
+        # METHOD 2: Learned wallet matching (v6.2 FIX - separate deposit vs hot wallet detection)
+        
+        # 2a: Check for learned bidirectional exchange (highest confidence)
         for addr in input_addrs:
             if self._address_memory.is_learned_exchange(addr):
                 self._stats['learned_wallet'] += 1
-                return ('exchange_outflow', 'Learned Exchange', 'learned_wallet')
+                return ('exchange_outflow', 'Learned Exchange', 'learned_exchange')
         
         for addr in output_addrs:
             if self._address_memory.is_learned_exchange(addr):
                 self._stats['learned_wallet'] += 1
-                return ('exchange_inflow', 'Learned Exchange', 'learned_wallet')
+                return ('exchange_inflow', 'Learned Exchange', 'learned_exchange')
+        
+        # 2b: Check for learned hot wallet (send-heavy = outflow detector)
+        for addr in input_addrs:
+            if self._address_memory.is_learned_hot_wallet(addr):
+                self._stats['learned_wallet'] += 1
+                return ('exchange_outflow', 'Learned Hot Wallet', 'learned_hot_wallet')
+        
+        # 2c: Check for learned deposit address (receive-heavy = inflow detector)
+        # v6.2 FIX: This enables inflow detection!
+        for addr in output_addrs:
+            if self._address_memory.is_learned_deposit_address(addr):
+                self._stats['learned_wallet'] += 1
+                return ('exchange_inflow', 'Learned Deposit', 'learned_deposit')
         
         # METHOD 3: Consolidation pattern (5+ inputs → 1-2 outputs)
         if len(inputs) >= 5 and len(outputs) <= 2:
@@ -2343,7 +2470,10 @@ class WhaleFlowTracker:
                         f"In: ${momentum['inflow_usd']/1e6:.1f}M ({momentum['inflow_count']}) | "
                         f"Out: ${momentum['outflow_usd']/1e6:.1f}M ({momentum['outflow_count']}) | "
                         f"Net: {net_direction} ${abs(net_flow)/1e6:.1f}M | "
-                        f"Det: {detection_rate:.0f}% | Learned: {mem_stats['learned_exchanges']}"
+                        f"Det: {detection_rate:.0f}% | "
+                        f"Learned: {mem_stats.get('total_learned', 0)} "
+                        f"(D:{mem_stats.get('learned_deposit_addresses', 0)} "
+                        f"H:{mem_stats.get('learned_hot_wallets', 0)})"
                     )
                     last_stats_log = now
                 
