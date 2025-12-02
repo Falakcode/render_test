@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-LONDON STRATEGIC EDGE - BULLETPROOF WORKER v6.2
+LONDON STRATEGIC EDGE - BULLETPROOF WORKER v7.0
 ================================================================================
 Production-grade data pipeline with AGGRESSIVE self-healing.
 
-FIXES in v6.2:
+NEW in v7.0:
+  - Task 7: AI News Desk - Synthesizes 3 professional articles per cycle
+  - Smart scheduling: 30 min (London/US), 60 min (other), 4 hours (weekend)
+  - 500-800 word articles with TF-IDF clustering
+  - Unsplash images with fallbacks
+  - Cross-run deduplication
+
+PREVIOUS FIXES (v6.2):
   - Fixed deposit address detection (receive-only addresses now detected!)
   - Added is_learned_deposit() for addresses that only receive
   - Added is_learned_hot_wallet() for addresses that only send
   - Inflows now properly tracked via deposit address pattern matching
-  - This fixes the zero-inflow bug from v6.1
-
-PREVIOUS FIXES (v6.1):
-  - Fixed momentum table column mapping (flow_score -> total_score)
-  - Improved learned wallet detection (stricter criteria)
-  - Fixed regime calculation to properly weight by USD value
-  - Added unknown flow tracking for better analysis
-  - likely_withdrawal now counts at 50% weight (was 100%)
 
 TASKS:
   1. Tick Streaming     - TwelveData WebSocket (237 symbols)
@@ -26,6 +25,7 @@ TASKS:
   4. Gap Fill Service   - Auto-detect and repair missing candle data
   5. Bond Yields        - G20 sovereign yields (every 30 minutes)
   6. Whale Flow Tracker - BTC whale movements via Blockchain.com WebSocket
+  7. AI News Desk       - Professional article synthesis (3 per cycle)
 ================================================================================
 """
 
@@ -38,12 +38,18 @@ import sys
 import re
 import time
 import threading
+import random
+import hashlib
+import math
+import ssl
+import urllib.request
+import urllib.parse
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Set, Tuple
 from contextlib import suppress
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 import websockets
 import requests
@@ -51,6 +57,14 @@ from bs4 import BeautifulSoup
 from supabase import create_client
 import feedparser
 import openai
+
+# Optional: TF-IDF for AI News Desk clustering
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+    HAS_SKLEARN = True
+except ImportError:
+    HAS_SKLEARN = False
 
 # ============================================================================
 #                              ENVIRONMENT
@@ -60,6 +74,7 @@ TD_API_KEY = os.environ["TWELVEDATA_API_KEY"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
+UNSPLASH_ACCESS_KEY = os.environ.get("UNSPLASH_ACCESS_KEY", "LWD7wgTnS8zYEtNcnOc9qUgr_Encl7iycazKCp2vhvc")
 
 SUPABASE_TABLE = os.environ.get("SUPABASE_TABLE", "tickdata")
 
@@ -174,19 +189,24 @@ log = logging.getLogger("worker")
 
 
 # ============================================================================
-#                    TASK 1: BULLETPROOF TICK STREAMING v5.0
+#                    TASK 1: BULLETPROOF TICK STREAMING v6.0
+#                         NUCLEAR WATCHDOG EDITION
 # ============================================================================
 
 class BulletproofTickStreamer:
     """
-    Bulletproof WebSocket tick streamer v5.0 with AGGRESSIVE reconnection:
+    Bulletproof WebSocket tick streamer v6.0 with NUCLEAR WATCHDOG.
     
-    FIXES:
-    - Watchdog forces IMMEDIATE reconnect (sets _force_reconnect flag)
-    - recv() has timeout to prevent infinite blocking
-    - Heartbeat task keeps connection alive
-    - Any error = instant reconnect (no long backoff on first try)
-    - Tracks last activity (not just last tick) to handle quiet markets
+    CRITICAL FIXES from v5:
+    1. NUCLEAR WATCHDOG - Runs independently, kills stuck connections
+    2. TASK TIMEOUT - Entire _connect_and_stream() wrapped in asyncio.wait_for()
+    3. ZOMBIE DETECTION - Detects when main loop is stuck, not just connection
+    4. FORCE KILL - Uses asyncio.Task.cancel() if normal close doesn't work
+    5. PERIODIC REFRESH - Force reconnect every 5 min to prevent zombie connections
+    6. MAIN LOOP HEARTBEAT - Proves the main loop itself is running
+    
+    The key insight: The old watchdog only monitored the CONNECTION, but the MAIN LOOP
+    could get stuck waiting for the connection to close. Now we monitor EVERYTHING.
     """
     
     def __init__(self):
@@ -194,13 +214,35 @@ class BulletproofTickStreamer:
         self._lock = asyncio.Lock()
         self._shutdown = asyncio.Event()
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
+        
+        # Timing - separate concerns
         self._last_tick_time: datetime = datetime.now(timezone.utc)
-        self._last_activity_time: datetime = datetime.now(timezone.utc)  # NEW: Any WS activity
+        self._last_activity_time: datetime = datetime.now(timezone.utc)
+        self._last_main_loop_heartbeat: datetime = datetime.now(timezone.utc)  # NEW: Track main loop health
+        
+        # Stats
         self._tick_count: int = 0
         self._connection_count: int = 0
         self._last_health_log: datetime = datetime.now(timezone.utc)
         self._is_connected: bool = False
-        self._force_reconnect: bool = False  # NEW: Watchdog sets this to force reconnect
+        
+        # Failure tracking (for debugging)
+        self._failure_reasons: dict = {
+            "timeout": 0,
+            "connection_closed": 0,
+            "watchdog_kill": 0,
+            "nuclear_kill": 0,
+            "exception": 0,
+            "forced_refresh": 0,
+        }
+        
+        # NEW: Task reference for nuclear watchdog to kill
+        self._stream_task: Optional[asyncio.Task] = None
+        self._connection_start_time: Optional[datetime] = None
+        
+        # NEW: Nuclear watchdog settings
+        self.NUCLEAR_TIMEOUT_SECS = 120  # If main loop doesn't heartbeat for 2 min, KILL EVERYTHING
+        self.MAX_CONNECTION_DURATION_SECS = 300  # Force reconnect every 5 min (prevents zombie connections)
         
     def _to_float(self, x) -> Optional[float]:
         """Convert to float preserving precision."""
@@ -303,51 +345,94 @@ class BulletproofTickStreamer:
 
     async def _watchdog(self):
         """
-        AGGRESSIVE WATCHDOG: Force reconnect if connection appears dead.
-        
-        Checks both:
-        - Last tick time (for active trading)
-        - Last activity time (for any WS message)
-        
-        If both are stale, FORCE immediate reconnect.
+        Standard watchdog: Force reconnect if connection appears dead.
+        Also forces periodic refresh to prevent zombie connections.
         """
         log.info("🐕 Watchdog started (timeout: %ds)", WATCHDOG_TIMEOUT_SECS)
         
         while not self._shutdown.is_set():
             await asyncio.sleep(5)  # Check every 5 seconds
             
-            if not self._is_connected:
-                continue
+            now = datetime.now(timezone.utc)
+            activity_elapsed = (now - self._last_activity_time).total_seconds()
+            
+            # If connected but no activity, kill the connection
+            if self._is_connected and activity_elapsed > WATCHDOG_TIMEOUT_SECS:
+                log.warning("🐕 WATCHDOG: No activity for %.1fs - killing connection!", activity_elapsed)
+                self._failure_reasons["watchdog_kill"] += 1
+                await self._kill_connection()
+            
+            # Force reconnect if connection has been up too long (prevents zombie connections)
+            if self._is_connected and self._connection_start_time:
+                connection_duration = (now - self._connection_start_time).total_seconds()
+                if connection_duration > self.MAX_CONNECTION_DURATION_SECS:
+                    log.warning("🐕 WATCHDOG: Connection up for %.1fs - forcing refresh!", connection_duration)
+                    self._failure_reasons["forced_refresh"] += 1
+                    await self._kill_connection()
+    
+    async def _nuclear_watchdog(self):
+        """
+        NUCLEAR WATCHDOG: Monitors the main loop itself, not just the connection.
+        
+        If the main loop stops heartbeating (gets stuck), this will:
+        1. Cancel the stream task
+        2. Force close any WebSocket
+        3. Reset all state
+        
+        This is the LAST LINE OF DEFENSE against any kind of hang.
+        """
+        log.info("☢️ NUCLEAR WATCHDOG started (timeout: %ds)", self.NUCLEAR_TIMEOUT_SECS)
+        
+        while not self._shutdown.is_set():
+            await asyncio.sleep(10)
+            
+            now = datetime.now(timezone.utc)
+            main_loop_elapsed = (now - self._last_main_loop_heartbeat).total_seconds()
+            
+            if main_loop_elapsed > self.NUCLEAR_TIMEOUT_SECS:
+                log.error("☢️ NUCLEAR WATCHDOG TRIGGERED! Main loop stuck for %.1fs!", main_loop_elapsed)
+                log.error("☢️ Killing everything and forcing restart...")
+                
+                self._failure_reasons["nuclear_kill"] += 1
+                
+                # Kill the stream task if it exists
+                if self._stream_task and not self._stream_task.done():
+                    log.warning("☢️ Cancelling stuck stream task...")
+                    self._stream_task.cancel()
+                    try:
+                        await asyncio.wait_for(asyncio.shield(self._stream_task), timeout=5)
+                    except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                        pass
+                
+                # Force close WebSocket
+                await self._kill_connection()
+                
+                # Reset main loop heartbeat so we don't immediately trigger again
+                self._last_main_loop_heartbeat = datetime.now(timezone.utc)
+                
+                log.info("☢️ Nuclear cleanup complete - main loop should restart")
+    
+    async def _kill_connection(self):
+        """Forcefully kill the WebSocket connection."""
+        self._is_connected = False
+        self._connection_start_time = None
+        
+        if self._ws:
+            try:
+                await asyncio.wait_for(self._ws.close(), timeout=3)
+            except Exception:
+                pass
+            self._ws = None
+
+    async def _health_logger(self):
+        """Log health status periodically with detailed diagnostics."""
+        while not self._shutdown.is_set():
+            await asyncio.sleep(HEALTH_LOG_INTERVAL)
             
             now = datetime.now(timezone.utc)
             tick_elapsed = (now - self._last_tick_time).total_seconds()
             activity_elapsed = (now - self._last_activity_time).total_seconds()
-            
-            # If no activity at all for timeout period, connection is dead
-            if activity_elapsed > WATCHDOG_TIMEOUT_SECS:
-                log.warning("🐕 WATCHDOG TRIGGERED: No activity for %.1fs - FORCING RECONNECT!", activity_elapsed)
-                self._force_reconnect = True  # Signal main loop to reconnect
-                self._is_connected = False
-                
-                # Force close the WebSocket
-                if self._ws:
-                    try:
-                        await self._ws.close()
-                    except Exception:
-                        pass
-                    self._ws = None
-                    
-            # If we have activity but no ticks for a long time, log warning (might be market closed)
-            elif tick_elapsed > WATCHDOG_TIMEOUT_SECS * 2:
-                log.warning("🐕 WATCHDOG: No ticks for %.1fs (but connection active - market may be closed)", tick_elapsed)
-
-    async def _health_logger(self):
-        """Log health status periodically."""
-        while not self._shutdown.is_set():
-            await asyncio.sleep(HEALTH_LOG_INTERVAL)
-            
-            tick_elapsed = (datetime.now(timezone.utc) - self._last_tick_time).total_seconds()
-            activity_elapsed = (datetime.now(timezone.utc) - self._last_activity_time).total_seconds()
+            main_loop_elapsed = (now - self._last_main_loop_heartbeat).total_seconds()
             
             if activity_elapsed < 10:
                 status = "🟢 HEALTHY"
@@ -357,15 +442,19 @@ class BulletproofTickStreamer:
                 status = "🔴 DEAD"
             
             log.info(
-                "💓 HEALTH: %s | Connected: %s | Ticks: %d | Last tick: %.1fs ago | Last activity: %.1fs ago | Reconnects: %d | Symbols: %d",
+                "💓 HEALTH: %s | Connected: %s | Ticks: %d | Last tick: %.1fs | Activity: %.1fs | MainLoop: %.1fs | Reconnects: %d",
                 status,
                 self._is_connected,
                 self._tick_count,
                 tick_elapsed,
                 activity_elapsed,
+                main_loop_elapsed,
                 self._connection_count,
-                len(ALL_SYMBOLS)
             )
+            
+            # Log failure stats every 10 reconnects
+            if self._connection_count > 0 and self._connection_count % 10 == 0:
+                log.info("📊 Failure breakdown: %s", self._failure_reasons)
 
     async def _heartbeat_sender(self):
         """
@@ -384,16 +473,16 @@ class BulletproofTickStreamer:
 
     async def _connect_and_stream(self):
         """
-        Single connection attempt with AGGRESSIVE error handling.
-        Uses recv() timeout to prevent infinite blocking.
+        Single connection attempt with MULTIPLE layers of timeout protection.
+        Tracks failure reasons for debugging.
         """
         self._connection_count += 1
-        self._force_reconnect = False  # Reset flag
+        self._connection_start_time = datetime.now(timezone.utc)
         
         log.info("🔌 Connection attempt #%d...", self._connection_count)
         
         try:
-            # Connect with timeout
+            # Layer 1: Timeout on connection itself
             self._ws = await asyncio.wait_for(
                 websockets.connect(
                     WS_URL,
@@ -417,9 +506,9 @@ class BulletproofTickStreamer:
             self._last_activity_time = datetime.now(timezone.utc)
             
             # Stream messages with TIMEOUT on each recv()
-            while not self._shutdown.is_set() and not self._force_reconnect:
+            while not self._shutdown.is_set() and self._is_connected:
                 try:
-                    # Use timeout on recv() to prevent infinite blocking
+                    # Layer 2: Timeout on each message receive
                     raw = await asyncio.wait_for(
                         self._ws.recv(),
                         timeout=RECV_TIMEOUT_SECS
@@ -428,15 +517,13 @@ class BulletproofTickStreamer:
                     await self._handle(data)
                     
                 except asyncio.TimeoutError:
-                    # No message received within timeout - this is OK during quiet markets
-                    # But update activity time to show we're still trying
-                    log.debug("⏱️ recv() timeout - connection still alive, no new data")
-                    # Send a heartbeat to check if connection is alive
+                    # No message received - send heartbeat to check connection
                     try:
                         await self._ws.send(json.dumps({"action": "heartbeat"}))
                         self._last_activity_time = datetime.now(timezone.utc)
                     except Exception:
-                        log.warning("⚠️ Heartbeat failed after recv timeout - connection may be dead")
+                        log.warning("⚠️ Heartbeat failed - connection dead")
+                        self._failure_reasons["timeout"] += 1
                         break
                         
                 except json.JSONDecodeError:
@@ -444,14 +531,19 @@ class BulletproofTickStreamer:
                     
         except asyncio.TimeoutError:
             log.error("⏱️ Connection timeout after %ds", CONNECTION_TIMEOUT_SECS)
+            self._failure_reasons["timeout"] += 1
         except websockets.exceptions.ConnectionClosed as e:
             log.warning("🔌 Connection closed: code=%s reason=%s", e.code, e.reason)
+            self._failure_reasons["connection_closed"] += 1
         except websockets.exceptions.ConnectionClosedError as e:
             log.warning("🔌 Connection closed with error: code=%s reason=%s", e.code, e.reason)
+            self._failure_reasons["connection_closed"] += 1
         except Exception as e:
             log.error("❌ Connection error: %s", e)
+            self._failure_reasons["exception"] += 1
         finally:
             self._is_connected = False
+            self._connection_start_time = None
             if self._ws:
                 with suppress(Exception):
                     await self._ws.close()
@@ -459,15 +551,16 @@ class BulletproofTickStreamer:
 
     async def run(self):
         """
-        Main run loop with AGGRESSIVE reconnection.
+        Main run loop with NUCLEAR-GRADE protection.
         
-        KEY FIXES:
-        - First reconnect attempt is IMMEDIATE (no backoff)
-        - Watchdog can force reconnect via _force_reconnect flag
-        - Never exits unless shutdown is requested
+        KEY FEATURES:
+        1. Main loop heartbeat - proves the loop is running
+        2. Stream task wrapped in asyncio.wait_for() - can't hang forever
+        3. Nuclear watchdog runs independently - can kill stuck tasks
+        4. Periodic forced reconnection to prevent zombie connections
         """
         log.info("=" * 60)
-        log.info("🚀 BULLETPROOF TICK STREAMER v5.0 STARTING")
+        log.info("🚀 BULLETPROOF TICK STREAMER v6.0 - NUCLEAR WATCHDOG EDITION")
         log.info("=" * 60)
         log.info("📊 Total symbols: %d", len(ALL_SYMBOLS))
         log.info("   Crypto: %d | Forex: %d | Commodities: %d", 
@@ -475,14 +568,15 @@ class BulletproofTickStreamer:
         log.info("   Stocks: %d | ETFs/Indices: %d",
                  len(STOCK_SYMBOLS), len(ETF_INDEX_SYMBOLS))
         log.info("🐕 Watchdog timeout: %ds", WATCHDOG_TIMEOUT_SECS)
-        log.info("⏱️ Recv timeout: %ds", RECV_TIMEOUT_SECS)
-        log.info("💓 Heartbeat interval: %ds", HEARTBEAT_INTERVAL_SECS)
+        log.info("☢️ Nuclear timeout: %ds", self.NUCLEAR_TIMEOUT_SECS)
+        log.info("⏱️ Max connection duration: %ds", self.MAX_CONNECTION_DURATION_SECS)
         log.info("🔄 Max reconnect delay: %ds", MAX_RECONNECT_DELAY)
         log.info("=" * 60)
         
-        # Start background tasks
+        # Start background tasks - including NUCLEAR WATCHDOG
         flusher = asyncio.create_task(self._periodic_flush())
         watchdog = asyncio.create_task(self._watchdog())
+        nuclear = asyncio.create_task(self._nuclear_watchdog())  # NEW!
         health = asyncio.create_task(self._health_logger())
         heartbeat = asyncio.create_task(self._heartbeat_sender())
         
@@ -491,13 +585,34 @@ class BulletproofTickStreamer:
         
         try:
             while not self._shutdown.is_set():
+                # UPDATE MAIN LOOP HEARTBEAT - proves we're not stuck
+                self._last_main_loop_heartbeat = datetime.now(timezone.utc)
+                
                 try:
                     start_time = datetime.now(timezone.utc)
                     
-                    await self._connect_and_stream()
+                    # Wrap the ENTIRE connection in a task so nuclear watchdog can kill it
+                    self._stream_task = asyncio.create_task(self._connect_and_stream())
+                    
+                    # Layer 3: Timeout on the ENTIRE connection session
+                    try:
+                        await asyncio.wait_for(
+                            self._stream_task,
+                            timeout=self.MAX_CONNECTION_DURATION_SECS + 60  # Extra buffer
+                        )
+                    except asyncio.TimeoutError:
+                        log.warning("⏱️ Connection session timeout - forcing reconnect")
+                        self._stream_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await self._stream_task
+                    
+                    self._stream_task = None
                     
                     if self._shutdown.is_set():
                         break
+                    
+                    # Update heartbeat again after connection ends
+                    self._last_main_loop_heartbeat = datetime.now(timezone.utc)
                     
                     # Calculate how long the connection lasted
                     connection_duration = (datetime.now(timezone.utc) - start_time).total_seconds()
@@ -511,8 +626,6 @@ class BulletproofTickStreamer:
                         consecutive_failures += 1
                         
                     # AGGRESSIVE RECONNECTION:
-                    # - First 3 attempts: immediate retry (1 second)
-                    # - After that: exponential backoff
                     if consecutive_failures <= 3:
                         log.info("🔄 Quick reconnect in 1s (attempt %d)...", consecutive_failures)
                         await asyncio.sleep(1)
@@ -520,24 +633,27 @@ class BulletproofTickStreamer:
                         log.info("🔄 Reconnecting in %ds (attempt %d)...", backoff, consecutive_failures)
                         await asyncio.sleep(backoff)
                         backoff = min(MAX_RECONNECT_DELAY, backoff * 2)
+                
+                except asyncio.CancelledError:
+                    # Nuclear watchdog cancelled us - just restart
+                    log.warning("🔄 Task was cancelled by nuclear watchdog - restarting...")
+                    consecutive_failures = 0
+                    backoff = 1
+                    await asyncio.sleep(1)
                     
                 except Exception as e:
                     log.error("💥 Unexpected error in main loop: %s", e)
                     consecutive_failures += 1
-                    await asyncio.sleep(min(backoff, 5))  # Quick retry on unexpected errors
+                    await asyncio.sleep(min(backoff, 5))
                         
         finally:
             log.info("🛑 Shutting down tick streamer...")
             await self._flush()
-            flusher.cancel()
-            watchdog.cancel()
-            health.cancel()
-            heartbeat.cancel()
-            with suppress(asyncio.CancelledError):
-                await flusher
-                await watchdog
-                await health
-                await heartbeat
+            
+            for task in [flusher, watchdog, nuclear, health, heartbeat]:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
 
     def shutdown(self):
         """Request graceful shutdown."""
@@ -2589,13 +2705,732 @@ async def whale_flow_task():
 
 
 # ============================================================================
+#                    TASK 7: AI NEWS DESK (Article Synthesis)
+# ============================================================================
+
+# AI News Desk Configuration
+AI_NEWS_DESK_ARTICLES = 3           # Generate 3 articles per cycle
+AI_NEWS_MIN_SCORE = 12              # Minimum article score
+AI_NEWS_MIN_CLUSTER_SIZE = 2        # Minimum sources per cluster
+AI_NEWS_MIN_CLUSTER_SCORE = 20      # Minimum cluster average score
+AI_NEWS_MIN_BODY_WORDS = 500        # Minimum article body length
+AI_NEWS_MAX_BODY_WORDS = 800        # Maximum article body length
+
+# AI News Desk RSS Feeds (Tier 1 = premium sources)
+AI_NEWS_FEEDS = [
+    # Tier 1: Premium Financial
+    {"url": "https://www.cnbc.com/id/100003114/device/rss/rss.html", "name": "CNBC Top News", "tier": 1, "category": "markets"},
+    {"url": "https://www.cnbc.com/id/20910258/device/rss/rss.html", "name": "CNBC Economy", "tier": 1, "category": "economy"},
+    {"url": "https://www.cnbc.com/id/10000664/device/rss/rss.html", "name": "CNBC Finance", "tier": 1, "category": "finance"},
+    {"url": "https://www.cnbc.com/id/10001147/device/rss/rss.html", "name": "CNBC Earnings", "tier": 1, "category": "earnings"},
+    {"url": "https://www.cnbc.com/id/15839135/device/rss/rss.html", "name": "CNBC Commodities", "tier": 1, "category": "commodities"},
+    {"url": "http://feeds.marketwatch.com/marketwatch/topstories", "name": "MarketWatch Top", "tier": 1, "category": "markets"},
+    {"url": "https://finance.yahoo.com/news/rssindex", "name": "Yahoo Finance", "tier": 1, "category": "markets"},
+    {"url": "https://www.federalreserve.gov/feeds/press_all.xml", "name": "Federal Reserve", "tier": 1, "category": "central_bank"},
+    
+    # Tier 2: Specialized
+    {"url": "https://www.investing.com/rss/news.rss", "name": "Investing.com News", "tier": 2, "category": "markets"},
+    {"url": "https://www.investing.com/rss/news_25.rss", "name": "Investing.com Economy", "tier": 2, "category": "economy"},
+    {"url": "https://www.investing.com/rss/news_14.rss", "name": "Investing.com Forex", "tier": 2, "category": "forex"},
+    {"url": "https://www.investing.com/rss/news_301.rss", "name": "Investing.com Crypto", "tier": 2, "category": "crypto"},
+    {"url": "https://www.fxstreet.com/rss/news", "name": "FXStreet News", "tier": 2, "category": "forex"},
+    {"url": "https://www.coindesk.com/arc/outboundfeeds/rss/", "name": "CoinDesk", "tier": 1, "category": "crypto"},
+    {"url": "https://cointelegraph.com/rss", "name": "Cointelegraph", "tier": 2, "category": "crypto"},
+    {"url": "https://decrypt.co/feed", "name": "Decrypt", "tier": 2, "category": "crypto"},
+    {"url": "https://oilprice.com/rss/main", "name": "OilPrice", "tier": 2, "category": "commodities"},
+    {"url": "https://seekingalpha.com/feed.xml", "name": "Seeking Alpha", "tier": 2, "category": "markets"},
+    
+    # Tier 3: Business News
+    {"url": "http://feeds.bbci.co.uk/news/business/rss.xml", "name": "BBC Business", "tier": 3, "category": "economy"},
+    {"url": "https://www.theguardian.com/uk/business/rss", "name": "Guardian Business", "tier": 3, "category": "economy"},
+]
+
+# Entity Database for scoring
+AI_NEWS_ENTITIES = {
+    "mega_caps": {
+        "nvidia": ["nvidia", "nvda", "jensen huang"],
+        "apple": ["apple", "aapl", "tim cook"],
+        "microsoft": ["microsoft", "msft", "satya nadella"],
+        "amazon": ["amazon", "amzn", "aws"],
+        "alphabet": ["alphabet", "google", "googl"],
+        "meta": ["meta", "facebook", "zuckerberg"],
+        "tesla": ["tesla", "tsla", "elon musk"],
+    },
+    "central_banks": {
+        "fed": ["federal reserve", "fed ", "fomc", "federal open market"],
+        "powell": ["jerome powell", "powell", "fed chair"],
+        "ecb": ["ecb", "european central bank"],
+        "lagarde": ["christine lagarde", "lagarde"],
+        "boe": ["bank of england", "boe "],
+        "boj": ["bank of japan", "boj "],
+    },
+    "monetary_policy": {
+        "rate_cut": ["rate cut", "cuts rates", "lower rates"],
+        "rate_hike": ["rate hike", "raise rates", "higher rates"],
+        "hawkish": ["hawkish", "tightening"],
+        "dovish": ["dovish", "easing", "stimulus"],
+    },
+    "economic_data": {
+        "cpi": ["cpi", "consumer price index", "inflation data"],
+        "gdp": ["gdp", "gross domestic product"],
+        "nfp": ["nfp", "non-farm payrolls", "jobs report"],
+        "unemployment": ["unemployment rate", "jobless"],
+    },
+    "market_events": {
+        "crash": ["crash", "plunge", "collapse"],
+        "rally": ["rally", "surge", "soars", "spikes"],
+        "correction": ["correction", "pullback", "sell-off"],
+        "breakout": ["all-time high", "ath", "record high"],
+    },
+    "crypto": {
+        "bitcoin": ["bitcoin", "btc"],
+        "ethereum": ["ethereum", "eth"],
+        "solana": ["solana", "sol"],
+        "bitcoin_etf": ["bitcoin etf", "btc etf", "spot bitcoin"],
+    },
+    "commodities": {
+        "gold": ["gold", "xau", "bullion"],
+        "silver": ["silver", "xag"],
+        "oil": ["oil", "crude", "wti", "brent"],
+    },
+    "currencies": {
+        "dollar": ["dollar", "usd", "greenback", "dxy"],
+        "euro": ["euro", "eur"],
+        "yen": ["yen", "jpy"],
+        "pound": ["pound", "sterling", "gbp"],
+    },
+    "geopolitical": {
+        "tariff": ["tariff", "tariffs", "trade barrier"],
+        "sanction": ["sanction", "sanctions"],
+        "trade_war": ["trade war", "trade tensions"],
+    },
+}
+
+# Impact keywords for scoring
+AI_NEWS_IMPACT_KEYWORDS = {
+    "fed cuts": 15, "fed hikes": 15, "rate decision": 12, "fomc": 12,
+    "rate cut": 12, "rate hike": 12, "basis points": 10,
+    "cpi": 12, "inflation": 10, "gdp": 10, "nfp": 12, "payrolls": 10,
+    "crash": 15, "plunge": 12, "collapse": 15, "crisis": 15,
+    "all-time high": 12, "record high": 12, "surge": 8, "soars": 8,
+    "bitcoin etf": 10, "sec approves": 12, "crypto crash": 10,
+    "tariff": 8, "sanctions": 8, "trade war": 10,
+    "layoffs": 7, "job cuts": 7, "acquisition": 7, "merger": 7,
+}
+
+# Exclusion keywords (noise filter)
+AI_NEWS_EXCLUSIONS = [
+    "football", "soccer", "cricket", "tennis", "basketball", "baseball",
+    "nfl", "nba", "mlb", "nhl", "olympics", "super bowl",
+    "celebrity", "actor", "actress", "movie", "film", "tv show",
+    "grammy", "oscar", "emmy", "concert", "album",
+    "recipe", "cooking", "fashion", "beauty", "wedding", "divorce",
+    "horoscope", "lottery", "jackpot", "weather forecast",
+    "video game", "playstation", "xbox", "nintendo",
+]
+
+
+def get_ai_news_interval() -> Tuple[int, str]:
+    """
+    Smart scheduling for AI News Desk based on market sessions.
+    
+    Returns: (interval_seconds, session_name)
+    
+    Schedule:
+    - London + US session (overlap): 30 minutes
+    - Other active hours: 60 minutes  
+    - Weekend: 4 hours
+    - Holidays: 4 hours (uses weekend schedule)
+    """
+    now = datetime.now(timezone.utc)
+    day_of_week = now.weekday()  # 0=Monday, 6=Sunday
+    hour_utc = now.hour
+    
+    # Weekend (Saturday/Sunday)
+    if day_of_week >= 5:
+        return 14400, "weekend"  # 4 hours
+    
+    # Check for major holidays (simplified - US/UK bank holidays)
+    # Christmas, New Year, etc.
+    month, day = now.month, now.day
+    holidays = [
+        (1, 1),   # New Year's Day
+        (12, 25), # Christmas
+        (12, 26), # Boxing Day
+    ]
+    if (month, day) in holidays:
+        return 14400, "holiday"  # 4 hours
+    
+    # London session: 8:00-16:30 UTC (08:00-16:30 GMT)
+    # US session: 14:30-21:00 UTC (09:30-16:00 EST)
+    # Overlap: 14:30-16:30 UTC
+    
+    london_open = 8
+    london_close = 17  # 16:30 rounded up
+    us_open = 14       # 14:30 rounded down
+    us_close = 21
+    
+    # London + US overlap OR active US session
+    if (us_open <= hour_utc < us_close) or (london_open <= hour_utc < london_close):
+        # Check if it's the overlap period (most active)
+        if us_open <= hour_utc < london_close:
+            return 1800, "london_us_overlap"  # 30 minutes
+        else:
+            return 1800, "active_session"  # 30 minutes during any major session
+    
+    # Asian session (less active for our users)
+    if 0 <= hour_utc < 8:
+        return 3600, "asian_session"  # 1 hour
+    
+    # Quiet hours
+    return 3600, "quiet"  # 1 hour
+
+
+def ai_news_extract_entities(text: str) -> Dict[str, Set[str]]:
+    """Extract entities from text for scoring."""
+    text_lower = text.lower()
+    found = defaultdict(set)
+    
+    for category, entity_dict in AI_NEWS_ENTITIES.items():
+        for entity_name, keywords in entity_dict.items():
+            for keyword in keywords:
+                if keyword.lower() in text_lower:
+                    found[category].add(entity_name)
+                    break
+    return dict(found)
+
+
+def ai_news_score_article(article: Dict) -> Dict:
+    """Score an article from 0-100 based on market relevance."""
+    title = article.get('title', '')
+    summary = article.get('summary', '')
+    text = f"{title} {summary}".lower()
+    
+    # Check exclusions first
+    for exclusion in AI_NEWS_EXCLUSIONS:
+        if exclusion in text:
+            article['score'] = 0
+            article['excluded'] = True
+            return article
+    
+    score = 0
+    
+    # Keyword scoring
+    for keyword, points in AI_NEWS_IMPACT_KEYWORDS.items():
+        if keyword.lower() in text:
+            score += points
+    
+    # Percentage bonus
+    percentages = re.findall(r'[-+]?\d+(?:\.\d+)?\s*%', text)
+    if percentages:
+        max_pct = max(abs(float(p.replace('%', '').strip())) for p in percentages)
+        if max_pct >= 20: score += 15
+        elif max_pct >= 10: score += 10
+        elif max_pct >= 5: score += 6
+    
+    # Entity extraction & bonus
+    entities = ai_news_extract_entities(text)
+    article['entities'] = entities
+    
+    if 'central_banks' in entities: score += 8
+    if 'monetary_policy' in entities: score += 6
+    if 'mega_caps' in entities: score += 4
+    if 'economic_data' in entities: score += 5
+    if 'market_events' in entities: score += 5
+    if 'geopolitical' in entities: score += 4
+    
+    # Tier multiplier
+    tier = article.get('tier', 3)
+    if tier == 1: score *= 1.3
+    elif tier == 2: score *= 1.15
+    
+    # Recency multiplier
+    if article.get('published'):
+        try:
+            pub_str = article['published']
+            if isinstance(pub_str, str):
+                pub_time = datetime.fromisoformat(pub_str.replace('Z', '+00:00'))
+            else:
+                pub_time = pub_str
+            if pub_time.tzinfo is None:
+                pub_time = pub_time.replace(tzinfo=timezone.utc)
+            age_hours = (datetime.now(timezone.utc) - pub_time).total_seconds() / 3600
+            if age_hours < 1: score *= 1.5
+            elif age_hours < 3: score *= 1.3
+            elif age_hours < 6: score *= 1.15
+        except:
+            pass
+    
+    article['score'] = min(100, max(0, round(score, 1)))
+    article['excluded'] = False
+    
+    # Impact level
+    if article['score'] >= 60: article['impact_level'] = 'critical'
+    elif article['score'] >= 40: article['impact_level'] = 'high'
+    elif article['score'] >= 20: article['impact_level'] = 'medium'
+    else: article['impact_level'] = 'low'
+    
+    # Event type classification
+    if 'central_banks' in entities or 'monetary_policy' in entities:
+        article['event_type'] = 'central_bank_news'
+    elif 'economic_data' in entities:
+        article['event_type'] = 'economic_data'
+    elif 'crypto' in entities:
+        article['event_type'] = 'crypto_news'
+    elif 'commodities' in entities:
+        article['event_type'] = 'commodities'
+    elif 'market_events' in entities:
+        article['event_type'] = 'market_move'
+    else:
+        article['event_type'] = 'general_market'
+    
+    return article
+
+
+def ai_news_fetch_feeds(max_age_hours: int = 12) -> List[Dict]:
+    """Fetch articles from AI News Desk feeds."""
+    all_articles = []
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+    
+    for feed_info in AI_NEWS_FEEDS:
+        try:
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+            response = requests.get(feed_info["url"], headers=headers, timeout=15, verify=False)
+            
+            if response.status_code != 200:
+                continue
+            
+            feed = feedparser.parse(response.content)
+            
+            for entry in feed.entries[:20]:
+                pub_date = None
+                if hasattr(entry, 'published_parsed') and entry.published_parsed:
+                    pub_date = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
+                elif hasattr(entry, 'updated_parsed') and entry.updated_parsed:
+                    pub_date = datetime(*entry.updated_parsed[:6], tzinfo=timezone.utc)
+                
+                if pub_date and pub_date < cutoff:
+                    continue
+                
+                title = entry.get('title', '').strip()
+                summary = entry.get('summary', entry.get('description', '')).strip()
+                url = entry.get('link', '').strip()
+                
+                if not title or not url:
+                    continue
+                
+                all_articles.append({
+                    "title": title,
+                    "summary": summary[:500] if summary else "",
+                    "url": url,
+                    "source": feed_info["name"],
+                    "tier": feed_info.get("tier", 2),
+                    "category": feed_info.get("category", "general"),
+                    "published": pub_date.isoformat() if pub_date else None,
+                })
+                
+        except Exception as e:
+            continue
+    
+    return all_articles
+
+
+def ai_news_cluster_articles(articles: List[Dict]) -> List[Dict]:
+    """Cluster similar articles using TF-IDF or title similarity."""
+    if not articles:
+        return []
+    
+    articles = sorted(articles, key=lambda x: x.get('score', 0), reverse=True)
+    
+    # TF-IDF similarity
+    tfidf_sim = None
+    if HAS_SKLEARN and len(articles) > 1:
+        try:
+            texts = [f"{a['title']} {a.get('summary', '')}" for a in articles]
+            vectorizer = TfidfVectorizer(stop_words='english', max_features=1000, ngram_range=(1, 2))
+            tfidf_matrix = vectorizer.fit_transform(texts)
+            tfidf_sim = cosine_similarity(tfidf_matrix)
+        except:
+            tfidf_sim = None
+    
+    clusters = []
+    used_indices = set()
+    
+    for i, article in enumerate(articles):
+        if i in used_indices:
+            continue
+        
+        cluster = {
+            "lead_article": article,
+            "sources": [article],
+            "total_score": article.get('score', 0),
+            "entities": article.get('entities', {}),
+            "event_type": article.get('event_type', 'general'),
+        }
+        used_indices.add(i)
+        
+        for j, other in enumerate(articles):
+            if j in used_indices or len(cluster["sources"]) >= 7:
+                continue
+            
+            similarity = 0.0
+            if tfidf_sim is not None:
+                similarity = tfidf_sim[i][j] * 0.6
+            
+            # Entity similarity
+            set1 = set()
+            set2 = set()
+            for ents in article.get('entities', {}).values():
+                set1.update(ents)
+            for ents in other.get('entities', {}).values():
+                set2.update(ents)
+            if set1 and set2:
+                entity_sim = len(set1 & set2) / len(set1 | set2)
+                similarity += entity_sim * 0.4
+            
+            if tfidf_sim is None:
+                title_sim = SequenceMatcher(None, article['title'].lower(), other['title'].lower()).ratio()
+                similarity = max(similarity, title_sim * 0.5)
+            
+            if similarity > 0.20:
+                cluster["sources"].append(other)
+                cluster["total_score"] += other.get('score', 0)
+                used_indices.add(j)
+        
+        cluster["avg_score"] = cluster["total_score"] / len(cluster["sources"])
+        
+        if len(cluster["sources"]) >= AI_NEWS_MIN_CLUSTER_SIZE:
+            if cluster["avg_score"] >= AI_NEWS_MIN_CLUSTER_SCORE:
+                clusters.append(cluster)
+    
+    return sorted(clusters, key=lambda x: x["avg_score"], reverse=True)
+
+
+def ai_news_create_single_clusters(articles: List[Dict], count: int, used_urls: Set[str]) -> List[Dict]:
+    """Create clusters from single high-scoring articles when clustering fails."""
+    sorted_articles = sorted(articles, key=lambda x: x.get('score', 0), reverse=True)
+    clusters = []
+    
+    for article in sorted_articles:
+        if len(clusters) >= count:
+            break
+        if article['url'] in used_urls:
+            continue
+        
+        clusters.append({
+            "lead_article": article,
+            "sources": [article],
+            "avg_score": article.get('score', 0),
+            "entities": article.get('entities', {}),
+            "event_type": article.get('event_type', 'general'),
+            "is_single_source": True,
+        })
+    
+    return clusters
+
+
+def ai_news_synthesize_article(cluster: Dict) -> Optional[Dict]:
+    """Use DeepSeek to synthesize an original article."""
+    if not DEEPSEEK_API_KEY:
+        return None
+    
+    sources = cluster["sources"][:5]
+    is_single = cluster.get("is_single_source", False)
+    
+    sources_text = ""
+    for i, src in enumerate(sources, 1):
+        sources_text += f"\nSOURCE {i}: {src['source']}\nTitle: {src['title']}\nSummary: {src.get('summary', '')[:400]}\n"
+    
+    entity_hints = []
+    for ents in cluster.get("entities", {}).values():
+        entity_hints.extend(list(ents)[:3])
+    
+    if is_single:
+        source_instruction = "You have ONE source article. Expand on this topic with your financial knowledge."
+    else:
+        source_instruction = f"Synthesize these {len(sources)} news sources into ONE compelling original article."
+    
+    prompt = f"""You are a professional financial journalist for London Strategic Edge, a premium market intelligence platform.
+
+{source_instruction}
+
+{sources_text}
+
+KEY ENTITIES: {', '.join(entity_hints[:10]) if entity_hints else 'Various market topics'}
+EVENT TYPE: {cluster.get('event_type', 'market_news')}
+
+REQUIREMENTS:
+1. Write an ORIGINAL article - do NOT copy phrases from sources
+2. Lead with the most important market-moving information
+3. Include SPECIFIC numbers: percentages, dollar amounts, dates
+4. Explain WHY this matters to traders/investors
+5. Include affected trading symbols (e.g., BTC/USD, SPY, EUR/USD, XAU/USD)
+6. Professional, authoritative tone like Reuters or Bloomberg
+7. Length: 500-800 words (AIM FOR 600-700 WORDS)
+8. Use multiple paragraphs with clear structure
+
+OUTPUT FORMAT - Respond with ONLY valid JSON:
+{{"headline": "Compelling headline under 100 characters", "summary": "2-3 sentence preview", "body": "Full article 500-800 words", "category": "markets|crypto|forex|commodities|economy|central_bank|earnings|tech", "sentiment": "bullish|bearish|neutral", "impact_level": "critical|high|medium|low", "affected_symbols": ["BTC/USD", "SPY"], "key_points": ["Point 1", "Point 2", "Point 3"]}}"""
+
+    try:
+        client = openai.OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=3000,
+            temperature=0.7
+        )
+        
+        response_text = response.choices[0].message.content.strip()
+        
+        # Clean markdown
+        if response_text.startswith("```"):
+            response_text = response_text.split("```")[1]
+            if response_text.startswith("json"):
+                response_text = response_text[4:]
+            response_text = response_text.strip()
+        if response_text.endswith("```"):
+            response_text = response_text[:-3].strip()
+        
+        article_data = json.loads(response_text)
+        article_data["sources"] = json.dumps([{"name": s["source"], "url": s["url"], "title": s["title"]} for s in sources])
+        article_data["event_type"] = cluster.get("event_type", "general")
+        
+        return article_data
+        
+    except Exception as e:
+        log.warning(f"⚠️ AI News synthesis error: {e}")
+        return None
+
+
+def ai_news_get_unsplash_image(headline: str, category: str = None) -> Optional[Dict]:
+    """Get image from Unsplash with fallbacks."""
+    
+    # Fallback images by category
+    fallbacks = {
+        "crypto": {"url": "https://images.unsplash.com/photo-1518546305927-5a555bb7020d?w=1200", "credit": "André François McKenzie", "credit_link": "https://unsplash.com/@silverhousehd"},
+        "forex": {"url": "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?w=1200", "credit": "Nick Chong", "credit_link": "https://unsplash.com/@nick604"},
+        "markets": {"url": "https://images.unsplash.com/photo-1590283603385-17ffb3a7f29f?w=1200", "credit": "Nicholas Cappello", "credit_link": "https://unsplash.com/@bash__profile"},
+        "economy": {"url": "https://images.unsplash.com/photo-1526304640581-d334cdbbf45e?w=1200", "credit": "Alexander Mils", "credit_link": "https://unsplash.com/@alexandermils"},
+        "central_bank": {"url": "https://images.unsplash.com/photo-1541354329998-f4d9a9f9297f?w=1200", "credit": "Etienne Martin", "credit_link": "https://unsplash.com/@etiennemartin"},
+        "commodities": {"url": "https://images.unsplash.com/photo-1610375461246-83df859d849d?w=1200", "credit": "Jingming Pan", "credit_link": "https://unsplash.com/@pokmer"},
+    }
+    
+    if not UNSPLASH_ACCESS_KEY:
+        return fallbacks.get(category, fallbacks["markets"])
+    
+    # Build search query
+    headline_lower = headline.lower()
+    keyword_map = {
+        "bitcoin": "bitcoin cryptocurrency", "crypto": "cryptocurrency market",
+        "gold": "gold investment", "oil": "crude oil energy",
+        "fed": "federal reserve", "inflation": "inflation economy",
+        "dollar": "us dollar currency", "stock": "stock market trading",
+    }
+    
+    search_query = "financial market trading"
+    for keyword, query in keyword_map.items():
+        if keyword in headline_lower:
+            search_query = query
+            break
+    
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        
+        params = urllib.parse.urlencode({"query": search_query, "per_page": "5", "orientation": "landscape"})
+        url = f"https://api.unsplash.com/search/photos?{params}"
+        
+        req = urllib.request.Request(url)
+        req.add_header("Authorization", f"Client-ID {UNSPLASH_ACCESS_KEY}")
+        
+        with urllib.request.urlopen(req, timeout=10, context=ctx) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            if data.get("results"):
+                photo = random.choice(data["results"][:3])
+                return {
+                    "url": photo["urls"]["regular"],
+                    "credit": photo["user"]["name"],
+                    "credit_link": photo["user"]["links"]["html"],
+                }
+    except Exception as e:
+        log.debug(f"Unsplash error: {e}")
+    
+    return fallbacks.get(category, fallbacks["markets"])
+
+
+def ai_news_get_recent_headlines(hours: int = 6) -> Set[str]:
+    """Get recent headlines to avoid duplicates."""
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        result = sb.table("ai_news_articles").select("headline").gte("created_at", cutoff).execute()
+        if result.data:
+            return {r["headline"].lower()[:50] for r in result.data}
+    except:
+        pass
+    return set()
+
+
+def ai_news_store_article(article: Dict, image: Optional[Dict]) -> bool:
+    """Store synthesized article in Supabase."""
+    try:
+        data = {
+            "headline": article["headline"],
+            "summary": article["summary"],
+            "body": article["body"],
+            "category": article["category"],
+            "sentiment": article["sentiment"],
+            "impact_level": article["impact_level"],
+            "affected_symbols": article.get("affected_symbols", []),
+            "key_points": article.get("key_points", []),
+            "sources": article.get("sources", "[]"),
+            "is_ai_generated": True,
+            "is_featured": article["impact_level"] in ["critical", "high"],
+            "image_url": image["url"] if image else None,
+            "image_credit": image["credit"] if image else None,
+            "image_credit_link": image["credit_link"] if image else None,
+        }
+        
+        try:
+            data["event_type"] = article.get("event_type", "general")
+            sb.table("ai_news_articles").insert(data).execute()
+            return True
+        except Exception as e:
+            if "event_type" in str(e):
+                del data["event_type"]
+                sb.table("ai_news_articles").insert(data).execute()
+                return True
+            raise e
+    except Exception as e:
+        log.warning(f"⚠️ AI News storage error: {e}")
+        return False
+
+
+async def ai_news_desk_task():
+    """
+    AI News Desk - Synthesizes professional articles from multiple sources.
+    
+    Schedule:
+    - London/US session: Every 30 minutes (3 articles = 6/hour)
+    - Other sessions: Every 60 minutes (3 articles = 3/hour)
+    - Weekend/Holiday: Every 4 hours (3 articles)
+    """
+    log.info("📰 AI News Desk started")
+    log.info(f"   Target: {AI_NEWS_DESK_ARTICLES} articles per cycle")
+    log.info(f"   Article length: {AI_NEWS_MIN_BODY_WORDS}-{AI_NEWS_MAX_BODY_WORDS} words")
+    
+    # Initial delay to let other tasks start
+    await asyncio.sleep(30)
+    
+    while not tick_streamer._shutdown.is_set():
+        try:
+            interval, session_name = get_ai_news_interval()
+            session_emoji = "🔥" if "overlap" in session_name else "📊" if "active" in session_name else "🌙"
+            
+            log.info(f"📰 AI News Desk cycle starting ({session_emoji} {session_name})")
+            
+            # Get recent headlines to avoid duplicates
+            recent_headlines = ai_news_get_recent_headlines(hours=6)
+            
+            # Fetch articles
+            loop = asyncio.get_event_loop()
+            raw_articles = await loop.run_in_executor(None, ai_news_fetch_feeds, 12)
+            
+            if not raw_articles:
+                log.warning("📰 No articles fetched, retrying later")
+                await asyncio.sleep(interval)
+                continue
+            
+            log.info(f"📰 Fetched {len(raw_articles)} raw articles")
+            
+            # Score articles
+            scored = []
+            excluded = 0
+            for article in raw_articles:
+                scored_article = ai_news_score_article(article)
+                if scored_article.get('excluded'):
+                    excluded += 1
+                else:
+                    scored.append(scored_article)
+            
+            # Filter by minimum score
+            high_quality = [a for a in scored if a.get('score', 0) >= AI_NEWS_MIN_SCORE]
+            log.info(f"📰 Scored: {len(scored)} | Excluded: {excluded} | High quality: {len(high_quality)}")
+            
+            if not high_quality:
+                log.warning("📰 No high-quality articles, retrying later")
+                await asyncio.sleep(interval)
+                continue
+            
+            # Cluster articles
+            clusters = ai_news_cluster_articles(high_quality)
+            
+            # Fallback to single articles if not enough clusters
+            if len(clusters) < AI_NEWS_DESK_ARTICLES:
+                used_urls = set()
+                for c in clusters:
+                    for s in c["sources"]:
+                        used_urls.add(s["url"])
+                
+                available = [a for a in high_quality if a["url"] not in used_urls and a["title"].lower()[:50] not in recent_headlines]
+                single_clusters = ai_news_create_single_clusters(available, AI_NEWS_DESK_ARTICLES - len(clusters), used_urls)
+                clusters.extend(single_clusters)
+            
+            log.info(f"📰 Topics to generate: {len(clusters)}")
+            
+            # Generate articles
+            generated_count = 0
+            generated_headlines = set()
+            
+            for i, cluster in enumerate(clusters[:AI_NEWS_DESK_ARTICLES]):
+                log.info(f"📝 Synthesizing article {i+1}/{AI_NEWS_DESK_ARTICLES}: {cluster['lead_article']['title'][:50]}...")
+                
+                # Synthesize
+                article = await loop.run_in_executor(None, ai_news_synthesize_article, cluster)
+                
+                if not article:
+                    log.warning(f"   ⚠️ Synthesis failed")
+                    continue
+                
+                # Check duplicates
+                headline_key = article["headline"].lower()[:50]
+                if headline_key in generated_headlines or headline_key in recent_headlines:
+                    log.warning(f"   ⚠️ Duplicate headline, skipping")
+                    continue
+                
+                # Get image
+                image = ai_news_get_unsplash_image(article["headline"], article.get("category"))
+                
+                # Store
+                if ai_news_store_article(article, image):
+                    word_count = len(article.get('body', '').split())
+                    log.info(f"   ✅ STORED: {article['headline'][:50]}... ({word_count} words)")
+                    generated_count += 1
+                    generated_headlines.add(headline_key)
+                else:
+                    log.warning(f"   ⚠️ Storage failed")
+                
+                await asyncio.sleep(2)  # Rate limit
+            
+            log.info(f"📰 AI News Desk cycle complete: {generated_count}/{AI_NEWS_DESK_ARTICLES} articles generated")
+            log.info(f"📰 Next cycle in {interval // 60} minutes ({session_emoji} {session_name})")
+            
+            await asyncio.sleep(interval)
+            
+        except Exception as e:
+            log.error(f"❌ AI News Desk error: {e}")
+            await asyncio.sleep(300)  # 5 min on error
+
+
+# ============================================================================
 #                              MAIN ENTRY POINT
 # ============================================================================
 
 async def main():
-    """Run all 6 tasks in parallel with graceful shutdown."""
+    """Run all 7 tasks in parallel with graceful shutdown."""
     log.info("=" * 70)
-    log.info("🚀 LONDON STRATEGIC EDGE - BULLETPROOF WORKER v6.0")
+    log.info("🚀 LONDON STRATEGIC EDGE - BULLETPROOF WORKER v7.0")
     log.info("=" * 70)
     log.info("   1️⃣  Tick streaming (TwelveData) - %d symbols", len(ALL_SYMBOLS))
     log.info("   2️⃣  Economic calendar (Trading Economics) - double-scrape")
@@ -2603,6 +3438,7 @@ async def main():
     log.info("   4️⃣  Gap detection & backfill (AUTO-HEALING)")
     log.info("   5️⃣  Bond yields (G20 sovereign bonds) - 30 min")
     log.info("   6️⃣  Whale flow tracker (BTC whales) - $100k+ threshold")
+    log.info("   7️⃣  AI News Desk (article synthesis) - 3 per cycle")
     log.info("=" * 70)
     log.info("📊 Symbol breakdown:")
     log.info("   Crypto: %d | Forex: %d | Commodities: %d",
@@ -2628,6 +3464,7 @@ async def main():
         asyncio.create_task(gap_fill_task(), name="gap_fill"),
         asyncio.create_task(bond_yield_task(), name="bond_yields"),
         asyncio.create_task(whale_flow_task(), name="whale_flow"),
+        asyncio.create_task(ai_news_desk_task(), name="ai_news_desk"),
     ]
 
     try:
