@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-LONDON STRATEGIC EDGE - BULLETPROOF WORKER v7.0
+LONDON STRATEGIC EDGE - BULLETPROOF WORKER v7.1
 ================================================================================
 Production-grade data pipeline with AGGRESSIVE self-healing.
+
+NEW in v7.1:
+  - Replaced DeepSeek with Google Gemini 2.0 Flash for AI classification
+  - Cost savings: Using free GCP credits instead of paid DeepSeek API
+  - Better performance with Gemini's faster response times
 
 NEW in v7.0:
   - Task 7: AI News Desk - Synthesizes 3 professional articles per cycle
@@ -21,7 +26,7 @@ PREVIOUS FIXES (v6.2):
 TASKS:
   1. Tick Streaming     - TwelveData WebSocket (237 symbols)
   2. Economic Calendar  - Trading Economics (double-scrape every 15 min)
-  3. Financial News     - 50+ RSS feeds + DeepSeek AI classification
+  3. Financial News     - 50+ RSS feeds + Gemini AI classification
   4. Gap Fill Service   - Auto-detect and repair missing candle data
   5. Bond Yields        - G20 sovereign yields (every 30 minutes)
   6. Whale Flow Tracker - BTC whale movements via Blockchain.com WebSocket
@@ -56,7 +61,6 @@ import requests
 from bs4 import BeautifulSoup
 from supabase import create_client
 import feedparser
-import openai
 
 # Optional: TF-IDF for AI News Desk clustering
 try:
@@ -73,7 +77,12 @@ except ImportError:
 TD_API_KEY = os.environ["TWELVEDATA_API_KEY"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
+
+# Google Gemini API (replaces DeepSeek)
+GOOGLE_GEMINI_API_KEY = os.environ.get("GOOGLE_GEMINI_API_KEY")
+GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+
 UNSPLASH_ACCESS_KEY = os.environ.get("UNSPLASH_ACCESS_KEY", "LWD7wgTnS8zYEtNcnOc9qUgr_Encl7iycazKCp2vhvc")
 
 SUPABASE_TABLE = os.environ.get("SUPABASE_TABLE", "tickdata")
@@ -176,16 +185,73 @@ BOND_SCRAPE_INTERVAL = 1800  # 30 minutes
 # ============================================================================
 
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-deepseek_client = openai.OpenAI(
-    api_key=DEEPSEEK_API_KEY, 
-    base_url="https://api.deepseek.com"
-) if DEEPSEEK_API_KEY else None
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 log = logging.getLogger("worker")
+
+
+# ============================================================================
+#                     GEMINI AI HELPER FUNCTIONS
+# ============================================================================
+
+def call_gemini_api(prompt: str, max_tokens: int = 1000, temperature: float = 0.1) -> Optional[str]:
+    """
+    Call Google Gemini API and return the response text.
+    Returns None if there's an error.
+    """
+    if not GOOGLE_GEMINI_API_KEY:
+        log.warning("⚠️ Google Gemini API key not configured")
+        return None
+    
+    url = f"{GEMINI_API_URL}?key={GOOGLE_GEMINI_API_KEY}"
+    
+    payload = {
+        "contents": [{
+            "parts": [{"text": prompt}]
+        }],
+        "generationConfig": {
+            "temperature": temperature,
+            "maxOutputTokens": max_tokens,
+        }
+    }
+    
+    try:
+        data = json.dumps(payload).encode('utf-8')
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={'Content-Type': 'application/json'},
+            method='POST'
+        )
+        
+        with urllib.request.urlopen(req, timeout=30) as response:
+            result = json.loads(response.read().decode('utf-8'))
+        
+        # Extract the text response
+        text = result['candidates'][0]['content']['parts'][0]['text']
+        return text.strip()
+        
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode('utf-8') if e.fp else str(e)
+        log.warning(f"⚠️ Gemini API Error: {e.code} - {error_body[:200]}")
+        return None
+    except Exception as e:
+        log.warning(f"⚠️ Gemini API Error: {e}")
+        return None
+
+
+def clean_gemini_json_response(text: str) -> str:
+    """Clean markdown code blocks from Gemini JSON response."""
+    text = text.strip()
+    if text.startswith('```'):
+        text = text.split('\n', 1)[1] if '\n' in text else text[3:]
+    if text.endswith('```'):
+        text = text.rsplit('\n', 1)[0] if '\n' in text else text[:-3]
+    text = text.replace('```json', '').replace('```', '').strip()
+    return text
 
 
 # ============================================================================
@@ -1246,10 +1312,10 @@ def fetch_rss_feed(feed_url: str, source_name: str) -> list:
         return []
 
 
-def classify_article_with_deepseek(article: dict) -> Optional[dict]:
-    """Classify article using DeepSeek API."""
-    if not deepseek_client:
-        log.warning("⚠️ DeepSeek API key not configured")
+def classify_article_with_gemini(article: dict) -> Optional[dict]:
+    """Classify article using Google Gemini API."""
+    if not GOOGLE_GEMINI_API_KEY:
+        log.warning("⚠️ Google Gemini API key not configured")
         return None
         
     try:
@@ -1266,30 +1332,21 @@ Valid event_types: war, political_shock, economic_data, central_bank, trade_war,
 Valid impact_levels: critical, high, medium, low
 Valid sentiments: bullish, bearish, neutral"""
 
-        response = deepseek_client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=500,
-            temperature=0.1
-        )
-
-        response_text = response.choices[0].message.content.strip()
+        response_text = call_gemini_api(prompt, max_tokens=500, temperature=0.1)
         
-        if response_text.startswith("```"):
-            response_text = response_text.split("```")[1]
-            if response_text.startswith("json"):
-                response_text = response_text[4:]
-            response_text = response_text.strip()
-        if response_text.endswith("```"):
-            response_text = response_text[:-3].strip()
+        if not response_text:
+            return None
+        
+        # Clean markdown if present
+        response_text = clean_gemini_json_response(response_text)
 
         return json.loads(response_text)
 
     except json.JSONDecodeError as e:
-        log.warning(f"⚠️ DeepSeek JSON parse error: {e}")
+        log.warning(f"⚠️ Gemini JSON parse error: {e}")
         return None
     except Exception as e:
-        log.warning(f"⚠️ DeepSeek API error: {e}")
+        log.warning(f"⚠️ Gemini API error: {e}")
         return None
 
 
@@ -1370,7 +1427,7 @@ async def financial_news_task():
             classified_count = 0
 
             for article in filtered_articles:
-                classification = await loop.run_in_executor(None, classify_article_with_deepseek, article)
+                classification = await loop.run_in_executor(None, classify_article_with_gemini, article)
                 classified_count += 1
 
                 if not classification:
@@ -3130,8 +3187,8 @@ def ai_news_create_single_clusters(articles: List[Dict], count: int, used_urls: 
 
 
 def ai_news_synthesize_article(cluster: Dict) -> Optional[Dict]:
-    """Use DeepSeek to synthesize an original article."""
-    if not DEEPSEEK_API_KEY:
+    """Use Gemini to synthesize an original article."""
+    if not GOOGLE_GEMINI_API_KEY:
         return None
     
     sources = cluster["sources"][:5]
@@ -3173,24 +3230,13 @@ OUTPUT FORMAT - Respond with ONLY valid JSON:
 {{"headline": "Compelling headline under 100 characters", "summary": "2-3 sentence preview", "body": "Full article 500-800 words", "category": "markets|crypto|forex|commodities|economy|central_bank|earnings|tech", "sentiment": "bullish|bearish|neutral", "impact_level": "critical|high|medium|low", "affected_symbols": ["BTC/USD", "SPY"], "key_points": ["Point 1", "Point 2", "Point 3"]}}"""
 
     try:
-        client = openai.OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
-        response = client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=3000,
-            temperature=0.7
-        )
+        response_text = call_gemini_api(prompt, max_tokens=3000, temperature=0.7)
         
-        response_text = response.choices[0].message.content.strip()
+        if not response_text:
+            return None
         
         # Clean markdown
-        if response_text.startswith("```"):
-            response_text = response_text.split("```")[1]
-            if response_text.startswith("json"):
-                response_text = response_text[4:]
-            response_text = response_text.strip()
-        if response_text.endswith("```"):
-            response_text = response_text[:-3].strip()
+        response_text = clean_gemini_json_response(response_text)
         
         article_data = json.loads(response_text)
         article_data["sources"] = json.dumps([{"name": s["source"], "url": s["url"], "title": s["title"]} for s in sources])
@@ -3430,11 +3476,11 @@ async def ai_news_desk_task():
 async def main():
     """Run all 7 tasks in parallel with graceful shutdown."""
     log.info("=" * 70)
-    log.info("🚀 LONDON STRATEGIC EDGE - BULLETPROOF WORKER v7.0")
+    log.info("🚀 LONDON STRATEGIC EDGE - BULLETPROOF WORKER v7.1")
     log.info("=" * 70)
     log.info("   1️⃣  Tick streaming (TwelveData) - %d symbols", len(ALL_SYMBOLS))
     log.info("   2️⃣  Economic calendar (Trading Economics) - double-scrape")
-    log.info("   3️⃣  Financial news (%d RSS feeds + DeepSeek)", len(RSS_FEEDS))
+    log.info("   3️⃣  Financial news (%d RSS feeds + Gemini AI)", len(RSS_FEEDS))
     log.info("   4️⃣  Gap detection & backfill (AUTO-HEALING)")
     log.info("   5️⃣  Bond yields (G20 sovereign bonds) - 30 min")
     log.info("   6️⃣  Whale flow tracker (BTC whales) - $100k+ threshold")
