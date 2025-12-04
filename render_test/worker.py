@@ -380,8 +380,8 @@ class BulletproofTickStreamer:
         
         # Handle different event types
         if event_type == "subscribe-status":
-            success = msg.get("success", [])
-            fails = msg.get("fails", [])
+            success = msg.get("success") or []
+            fails = msg.get("fails") or []
             log.info("📡 Subscribe status: %d success, %d fails", len(success), len(fails))
             if fails:
                 log.warning("⚠️ Failed symbols: %s", fails[:10])  # Show first 10
