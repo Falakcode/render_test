@@ -486,17 +486,21 @@ def store_calendar_events(events: List[Dict]) -> int:
     stored = 0
     for event in events:
         try:
+            event_date = event.get("date", "")
+            date_part = event_date.split(" ")[0] if event_date else None
+            time_part = event_date.split(" ")[1] if event_date and " " in event_date else None
+            
             data = {
-                "event_name": event.get("type", ""),
+                "event": event.get("type", ""),
                 "country": event.get("country", ""),
-                "event_date": event.get("date"),
-                "actual": event.get("actual"),
-                "previous": event.get("previous"),
-                "estimate": event.get("estimate"),
-                "impact": classify_calendar_impact(event.get("type", "")),
-                "comparison": event.get("comparison", ""),
+                "date": date_part,
+                "time": time_part,
+                "actual": str(event.get("actual")) if event.get("actual") is not None else None,
+                "previous": str(event.get("previous")) if event.get("previous") is not None else None,
+                "consensus": str(event.get("estimate")) if event.get("estimate") is not None else None,
+                "importance": classify_calendar_impact(event.get("type", "")),
             }
-            sb.table("Economic_calander").upsert(data, on_conflict="event_name,country,event_date").execute()
+            sb.table("Economic_calander").upsert(data, on_conflict="event,country,date").execute()
             stored += 1
         except Exception:
             pass
