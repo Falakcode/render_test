@@ -503,7 +503,8 @@ def store_calendar_events(events: List[Dict]) -> int:
                 "consensus": str(event.get("estimate")) if event.get("estimate") is not None else None,
                 "importance": classify_calendar_impact(event.get("type", "")),
             }
-            sb.table("Economic_calander").upsert(data, on_conflict="event,country,date").execute()
+            # Insert - duplicates handled by unique constraint or ignored
+            sb.table("Economic_calander").insert(data).execute()
             stored += 1
         except Exception:
             pass
@@ -1272,6 +1273,7 @@ def run_index_poll_cycle() -> int:
     """Run one cycle of index polling. Returns number of indices updated."""
     data = fetch_all_indices_parallel()
     updated = 0
+    now = datetime.now(timezone.utc)
     
     for eodhd_symbol, (display_symbol, candle_table) in INDEX_SYMBOLS.items():
         d = data.get(eodhd_symbol)
@@ -1286,12 +1288,42 @@ def run_index_poll_cycle() -> int:
             low = float(d.get("low", price) or price)
             open_price = float(d.get("open", price) or price)
             
-            # Insert to tickdata
-            if insert_index_to_tickdata(display_symbol, price, change, change_p):
-                updated += 1
+            # 1. Insert to tickdata
+            try:
+                tick = {
+                    "symbol": display_symbol,
+                    "price": price,
+                    "bid": None,
+                    "ask": None,
+                    "volume": None,
+                    "ts": now.isoformat(),
+                }
+                sb.table(SUPABASE_TABLE).insert(tick).execute()
+            except Exception as e:
+                log.warning(f"Index tickdata insert failed for {display_symbol}: {e}")
+            
+            # 2. Insert/upsert to candle table (1-minute candle)
+            # Round timestamp to current minute
+            minute_ts = now.replace(second=0, microsecond=0).isoformat()
+            try:
+                candle = {
+                    "timestamp": minute_ts,
+                    "open": open_price,
+                    "high": high,
+                    "low": low,
+                    "close": price,
+                    "volume": None,
+                }
+                sb.table(candle_table).upsert(candle, on_conflict="timestamp").execute()
+            except Exception as e:
+                log.warning(f"Index candle insert failed for {display_symbol} -> {candle_table}: {e}")
+            
+            updated += 1
             
         except Exception as e:
             log.warning(f"Index process error {display_symbol}: {e}")
+    
+    return updated
     
     return updated
 
@@ -1311,8 +1343,9 @@ async def index_poller_task():
             updated = await loop.run_in_executor(None, run_index_poll_cycle)
             total_updates += updated
             
-            if poll_count % 30 == 0:  # Log every 30 polls (10 minutes)
-                log.info(f"Index Poller: {poll_count} polls, {total_updates} total updates, {updated} this cycle")
+            # Log every poll for first 10, then every 30
+            if poll_count <= 10 or poll_count % 30 == 0:
+                log.info(f"Index Poller: poll #{poll_count}, {updated} indices updated this cycle, {total_updates} total")
             
             await asyncio.sleep(INDEX_POLL_INTERVAL)
             
