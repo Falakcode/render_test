@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-LONDON STRATEGIC EDGE - BULLETPROOF WORKER v8.3 (FIXED)
+LONDON STRATEGIC EDGE - BULLETPROOF WORKER v9.0 (DEBUG EDITION)
 ================================================================================
-Production-grade data pipeline with EODHD WebSocket streaming.
+Production-grade data pipeline with comprehensive debugging and diagnostics.
 
-FIXES IN v8.3:
-  - INDEX POLLER: Now tracks minute-level OHLC (fixes static candles issue)
-  - ECONOMIC CALENDAR: Uses upsert with error handling (fixes 400 errors)
+DEBUG FEATURES:
+  - Startup schema validation
+  - Request/response logging with payloads
+  - Detailed error context and stack traces
+  - Per-task health metrics
+  - Configurable debug verbosity
 
 TASKS:
   1. Tick Streaming     - EODHD WebSocket (280 symbols across 7 connections)
-  2. Economic Calendar  - EODHD API (every 5 min + 3s follow-up)
+  2. Economic Calendar  - EODHD API (every 5 min)
   3. Financial News     - RSS feeds + Gemini AI classification
   4. Gap Fill Service   - Auto-detect and repair missing candle data
   5. Bond Yields        - G20 sovereign yields (every 30 minutes)
@@ -20,7 +23,6 @@ TASKS:
   8. G20 Macro Fetcher  - 16 indicators x 20 countries (hourly)
   9. Index Poller       - 11 global indices via REST API (every 20 seconds)
 
-SYMBOL CAPACITY: 280/300 WebSocket credits used
 ================================================================================
 """
 
@@ -32,12 +34,14 @@ import signal
 import sys
 import time
 import threading
+import traceback
 from datetime import datetime, timezone, timedelta
 from difflib import SequenceMatcher
 from typing import Optional, List, Dict, Tuple, Any
 from contextlib import suppress
-from collections import Counter
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 
 import websockets
 import requests
@@ -46,19 +50,384 @@ from supabase import create_client
 import feedparser
 
 # ============================================================================
-#                              ENVIRONMENT
+#                              CONFIGURATION
 # ============================================================================
 
-EODHD_API_KEY = os.environ.get("EODHD_API_KEY", "6931c829362a18.89813191")
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
-GOOGLE_GEMINI_API_KEY = os.environ.get("GOOGLE_GEMINI_API_KEY")
+# Debug settings - set via environment or change here
+DEBUG_MODE = os.environ.get("DEBUG_MODE", "true").lower() == "true"
+DEBUG_LOG_PAYLOADS = os.environ.get("DEBUG_LOG_PAYLOADS", "false").lower() == "true"
+DEBUG_LOG_RESPONSES = os.environ.get("DEBUG_LOG_RESPONSES", "false").lower() == "true"
+
+# API Keys and URLs
+EODHD_API_KEY = os.environ.get("EODHD_API_KEY", "")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+GOOGLE_GEMINI_API_KEY = os.environ.get("GOOGLE_GEMINI_API_KEY", "")
 GEMINI_MODEL = "gemini-2.0-flash"
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 SUPABASE_TABLE = os.environ.get("SUPABASE_TABLE", "tickdata")
 
+# Timing configuration
+BATCH_MAX = 500
+BATCH_FLUSH_INTERVAL = 2
+WATCHDOG_TIMEOUT_SECS = 60
+NUCLEAR_TIMEOUT_SECS = 120
+HEALTH_LOG_INTERVAL = 60
+WEEKLY_RESET_DAY = 5
+WEEKLY_RESET_HOUR = 22
+MIN_GAP_MINUTES = 3
+MAX_GAP_HOURS = 4
+GAP_SCAN_INTERVAL = 300
+BOND_SCRAPE_INTERVAL = 1800
+MACRO_FETCH_INTERVAL = 3600
+INDEX_POLL_INTERVAL = 20
+CALENDAR_FETCH_INTERVAL = 300
+NEWS_SCAN_INTERVAL_ACTIVE = 600
+NEWS_SCAN_INTERVAL_QUIET = 1800
+NEWS_SCAN_INTERVAL_WEEKEND = 7200
+
 # ============================================================================
-#                           TRADING SYMBOLS (280 TOTAL)
+#                              LOGGING SETUP
+# ============================================================================
+
+class DebugFormatter(logging.Formatter):
+    """Custom formatter with colors for terminal output."""
+    
+    COLORS = {
+        'DEBUG': '\033[36m',     # Cyan
+        'INFO': '\033[32m',      # Green
+        'WARNING': '\033[33m',   # Yellow
+        'ERROR': '\033[31m',     # Red
+        'CRITICAL': '\033[35m',  # Magenta
+        'RESET': '\033[0m'
+    }
+    
+    def format(self, record):
+        if hasattr(record, 'task'):
+            task_prefix = f"[{record.task}] "
+        else:
+            task_prefix = ""
+        
+        color = self.COLORS.get(record.levelname, self.COLORS['RESET'])
+        reset = self.COLORS['RESET']
+        
+        formatted = f"{self.formatTime(record)} | {color}{record.levelname:8s}{reset} | {task_prefix}{record.getMessage()}"
+        
+        if record.exc_info:
+            formatted += f"\n{self.formatException(record.exc_info)}"
+        
+        return formatted
+
+
+def setup_logging():
+    """Configure logging with debug-friendly format."""
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG if DEBUG_MODE else logging.INFO)
+    
+    # Clear existing handlers
+    root_logger.handlers.clear()
+    
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.DEBUG if DEBUG_MODE else logging.INFO)
+    console_handler.setFormatter(DebugFormatter())
+    root_logger.addHandler(console_handler)
+    
+    # Reduce noise from external libraries
+    logging.getLogger("websockets").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    
+    return logging.getLogger("worker")
+
+
+log = setup_logging()
+
+
+def log_with_task(level: str, task: str, message: str, **kwargs):
+    """Log a message with task context."""
+    extra = {'task': task}
+    getattr(log, level)(message, extra=extra, **kwargs)
+
+
+def debug(task: str, message: str):
+    """Debug log with task context."""
+    if DEBUG_MODE:
+        log_with_task('debug', task, message)
+
+
+def info(task: str, message: str):
+    """Info log with task context."""
+    log_with_task('info', task, message)
+
+
+def warning(task: str, message: str):
+    """Warning log with task context."""
+    log_with_task('warning', task, message)
+
+
+def error(task: str, message: str, exc_info: bool = False):
+    """Error log with task context."""
+    log_with_task('error', task, message, exc_info=exc_info)
+
+
+# ============================================================================
+#                           METRICS TRACKING
+# ============================================================================
+
+@dataclass
+class TaskMetrics:
+    """Track metrics for a single task."""
+    name: str
+    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    success_count: int = 0
+    error_count: int = 0
+    last_success: Optional[datetime] = None
+    last_error: Optional[datetime] = None
+    last_error_message: Optional[str] = None
+    custom_metrics: Dict[str, Any] = field(default_factory=dict)
+    
+    def record_success(self):
+        self.success_count += 1
+        self.last_success = datetime.now(timezone.utc)
+    
+    def record_error(self, message: str):
+        self.error_count += 1
+        self.last_error = datetime.now(timezone.utc)
+        self.last_error_message = message
+    
+    def get_success_rate(self) -> float:
+        total = self.success_count + self.error_count
+        return (self.success_count / total * 100) if total > 0 else 0.0
+    
+    def to_dict(self) -> Dict:
+        return {
+            "name": self.name,
+            "uptime_seconds": (datetime.now(timezone.utc) - self.started_at).total_seconds(),
+            "success_count": self.success_count,
+            "error_count": self.error_count,
+            "success_rate": f"{self.get_success_rate():.1f}%",
+            "last_success": self.last_success.isoformat() if self.last_success else None,
+            "last_error": self.last_error.isoformat() if self.last_error else None,
+            "last_error_message": self.last_error_message,
+            **self.custom_metrics
+        }
+
+
+class MetricsCollector:
+    """Collect and report metrics across all tasks."""
+    
+    def __init__(self):
+        self._tasks: Dict[str, TaskMetrics] = {}
+        self._lock = threading.Lock()
+    
+    def get_or_create(self, task_name: str) -> TaskMetrics:
+        with self._lock:
+            if task_name not in self._tasks:
+                self._tasks[task_name] = TaskMetrics(name=task_name)
+            return self._tasks[task_name]
+    
+    def report(self) -> Dict:
+        with self._lock:
+            return {name: metrics.to_dict() for name, metrics in self._tasks.items()}
+    
+    def log_summary(self):
+        """Log a summary of all task metrics."""
+        log.info("=" * 70)
+        log.info("METRICS SUMMARY")
+        log.info("=" * 70)
+        for name, metrics in self._tasks.items():
+            status = "✓" if metrics.error_count == 0 else "⚠" if metrics.get_success_rate() > 90 else "✗"
+            log.info(f"  {status} {name}: {metrics.success_count} ok, {metrics.error_count} err ({metrics.get_success_rate():.1f}%)")
+            if metrics.last_error_message:
+                log.info(f"      Last error: {metrics.last_error_message[:80]}")
+        log.info("=" * 70)
+
+
+metrics = MetricsCollector()
+
+# ============================================================================
+#                           SUPABASE CLIENT WITH DEBUGGING
+# ============================================================================
+
+class DebugSupabaseClient:
+    """Wrapper around Supabase client with request/response logging."""
+    
+    def __init__(self, url: str, key: str):
+        self._client = create_client(url, key) if url and key else None
+        self._request_count = 0
+        self._error_count = 0
+        self._lock = threading.Lock()
+    
+    @property
+    def client(self):
+        return self._client
+    
+    def table(self, name: str):
+        """Get a table reference with debug logging."""
+        return DebugTableRef(self, name)
+    
+    def log_request(self, table: str, operation: str, data: Any = None):
+        """Log an outgoing request."""
+        with self._lock:
+            self._request_count += 1
+        
+        if DEBUG_LOG_PAYLOADS and data:
+            debug("SUPABASE", f"Request #{self._request_count}: {operation} {table}")
+            debug("SUPABASE", f"  Payload: {json.dumps(data, default=str)[:500]}")
+        else:
+            debug("SUPABASE", f"Request #{self._request_count}: {operation} {table}")
+    
+    def log_response(self, table: str, operation: str, response: Any, error: Exception = None):
+        """Log a response."""
+        if error:
+            with self._lock:
+                self._error_count += 1
+            warning("SUPABASE", f"Response ERROR: {operation} {table} - {str(error)[:200]}")
+            if DEBUG_MODE:
+                warning("SUPABASE", f"  Full error: {error}")
+        elif DEBUG_LOG_RESPONSES:
+            debug("SUPABASE", f"Response OK: {operation} {table}")
+    
+    def get_stats(self) -> Dict:
+        return {
+            "total_requests": self._request_count,
+            "total_errors": self._error_count,
+            "error_rate": f"{(self._error_count / self._request_count * 100) if self._request_count > 0 else 0:.1f}%"
+        }
+
+
+class DebugTableRef:
+    """Wrapper around Supabase table operations with debug logging."""
+    
+    def __init__(self, client: DebugSupabaseClient, table_name: str):
+        self._client = client
+        self._table_name = table_name
+        self._table = client.client.table(table_name) if client.client else None
+    
+    def insert(self, data: Any):
+        """Insert with logging."""
+        self._client.log_request(self._table_name, "INSERT", data)
+        
+        class InsertBuilder:
+            def __init__(inner_self, table_ref):
+                inner_self._table_ref = table_ref
+                inner_self._data = data
+            
+            def execute(inner_self):
+                try:
+                    if inner_self._table_ref._table is None:
+                        raise Exception("Supabase client not initialized")
+                    result = inner_self._table_ref._table.insert(inner_self._data).execute()
+                    inner_self._table_ref._client.log_response(inner_self._table_ref._table_name, "INSERT", result)
+                    return result
+                except Exception as e:
+                    inner_self._table_ref._client.log_response(inner_self._table_ref._table_name, "INSERT", None, e)
+                    raise
+        
+        return InsertBuilder(self)
+    
+    def upsert(self, data: Any, on_conflict: str = None):
+        """Upsert with logging."""
+        self._client.log_request(self._table_name, f"UPSERT(on_conflict={on_conflict})", data)
+        
+        class UpsertBuilder:
+            def __init__(inner_self, table_ref):
+                inner_self._table_ref = table_ref
+                inner_self._data = data
+                inner_self._on_conflict = on_conflict
+            
+            def execute(inner_self):
+                try:
+                    if inner_self._table_ref._table is None:
+                        raise Exception("Supabase client not initialized")
+                    result = inner_self._table_ref._table.upsert(inner_self._data, on_conflict=inner_self._on_conflict).execute()
+                    inner_self._table_ref._client.log_response(inner_self._table_ref._table_name, "UPSERT", result)
+                    return result
+                except Exception as e:
+                    inner_self._table_ref._client.log_response(inner_self._table_ref._table_name, "UPSERT", None, e)
+                    raise
+        
+        return UpsertBuilder(self)
+    
+    def select(self, columns: str = "*"):
+        """Select with chaining support."""
+        return SelectBuilder(self, columns)
+
+
+class SelectBuilder:
+    """Chainable select query builder with logging."""
+    
+    def __init__(self, table_ref: DebugTableRef, columns: str):
+        self._table_ref = table_ref
+        self._columns = columns
+        self._filters = []
+        self._limit_val = None
+        self._order_col = None
+        self._order_desc = False
+    
+    def eq(self, column: str, value: Any):
+        self._filters.append(("eq", column, value))
+        return self
+    
+    def gte(self, column: str, value: Any):
+        self._filters.append(("gte", column, value))
+        return self
+    
+    def lte(self, column: str, value: Any):
+        self._filters.append(("lte", column, value))
+        return self
+    
+    def limit(self, count: int):
+        self._limit_val = count
+        return self
+    
+    def order(self, column: str, desc: bool = False):
+        self._order_col = column
+        self._order_desc = desc
+        return self
+    
+    def execute(self):
+        filter_desc = ", ".join([f"{f[1]}={f[0]}({f[2]})" for f in self._filters])
+        self._table_ref._client.log_request(
+            self._table_ref._table_name, 
+            f"SELECT({self._columns}) WHERE {filter_desc}"
+        )
+        
+        try:
+            if self._table_ref._table is None:
+                raise Exception("Supabase client not initialized")
+            
+            query = self._table_ref._table.select(self._columns)
+            
+            for filter_type, column, value in self._filters:
+                if filter_type == "eq":
+                    query = query.eq(column, value)
+                elif filter_type == "gte":
+                    query = query.gte(column, value)
+                elif filter_type == "lte":
+                    query = query.lte(column, value)
+            
+            if self._limit_val:
+                query = query.limit(self._limit_val)
+            
+            if self._order_col:
+                query = query.order(self._order_col, desc=self._order_desc)
+            
+            result = query.execute()
+            self._table_ref._client.log_response(self._table_ref._table_name, "SELECT", result)
+            return result
+        except Exception as e:
+            self._table_ref._client.log_response(self._table_ref._table_name, "SELECT", None, e)
+            raise
+
+
+# Initialize Supabase client
+sb = DebugSupabaseClient(SUPABASE_URL, SUPABASE_KEY)
+
+# ============================================================================
+#                           TRADING SYMBOLS
 # ============================================================================
 
 FOREX_SYMBOLS = [
@@ -121,6 +490,21 @@ ALL_US_STOCKS = US_STOCKS
 ALL_ETFS = ETFS
 TOTAL_SYMBOLS = len(ALL_FOREX) + len(ALL_CRYPTO) + len(ALL_US_STOCKS) + len(ALL_ETFS)
 
+# Index symbols: EODHD API symbol -> (display_symbol, candle_table)
+INDEX_SYMBOLS = {
+    "GSPC.INDX": ("SPX", "candles_spx"),
+    "DJI.INDX": ("US30", "candles_us30"),
+    "IXIC.INDX": ("NASDAQ", "candles_nasdaq"),
+    "NDX.INDX": ("NAS100", "candles_nas100"),
+    "RUT.INDX": ("RUT", "candles_rut"),
+    "FTSE.INDX": ("UK100", "candles_uk100"),
+    "GDAXI.INDX": ("DAX", "candles_dax"),
+    "FCHI.INDX": ("CAC40", "candles_cac40"),
+    "N225.INDX": ("NIKKEI", "candles_nikkei"),
+    "HSI.INDX": ("HSI", "candles_hsi"),
+    "STOXX50E.INDX": ("STOXX50", "candles_stoxx50"),
+}
+
 # ============================================================================
 #                          EODHD WEBSOCKET CONFIG
 # ============================================================================
@@ -142,46 +526,103 @@ WS_CONNECTIONS = [
 ]
 
 # ============================================================================
-#                            CONFIGURATION
+#                    STARTUP DIAGNOSTICS
 # ============================================================================
 
-BATCH_MAX = 500
-BATCH_FLUSH_INTERVAL = 2
-WATCHDOG_TIMEOUT_SECS = 60
-NUCLEAR_TIMEOUT_SECS = 120
-HEALTH_LOG_INTERVAL = 60
-WEEKLY_RESET_DAY = 5
-WEEKLY_RESET_HOUR = 22
-MIN_GAP_MINUTES = 3
-MAX_GAP_HOURS = 4
-GAP_SCAN_INTERVAL = 300
-BOND_SCRAPE_INTERVAL = 1800
-MACRO_FETCH_INTERVAL = 3600
-INDEX_POLL_INTERVAL = 20  # Poll indices every 20 seconds
+def run_startup_diagnostics():
+    """Run comprehensive startup checks and log configuration."""
+    log.info("=" * 70)
+    log.info("STARTUP DIAGNOSTICS")
+    log.info("=" * 70)
+    
+    # Check environment variables
+    env_checks = [
+        ("EODHD_API_KEY", EODHD_API_KEY, True),
+        ("SUPABASE_URL", SUPABASE_URL, True),
+        ("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_KEY, True),
+        ("GOOGLE_GEMINI_API_KEY", GOOGLE_GEMINI_API_KEY, False),
+    ]
+    
+    log.info("Environment Variables:")
+    all_required_present = True
+    for name, value, required in env_checks:
+        if value:
+            masked = value[:8] + "..." + value[-4:] if len(value) > 12 else "***"
+            status = "✓"
+        else:
+            masked = "NOT SET"
+            status = "✗" if required else "○"
+            if required:
+                all_required_present = False
+        log.info(f"  {status} {name}: {masked}")
+    
+    if not all_required_present:
+        log.error("Missing required environment variables! Worker may not function correctly.")
+    
+    # Log configuration
+    log.info("")
+    log.info("Configuration:")
+    log.info(f"  DEBUG_MODE: {DEBUG_MODE}")
+    log.info(f"  DEBUG_LOG_PAYLOADS: {DEBUG_LOG_PAYLOADS}")
+    log.info(f"  DEBUG_LOG_RESPONSES: {DEBUG_LOG_RESPONSES}")
+    log.info(f"  BATCH_MAX: {BATCH_MAX}")
+    log.info(f"  BATCH_FLUSH_INTERVAL: {BATCH_FLUSH_INTERVAL}s")
+    log.info(f"  INDEX_POLL_INTERVAL: {INDEX_POLL_INTERVAL}s")
+    log.info(f"  CALENDAR_FETCH_INTERVAL: {CALENDAR_FETCH_INTERVAL}s")
+    
+    # Log symbol counts
+    log.info("")
+    log.info("Symbol Coverage:")
+    log.info(f"  Forex: {len(ALL_FOREX)}")
+    log.info(f"  Crypto: {len(ALL_CRYPTO)}")
+    log.info(f"  US Stocks: {len(ALL_US_STOCKS)}")
+    log.info(f"  ETFs: {len(ALL_ETFS)}")
+    log.info(f"  Indices: {len(INDEX_SYMBOLS)}")
+    log.info(f"  TOTAL: {TOTAL_SYMBOLS + len(INDEX_SYMBOLS)}")
+    
+    # Test Supabase connection
+    log.info("")
+    log.info("Testing Supabase Connection...")
+    try:
+        if sb.client:
+            # Try a simple query
+            result = sb.client.table(SUPABASE_TABLE).select("symbol").limit(1).execute()
+            log.info(f"  ✓ Supabase connection OK (table: {SUPABASE_TABLE})")
+        else:
+            log.error("  ✗ Supabase client not initialized")
+    except Exception as e:
+        log.error(f"  ✗ Supabase connection failed: {e}")
+    
+    # Test EODHD API
+    log.info("")
+    log.info("Testing EODHD API...")
+    try:
+        test_url = f"https://eodhd.com/api/real-time/AAPL.US?api_token={EODHD_API_KEY}&fmt=json"
+        response = requests.get(test_url, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            log.info(f"  ✓ EODHD API OK (AAPL price: ${data.get('close', 'N/A')})")
+        else:
+            log.warning(f"  ⚠ EODHD API returned status {response.status_code}")
+    except Exception as e:
+        log.error(f"  ✗ EODHD API test failed: {e}")
+    
+    log.info("")
+    log.info("=" * 70)
+    log.info("DIAGNOSTICS COMPLETE")
+    log.info("=" * 70)
+    log.info("")
 
-# ============================================================================
-#                              LOGGING
-# ============================================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-log = logging.getLogger("worker")
-
-# ============================================================================
-#                           SUPABASE CLIENT
-# ============================================================================
-
-sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ============================================================================
 #                    TASK 1: EODHD TICK STREAMING
 # ============================================================================
 
 class EODHDTickStreamer:
+    """WebSocket tick streamer with comprehensive debugging."""
+    
+    TASK_NAME = "TICK_STREAM"
+    
     def __init__(self):
         self._shutdown = asyncio.Event()
         self._connections: Dict[str, Dict] = {}
@@ -192,6 +633,7 @@ class EODHDTickStreamer:
         self._last_main_loop_heartbeat = datetime.now(timezone.utc)
         self._last_weekly_reset = None
         self._failure_reasons = Counter()
+        self._metrics = metrics.get_or_create(self.TASK_NAME)
         
         for conn_config in WS_CONNECTIONS:
             name = conn_config["name"]
@@ -204,6 +646,7 @@ class EODHDTickStreamer:
                 "last_activity_time": datetime.now(timezone.utc),
                 "symbols_streaming": set(),
                 "task": None,
+                "errors": [],
             }
     
     def _normalize_symbol(self, symbol: str, endpoint: str) -> str:
@@ -225,25 +668,44 @@ class EODHDTickStreamer:
             return None
     
     async def _flush(self):
+        """Flush batch to Supabase with error handling."""
         if not self._batch:
             return
+        
         batch_copy = self._batch.copy()
         self._batch.clear()
+        batch_size = len(batch_copy)
+        
+        debug(self.TASK_NAME, f"Flushing batch of {batch_size} ticks")
+        
         try:
             sb.table(SUPABASE_TABLE).insert(batch_copy).execute()
+            self._metrics.record_success()
+            self._metrics.custom_metrics["last_batch_size"] = batch_size
+            debug(self.TASK_NAME, f"Batch insert OK: {batch_size} ticks")
         except Exception as e:
-            log.warning(f"Batch insert failed: {e}")
+            self._metrics.record_error(str(e))
+            error_msg = str(e)
+            warning(self.TASK_NAME, f"Batch insert FAILED: {error_msg[:200]}")
+            
+            # Log sample of failed data for debugging
+            if DEBUG_MODE and batch_copy:
+                sample = batch_copy[0]
+                debug(self.TASK_NAME, f"Sample failed record: {json.dumps(sample, default=str)}")
     
     async def _periodic_flush(self):
+        """Periodically flush tick batch."""
         while not self._shutdown.is_set():
             await asyncio.sleep(BATCH_FLUSH_INTERVAL)
             async with self._batch_lock:
                 await self._flush()
     
     async def _handle_tick(self, data: Dict, conn_name: str, endpoint: str):
+        """Process a single tick with validation."""
         try:
             symbol = data.get("s", data.get("symbol", ""))
             if not symbol:
+                debug(self.TASK_NAME, f"[{conn_name}] Tick missing symbol: {data}")
                 return
             
             normalized = self._normalize_symbol(symbol, endpoint)
@@ -253,7 +715,9 @@ class EODHDTickStreamer:
             volume = self._to_float(data.get("v", data.get("volume")))
             
             if price is None and bid is None:
+                debug(self.TASK_NAME, f"[{conn_name}] Tick missing price/bid: {symbol}")
                 return
+            
             if price is None and bid and ask:
                 price = (bid + ask) / 2
             
@@ -264,12 +728,13 @@ class EODHDTickStreamer:
             conn["symbols_streaming"].add(symbol)
             self._total_ticks += 1
             
+            # Use 'volume' column (not 'day_volume')
             tick = {
                 "symbol": normalized,
                 "price": price,
                 "bid": bid,
                 "ask": ask,
-                "day_volume": volume,
+                "volume": volume,
                 "ts": datetime.now(timezone.utc).isoformat(),
             }
             
@@ -277,10 +742,14 @@ class EODHDTickStreamer:
                 self._batch.append(tick)
                 if len(self._batch) >= BATCH_MAX:
                     await self._flush()
+                    
         except Exception as e:
-            log.warning(f"Error handling tick: {e}")
+            warning(self.TASK_NAME, f"Error handling tick: {e}")
+            if DEBUG_MODE:
+                debug(self.TASK_NAME, f"Failed tick data: {data}")
 
     async def _kill_connection(self, conn_name: str):
+        """Kill a WebSocket connection."""
         conn = self._connections[conn_name]
         conn["is_connected"] = False
         if conn["ws"]:
@@ -289,9 +758,12 @@ class EODHDTickStreamer:
             except Exception:
                 pass
             conn["ws"] = None
+        debug(self.TASK_NAME, f"[{conn_name}] Connection killed")
 
     async def _watchdog(self):
-        log.info(f"Watchdog started (timeout: {WATCHDOG_TIMEOUT_SECS}s)")
+        """Monitor connections and kill stale ones."""
+        info(self.TASK_NAME, f"Watchdog started (timeout: {WATCHDOG_TIMEOUT_SECS}s)")
+        
         while not self._shutdown.is_set():
             await asyncio.sleep(5)
             now = datetime.now(timezone.utc)
@@ -299,42 +771,52 @@ class EODHDTickStreamer:
             for conn_name, conn in self._connections.items():
                 if not conn["is_connected"]:
                     continue
+                    
                 activity_elapsed = (now - conn["last_activity_time"]).total_seconds()
+                
                 if activity_elapsed > WATCHDOG_TIMEOUT_SECS:
-                    log.warning(f"WATCHDOG [{conn_name}]: No activity for {activity_elapsed:.1f}s - killing!")
+                    warning(self.TASK_NAME, f"WATCHDOG [{conn_name}]: No activity for {activity_elapsed:.1f}s - killing!")
                     self._failure_reasons["watchdog_kill"] += 1
+                    conn["errors"].append(f"Watchdog kill at {now.isoformat()}")
                     await self._kill_connection(conn_name)
             
+            # Weekly reset check
             active_connections = sum(1 for c in self._connections.values() if c["is_connected"])
             if active_connections > 0:
                 if now.weekday() == WEEKLY_RESET_DAY and now.hour == WEEKLY_RESET_HOUR:
                     reset_key = f"{now.year}-{now.isocalendar()[1]}"
                     if self._last_weekly_reset != reset_key:
-                        log.info("WEEKLY RESET: Saturday 10pm maintenance")
+                        info(self.TASK_NAME, "WEEKLY RESET: Saturday 10pm maintenance")
                         self._last_weekly_reset = reset_key
                         self._failure_reasons["weekly_reset"] += 1
                         for cn in self._connections:
                             await self._kill_connection(cn)
 
     async def _nuclear_watchdog(self):
-        log.info(f"NUCLEAR WATCHDOG started (timeout: {NUCLEAR_TIMEOUT_SECS}s)")
+        """Emergency watchdog for system-wide stuck state."""
+        info(self.TASK_NAME, f"NUCLEAR WATCHDOG started (timeout: {NUCLEAR_TIMEOUT_SECS}s)")
+        
         while not self._shutdown.is_set():
             await asyncio.sleep(10)
             now = datetime.now(timezone.utc)
             main_loop_elapsed = (now - self._last_main_loop_heartbeat).total_seconds()
             
             if main_loop_elapsed > NUCLEAR_TIMEOUT_SECS:
-                log.error(f"NUCLEAR WATCHDOG TRIGGERED! System stuck for {main_loop_elapsed:.1f}s!")
+                error(self.TASK_NAME, f"NUCLEAR WATCHDOG TRIGGERED! System stuck for {main_loop_elapsed:.1f}s!")
                 self._failure_reasons["nuclear_kill"] += 1
+                
                 for conn_name, conn in self._connections.items():
                     if conn["task"] and not conn["task"].done():
                         conn["task"].cancel()
                     await self._kill_connection(conn_name)
+                
                 self._last_main_loop_heartbeat = datetime.now(timezone.utc)
 
     async def _health_logger(self):
+        """Periodically log health status."""
         while not self._shutdown.is_set():
             await asyncio.sleep(HEALTH_LOG_INTERVAL)
+            
             now = datetime.now(timezone.utc)
             elapsed = (now - self._start_time).total_seconds()
             rate = self._total_ticks / elapsed if elapsed > 0 else 0
@@ -346,9 +828,26 @@ class EODHDTickStreamer:
                 streaming.update(c["symbols_streaming"])
             
             status = "HEALTHY" if main_loop_elapsed < 30 else "STALE" if main_loop_elapsed < NUCLEAR_TIMEOUT_SECS else "STUCK"
-            log.info(f"HEALTH: {status} | Ticks: {self._total_ticks:,} ({rate:.1f}/sec) | Connections: {active}/{len(self._connections)} | Symbols: {len(streaming)}/{TOTAL_SYMBOLS}")
+            
+            self._metrics.custom_metrics.update({
+                "total_ticks": self._total_ticks,
+                "tick_rate": f"{rate:.1f}/sec",
+                "active_connections": f"{active}/{len(self._connections)}",
+                "symbols_streaming": len(streaming),
+                "status": status,
+                "failure_reasons": dict(self._failure_reasons),
+            })
+            
+            info(self.TASK_NAME, f"HEALTH: {status} | Ticks: {self._total_ticks:,} ({rate:.1f}/sec) | Connections: {active}/{len(self._connections)} | Symbols: {len(streaming)}/{TOTAL_SYMBOLS}")
+            
+            # Log per-connection stats in debug mode
+            if DEBUG_MODE:
+                for conn_name, conn in self._connections.items():
+                    status_icon = "✓" if conn["is_connected"] else "✗"
+                    debug(self.TASK_NAME, f"  {status_icon} {conn_name}: {conn['tick_count']} ticks, {len(conn['symbols_streaming'])} symbols")
 
     async def _run_connection(self, conn_name: str):
+        """Run a single WebSocket connection with reconnection logic."""
         conn = self._connections[conn_name]
         config = conn["config"]
         endpoint = config["endpoint"]
@@ -356,65 +855,89 @@ class EODHDTickStreamer:
         url = f"{EODHD_ENDPOINTS[endpoint]}?api_token={EODHD_API_KEY}"
         backoff = 1
         
+        info(self.TASK_NAME, f"[{conn_name}] Starting connection for {len(symbols)} {endpoint} symbols")
+        
         while not self._shutdown.is_set():
             self._last_main_loop_heartbeat = datetime.now(timezone.utc)
+            
             try:
-                log.info(f"[{conn_name}] Connecting to {endpoint}...")
+                debug(self.TASK_NAME, f"[{conn_name}] Connecting to {endpoint}...")
+                
                 async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
                     conn["ws"] = ws
                     conn["is_connected"] = True
                     conn["last_activity_time"] = datetime.now(timezone.utc)
                     backoff = 1
                     
+                    # Subscribe to symbols
                     sub_msg = {"action": "subscribe", "symbols": ",".join(symbols)}
                     await ws.send(json.dumps(sub_msg))
-                    log.info(f"[{conn_name}] Subscribed to {len(symbols)} symbols")
+                    info(self.TASK_NAME, f"[{conn_name}] Connected and subscribed to {len(symbols)} symbols")
                     
+                    # Process messages
                     async for message in ws:
                         if self._shutdown.is_set():
                             break
+                            
                         conn["last_activity_time"] = datetime.now(timezone.utc)
                         self._last_main_loop_heartbeat = datetime.now(timezone.utc)
+                        
                         try:
                             data = json.loads(message)
+                            
                             if isinstance(data, dict):
+                                # Skip status messages
                                 if data.get("status_code") or data.get("message"):
+                                    debug(self.TASK_NAME, f"[{conn_name}] Status: {data.get('message', data)}")
                                     continue
                                 await self._handle_tick(data, conn_name, endpoint)
+                                
                             elif isinstance(data, list):
                                 for item in data:
                                     if isinstance(item, dict):
                                         await self._handle_tick(item, conn_name, endpoint)
-                        except json.JSONDecodeError:
-                            pass
+                                        
+                        except json.JSONDecodeError as e:
+                            debug(self.TASK_NAME, f"[{conn_name}] JSON decode error: {e}")
+                            
             except websockets.exceptions.ConnectionClosed as e:
-                log.warning(f"[{conn_name}] Connection closed: {e.code}")
+                warning(self.TASK_NAME, f"[{conn_name}] Connection closed: code={e.code}, reason={e.reason}")
                 self._failure_reasons["connection_closed"] += 1
                 conn["is_connected"] = False
+                conn["errors"].append(f"Connection closed: {e.code}")
+                
             except Exception as e:
-                log.error(f"[{conn_name}] Error: {e}")
-                self._failure_reasons["http_error"] += 1
+                error(self.TASK_NAME, f"[{conn_name}] Error: {e}", exc_info=DEBUG_MODE)
+                self._failure_reasons["exception"] += 1
                 conn["is_connected"] = False
+                conn["errors"].append(str(e))
             
             if self._shutdown.is_set():
                 break
-            log.info(f"[{conn_name}] Reconnecting in {backoff}s...")
+                
+            info(self.TASK_NAME, f"[{conn_name}] Reconnecting in {backoff}s...")
             await asyncio.sleep(backoff)
             backoff = min(30, backoff * 2)
     
     async def run(self):
-        log.info(f"Starting EODHD tick streamer ({len(self._connections)} connections)")
+        """Main run loop for tick streamer."""
+        info(self.TASK_NAME, f"Starting EODHD tick streamer ({len(self._connections)} connections)")
+        
+        # Start helper tasks
         flush_task = asyncio.create_task(self._periodic_flush())
         watchdog_task = asyncio.create_task(self._watchdog())
         nuclear_task = asyncio.create_task(self._nuclear_watchdog())
         health_task = asyncio.create_task(self._health_logger())
         
+        # Start connection tasks
         for conn_name in self._connections:
             task = asyncio.create_task(self._run_connection(conn_name))
             self._connections[conn_name]["task"] = task
         
+        # Wait for shutdown
         await self._shutdown.wait()
         
+        # Cleanup
         flush_task.cancel()
         watchdog_task.cancel()
         nuclear_task.cancel()
@@ -425,30 +948,31 @@ class EODHDTickStreamer:
                 conn["task"].cancel()
             await self._kill_connection(conn["config"]["name"])
         
+        # Final flush
         async with self._batch_lock:
             await self._flush()
+        
+        info(self.TASK_NAME, "Tick streamer shutdown complete")
     
     def shutdown(self):
+        """Signal shutdown."""
         self._shutdown.set()
 
 
+# Global tick streamer instance
 tick_streamer = EODHDTickStreamer()
 
 
 async def tick_streaming_task():
+    """Task 1: WebSocket tick streaming."""
     await tick_streamer.run()
 
 
 # ============================================================================
-#                    TASK 2: EODHD ECONOMIC CALENDAR (FIXED)
+#                    TASK 2: ECONOMIC CALENDAR
 # ============================================================================
-# FIX: Use upsert with proper error handling to prevent 400 errors
-#
-# IMPORTANT: Run this SQL in Supabase first:
-# ALTER TABLE "Economic_calander" 
-# ADD CONSTRAINT economic_calander_unique 
-# UNIQUE NULLS NOT DISTINCT (date, time, country, event);
-# ============================================================================
+
+CALENDAR_TASK = "CALENDAR"
 
 HIGH_IMPACT_KEYWORDS = [
     "non farm payrolls", "nonfarm payrolls", "nfp", "unemployment rate",
@@ -466,19 +990,23 @@ MEDIUM_IMPACT_KEYWORDS = [
 
 
 def classify_calendar_impact(event_name: str) -> str:
+    """Classify event importance based on keywords."""
     name_lower = event_name.lower()
     for kw in HIGH_IMPACT_KEYWORDS:
         if kw in name_lower:
-            return "high"
+            return "High"  # Capital H to match constraint
     for kw in MEDIUM_IMPACT_KEYWORDS:
         if kw in name_lower:
-            return "medium"
-    return "low"
+            return "Medium"
+    return "Low"
 
 
-def fetch_eodhd_calendar(days_ahead: int = 7) -> List[Dict]:
+def fetch_eodhd_calendar(days_ahead: int = 7) -> Tuple[List[Dict], Optional[str]]:
+    """Fetch economic calendar from EODHD API.
+    Returns (events, error_message)."""
     from_date = datetime.now().strftime("%Y-%m-%d")
     to_date = (datetime.now() + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+    
     url = "https://eodhd.com/api/economic-events"
     params = {
         "api_token": EODHD_API_KEY,
@@ -487,24 +1015,34 @@ def fetch_eodhd_calendar(days_ahead: int = 7) -> List[Dict]:
         "limit": 1000,
         "fmt": "json"
     }
+    
+    debug(CALENDAR_TASK, f"Fetching calendar: {from_date} to {to_date}")
+    
     try:
         response = requests.get(url, params=params, timeout=30)
+        
         if response.status_code == 200:
-            return response.json()
-        return []
+            events = response.json()
+            debug(CALENDAR_TASK, f"API returned {len(events)} events")
+            return events, None
+        else:
+            return [], f"API returned status {response.status_code}: {response.text[:200]}"
+            
+    except requests.Timeout:
+        return [], "Request timed out"
     except Exception as e:
-        log.warning(f"Calendar fetch error: {e}")
-        return []
+        return [], f"Request failed: {e}"
 
 
-def store_calendar_events(events: List[Dict]) -> Tuple[int, int]:
-    """Store calendar events efficiently with batch duplicate checking.
-    Returns (stored_count, skipped_count)."""
+def store_calendar_events(events: List[Dict]) -> Tuple[int, int, List[str]]:
+    """Store calendar events with detailed error tracking.
+    Returns (stored_count, skipped_count, errors)."""
     if not events:
-        return 0, 0
+        return 0, 0, []
     
     stored = 0
     skipped = 0
+    errors = []
     
     # Parse all events first
     parsed_events = []
@@ -530,32 +1068,41 @@ def store_calendar_events(events: List[Dict]) -> Tuple[int, int]:
                 "consensus": str(event.get("estimate")) if event.get("estimate") is not None else None,
                 "importance": classify_calendar_impact(event_name),
             })
-        except Exception:
+        except Exception as e:
+            errors.append(f"Parse error: {e}")
             continue
     
     if not parsed_events:
-        return 0, 0
+        return 0, 0, errors
+    
+    debug(CALENDAR_TASK, f"Parsed {len(parsed_events)} events")
     
     # Get date range for batch lookup
     dates = set(e["date"] for e in parsed_events if e["date"])
     if not dates:
-        return 0, 0
+        return 0, 0, errors
     
-    # Batch fetch existing events for these dates (one query)
+    # Batch fetch existing events
     existing_keys = set()
     try:
         min_date = min(dates)
         max_date = max(dates)
-        existing = sb.table("Economic_calander").select(
+        
+        debug(CALENDAR_TASK, f"Checking existing events from {min_date} to {max_date}")
+        
+        result = sb.table("Economic_calander").select(
             "date,time,country,event"
         ).gte("date", min_date).lte("date", max_date).execute()
         
-        for row in existing.data:
+        for row in result.data:
             key = (row.get("date"), row.get("time"), row.get("country"), row.get("event"))
             existing_keys.add(key)
+        
+        debug(CALENDAR_TASK, f"Found {len(existing_keys)} existing events")
+        
     except Exception as e:
-        log.warning(f"Calendar batch lookup failed: {e}")
-        # Continue anyway - inserts will fail for duplicates
+        errors.append(f"Lookup failed: {e}")
+        debug(CALENDAR_TASK, f"Existing events lookup failed, will try insert anyway: {e}")
     
     # Filter to only new events
     new_events = []
@@ -566,55 +1113,85 @@ def store_calendar_events(events: List[Dict]) -> Tuple[int, int]:
         else:
             new_events.append(evt)
     
-    # Batch insert new events (in chunks to avoid payload limits)
-    chunk_size = 50
-    for i in range(0, len(new_events), chunk_size):
-        chunk = new_events[i:i+chunk_size]
-        try:
-            sb.table("Economic_calander").insert(chunk).execute()
-            stored += len(chunk)
-        except Exception as e:
-            # If batch fails, try individual inserts
-            for evt in chunk:
-                try:
-                    sb.table("Economic_calander").insert(evt).execute()
-                    stored += 1
-                except Exception:
-                    skipped += 1
+    debug(CALENDAR_TASK, f"New events to insert: {len(new_events)}, skipping {skipped} duplicates")
     
-    return stored, skipped
+    # Batch insert new events
+    if new_events:
+        chunk_size = 50
+        for i in range(0, len(new_events), chunk_size):
+            chunk = new_events[i:i+chunk_size]
+            try:
+                sb.table("Economic_calander").insert(chunk).execute()
+                stored += len(chunk)
+                debug(CALENDAR_TASK, f"Inserted chunk of {len(chunk)} events")
+            except Exception as e:
+                error_msg = str(e)
+                errors.append(f"Batch insert failed: {error_msg[:100]}")
+                
+                # Try individual inserts
+                for evt in chunk:
+                    try:
+                        sb.table("Economic_calander").insert(evt).execute()
+                        stored += 1
+                    except Exception as e2:
+                        skipped += 1
+                        if len(errors) < 10:  # Limit error messages
+                            errors.append(f"Individual insert failed: {str(e2)[:50]}")
+    
+    return stored, skipped, errors
 
 
 async def economic_calendar_task():
-    log.info("Economic calendar task started (EODHD API)")
+    """Task 2: Fetch and store economic calendar events."""
+    task_metrics = metrics.get_or_create(CALENDAR_TASK)
+    
+    info(CALENDAR_TASK, "Economic calendar task started")
     
     while not tick_streamer._shutdown.is_set():
         try:
-            log.info("Fetching economic calendar...")
-            events = fetch_eodhd_calendar(days_ahead=7)
+            info(CALENDAR_TASK, "Fetching economic calendar...")
             
-            if events:
-                stored, errors = store_calendar_events(events)
-                high_impact = sum(1 for e in events if classify_calendar_impact(e.get("type", "")) == "high")
-                log.info(f"Calendar: {len(events)} fetched, {stored} stored, {errors} skipped, {high_impact} high-impact")
+            events, fetch_error = fetch_eodhd_calendar(days_ahead=7)
             
-            # Follow-up fetch after 3 seconds
-            await asyncio.sleep(3)
-            events2 = fetch_eodhd_calendar(days_ahead=7)
-            if events2:
-                store_calendar_events(events2)
+            if fetch_error:
+                warning(CALENDAR_TASK, f"Fetch failed: {fetch_error}")
+                task_metrics.record_error(fetch_error)
+            elif events:
+                stored, skipped, errors = store_calendar_events(events)
+                high_impact = sum(1 for e in events if classify_calendar_impact(e.get("type", "")) == "High")
+                
+                info(CALENDAR_TASK, f"Results: {len(events)} fetched, {stored} stored, {skipped} skipped, {high_impact} high-impact")
+                
+                if errors:
+                    for err in errors[:5]:  # Log first 5 errors
+                        warning(CALENDAR_TASK, f"  Error: {err}")
+                    if len(errors) > 5:
+                        warning(CALENDAR_TASK, f"  ... and {len(errors) - 5} more errors")
+                
+                task_metrics.record_success()
+                task_metrics.custom_metrics.update({
+                    "last_fetch_count": len(events),
+                    "last_stored_count": stored,
+                    "last_skipped_count": skipped,
+                    "last_error_count": len(errors),
+                })
+            else:
+                info(CALENDAR_TASK, "No events returned from API")
             
-            # Wait 5 minutes before next cycle
-            await asyncio.sleep(300)
+            # Wait before next fetch
+            await asyncio.sleep(CALENDAR_FETCH_INTERVAL)
             
         except Exception as e:
-            log.error(f"Calendar task error: {e}")
+            error(CALENDAR_TASK, f"Task error: {e}", exc_info=DEBUG_MODE)
+            task_metrics.record_error(str(e))
             await asyncio.sleep(60)
 
 
 # ============================================================================
 #                    TASK 3: FINANCIAL NEWS
 # ============================================================================
+
+NEWS_TASK = "NEWS"
 
 RSS_FEEDS = [
     {"url": "https://feeds.bbci.co.uk/news/business/rss.xml", "name": "BBC Business"},
@@ -623,7 +1200,6 @@ RSS_FEEDS = [
     {"url": "https://finance.yahoo.com/news/rssindex", "name": "Yahoo Finance"},
     {"url": "https://cointelegraph.com/rss", "name": "CoinTelegraph"},
     {"url": "https://www.federalreserve.gov/feeds/press_all.xml", "name": "Federal Reserve"},
-    {"url": "https://feeds.reuters.com/reuters/businessNews", "name": "Reuters Business"},
     {"url": "https://www.investing.com/rss/news.rss", "name": "Investing.com"},
     {"url": "https://seekingalpha.com/market_currents.xml", "name": "Seeking Alpha"},
     {"url": "https://oilprice.com/rss/main", "name": "OilPrice"},
@@ -641,6 +1217,7 @@ EXCLUDE_KEYWORDS = ["sport", "sports", "football", "basketball", "celebrity", "e
 
 
 def should_prefilter_article(title: str, summary: str) -> bool:
+    """Check if article passes keyword filters."""
     text = f"{title} {summary}".lower()
     for kw in EXCLUDE_KEYWORDS:
         if kw in text:
@@ -651,66 +1228,14 @@ def should_prefilter_article(title: str, summary: str) -> bool:
     return False
 
 
-def optimize_articles_for_cost(articles: List[Dict]) -> List[Dict]:
-    if not articles:
-        return []
-    
-    articles_with_images = [a for a in articles if a.get("image_url")]
-    if not articles_with_images:
-        articles_with_images = articles[:50]
-    
-    unique_articles = []
-    seen_titles = []
-    for article in articles_with_images:
-        title = article.get("title", "")
-        is_duplicate = False
-        for seen in seen_titles:
-            if SequenceMatcher(None, title.lower(), seen.lower()).ratio() >= 0.70:
-                is_duplicate = True
-                break
-        if not is_duplicate:
-            unique_articles.append(article)
-            seen_titles.append(title)
-    
-    category_counts = {"crypto": 0, "political": 0, "central_bank": 0, "market": 0, "commodity": 0, "macro": 0}
-    category_limits = {"crypto": 4, "political": 4, "central_bank": 4, "market": 4, "commodity": 3, "macro": 4}
-    
-    crypto_kw = ["bitcoin", "btc", "ethereum", "eth", "crypto", "solana", "xrp"]
-    political_kw = ["trump", "biden", "election", "president", "white house"]
-    central_bank_kw = ["fed", "powell", "ecb", "lagarde", "rate", "monetary", "fomc"]
-    market_kw = ["stock", "nasdaq", "s&p", "dow", "market", "rally", "crash"]
-    commodity_kw = ["oil", "gold", "opec", "crude", "commodity"]
-    macro_kw = ["gdp", "inflation", "cpi", "unemployment", "jobs", "pmi"]
-    
-    final_articles = []
-    for article in unique_articles:
-        text = f"{article['title']} {article.get('summary', '')}".lower()
-        category = None
-        if any(kw in text for kw in crypto_kw):
-            category = "crypto"
-        elif any(kw in text for kw in central_bank_kw):
-            category = "central_bank"
-        elif any(kw in text for kw in macro_kw):
-            category = "macro"
-        elif any(kw in text for kw in political_kw):
-            category = "political"
-        elif any(kw in text for kw in commodity_kw):
-            category = "commodity"
-        elif any(kw in text for kw in market_kw):
-            category = "market"
-        
-        if category and category in category_limits:
-            if category_counts[category] >= category_limits[category]:
-                continue
-            category_counts[category] += 1
-        final_articles.append(article)
-    
-    return final_articles
-
-
-def fetch_rss_feed(feed_url: str, source_name: str) -> List[Dict]:
+def fetch_rss_feed(feed_url: str, source_name: str) -> Tuple[List[Dict], Optional[str]]:
+    """Fetch articles from RSS feed. Returns (articles, error)."""
     try:
         feed = feedparser.parse(feed_url)
+        
+        if feed.bozo and feed.bozo_exception:
+            return [], f"Parse error: {feed.bozo_exception}"
+        
         articles = []
         for entry in feed.entries[:20]:
             article = {
@@ -721,35 +1246,47 @@ def fetch_rss_feed(feed_url: str, source_name: str) -> List[Dict]:
                 "published": entry.get("published", ""),
                 "image_url": None,
             }
+            
             if hasattr(entry, "media_content") and entry.media_content:
                 article["image_url"] = entry.media_content[0].get("url")
             elif hasattr(entry, "media_thumbnail") and entry.media_thumbnail:
                 article["image_url"] = entry.media_thumbnail[0].get("url")
+            
             articles.append(article)
-        return articles
-    except Exception:
-        return []
+        
+        return articles, None
+        
+    except Exception as e:
+        return [], str(e)
 
 
-def call_gemini_api(prompt: str, max_tokens: int = 1000, temperature: float = 0.7) -> Optional[str]:
+def call_gemini_api(prompt: str, max_tokens: int = 1000, temperature: float = 0.7) -> Tuple[Optional[str], Optional[str]]:
+    """Call Gemini API. Returns (response_text, error)."""
     if not GOOGLE_GEMINI_API_KEY:
-        return None
+        return None, "GOOGLE_GEMINI_API_KEY not set"
+    
     try:
         url = f"{GEMINI_API_URL}?key={GOOGLE_GEMINI_API_KEY}"
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens}
         }
+        
         response = requests.post(url, json=payload, timeout=30)
+        
         if response.status_code == 200:
             data = response.json()
-            return data["candidates"][0]["content"]["parts"][0]["text"]
-        return None
-    except Exception:
-        return None
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
+            return text, None
+        else:
+            return None, f"API returned {response.status_code}: {response.text[:100]}"
+            
+    except Exception as e:
+        return None, str(e)
 
 
-def classify_article_with_gemini(article: Dict) -> Optional[Dict]:
+def classify_article_with_gemini(article: Dict) -> Tuple[Optional[Dict], Optional[str]]:
+    """Classify article using Gemini. Returns (classification, error)."""
     prompt = f"""Analyze this financial news article and respond with JSON only:
 
 Title: {article['title']}
@@ -766,67 +1303,99 @@ Return JSON with:
 
 Respond with valid JSON only."""
 
+    response_text, api_error = call_gemini_api(prompt, max_tokens=500, temperature=0.1)
+    
+    if api_error:
+        return None, api_error
+    
+    if not response_text:
+        return None, "Empty response"
+    
     try:
-        response_text = call_gemini_api(prompt, max_tokens=500, temperature=0.1)
-        if not response_text:
-            return None
-        response_text = response_text.strip()
-        if response_text.startswith("```json"):
-            response_text = response_text[7:]
-        if response_text.startswith("```"):
-            response_text = response_text[3:]
-        if response_text.endswith("```"):
-            response_text = response_text[:-3]
-        return json.loads(response_text.strip())
-    except Exception:
-        return None
+        # Clean up response
+        text = response_text.strip()
+        if text.startswith("```json"):
+            text = text[7:]
+        if text.startswith("```"):
+            text = text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        
+        return json.loads(text.strip()), None
+        
+    except json.JSONDecodeError as e:
+        return None, f"JSON parse error: {e}"
 
 
-def store_news_article(article: Dict, classification: Dict) -> bool:
+def store_news_article(article: Dict, classification: Dict) -> Tuple[bool, Optional[str]]:
+    """Store classified news article. Returns (success, error)."""
     try:
         data = {
             "title": article["title"],
-            "summary": classification["summary"],
+            "summary": classification.get("summary", article["summary"][:200]),
             "url": article["url"],
             "source": article["source"],
-            "published_at": article["published"],
+            "published_at": article.get("published"),
             "image_url": article.get("image_url"),
-            "event_type": classification["event_type"],
-            "impact_level": classification["impact_level"],
-            "affected_symbols": classification["affected_symbols"],
-            "sentiment": classification["sentiment"],
-            "keywords": classification["keywords"],
-            "is_breaking": classification["impact_level"] in ["critical", "high"]
+            "event_type": classification.get("event_type", "other"),
+            "impact_level": classification.get("impact_level", "low"),
+            "affected_symbols": classification.get("affected_symbols", []),
+            "sentiment": classification.get("sentiment", "neutral"),
+            "keywords": classification.get("keywords", []),
+            "is_breaking": classification.get("impact_level") in ["critical", "high"]
         }
+        
         sb.table("financial_news").insert(data).execute()
-        return True
-    except Exception:
-        return False
+        return True, None
+        
+    except Exception as e:
+        return False, str(e)
 
 
 def get_news_scan_interval() -> Tuple[int, str]:
+    """Get appropriate scan interval based on time."""
     now = datetime.now(timezone.utc)
     if now.weekday() >= 5:
-        return 7200, "weekend"
+        return NEWS_SCAN_INTERVAL_WEEKEND, "weekend"
     if 8 <= now.hour < 21:
-        return 600, "active"
-    return 1800, "quiet"
+        return NEWS_SCAN_INTERVAL_ACTIVE, "active"
+    return NEWS_SCAN_INTERVAL_QUIET, "quiet"
 
 
 async def financial_news_task():
-    log.info("Financial news scraper started")
+    """Task 3: Fetch and classify financial news."""
+    task_metrics = metrics.get_or_create(NEWS_TASK)
+    
+    info(NEWS_TASK, f"Financial news task started ({len(RSS_FEEDS)} feeds)")
+    
     while not tick_streamer._shutdown.is_set():
         try:
             interval, session_name = get_news_scan_interval()
-            log.info(f"Starting news scan ({session_name} session)")
+            info(NEWS_TASK, f"Starting news scan ({session_name} session)")
             
+            # Fetch from all feeds
             all_articles = []
+            feed_stats = {}
+            
             loop = asyncio.get_event_loop()
             for feed in RSS_FEEDS:
-                articles = await loop.run_in_executor(None, fetch_rss_feed, feed["url"], feed["name"])
-                all_articles.extend(articles)
+                articles, feed_error = await loop.run_in_executor(
+                    None, fetch_rss_feed, feed["url"], feed["name"]
+                )
+                
+                feed_stats[feed["name"]] = {
+                    "count": len(articles),
+                    "error": feed_error
+                }
+                
+                if articles:
+                    all_articles.extend(articles)
+                elif feed_error:
+                    debug(NEWS_TASK, f"  {feed['name']}: ERROR - {feed_error}")
+                
                 await asyncio.sleep(0.3)
             
+            # Deduplicate by URL
             seen_urls = set()
             unique_articles = []
             for article in all_articles:
@@ -834,24 +1403,65 @@ async def financial_news_task():
                     seen_urls.add(article["url"])
                     unique_articles.append(article)
             
-            filtered_articles = [a for a in unique_articles if should_prefilter_article(a["title"], a.get("summary", ""))]
-            filtered_articles = optimize_articles_for_cost(filtered_articles)
+            # Filter by keywords
+            filtered_articles = [
+                a for a in unique_articles 
+                if should_prefilter_article(a["title"], a.get("summary", ""))
+            ]
             
+            debug(NEWS_TASK, f"Articles: {len(all_articles)} total -> {len(unique_articles)} unique -> {len(filtered_articles)} filtered")
+            
+            # Classify and store
             stored_count = 0
-            for article in filtered_articles:
-                classification = await loop.run_in_executor(None, classify_article_with_gemini, article)
+            classify_errors = 0
+            store_errors = 0
+            
+            for article in filtered_articles[:20]:  # Limit to avoid API costs
+                classification, classify_error = await loop.run_in_executor(
+                    None, classify_article_with_gemini, article
+                )
+                
+                if classify_error:
+                    classify_errors += 1
+                    debug(NEWS_TASK, f"  Classify error: {classify_error[:50]}")
+                    continue
+                
                 if not classification:
                     continue
-                if not classification.get("is_important") or classification.get("impact_level") not in ["critical", "high"]:
+                
+                # Only store high-impact news
+                if not classification.get("is_important"):
                     continue
-                if await loop.run_in_executor(None, store_news_article, article, classification):
+                if classification.get("impact_level") not in ["critical", "high"]:
+                    continue
+                
+                success, store_error = await loop.run_in_executor(
+                    None, store_news_article, article, classification
+                )
+                
+                if success:
                     stored_count += 1
-                await asyncio.sleep(1)
+                else:
+                    store_errors += 1
+                    debug(NEWS_TASK, f"  Store error: {store_error[:50]}")
+                
+                await asyncio.sleep(1)  # Rate limit
             
-            log.info(f"News cycle complete: {stored_count} stored")
+            info(NEWS_TASK, f"News cycle complete: {stored_count} stored, {classify_errors} classify errors, {store_errors} store errors")
+            
+            task_metrics.record_success()
+            task_metrics.custom_metrics.update({
+                "last_articles_fetched": len(all_articles),
+                "last_articles_filtered": len(filtered_articles),
+                "last_stored": stored_count,
+                "session": session_name,
+            })
+            
             await asyncio.sleep(interval)
+            
         except Exception as e:
-            log.error(f"Financial news task error: {e}")
+            error(NEWS_TASK, f"Task error: {e}", exc_info=DEBUG_MODE)
+            task_metrics.record_error(str(e))
             await asyncio.sleep(60)
 
 
@@ -859,51 +1469,92 @@ async def financial_news_task():
 #                    TASK 4: GAP FILL SERVICE
 # ============================================================================
 
+GAP_TASK = "GAP_FILL"
+
 PRIORITY_SYMBOLS = ["BTC/USD", "ETH/USD", "EUR/USD", "GBP/USD", "USD/JPY", "XAU/USD", "AAPL", "MSFT", "SPY", "QQQ"]
 
 
 def symbol_to_table(symbol: str) -> str:
+    """Convert symbol to table name."""
     return f"candles_{symbol.lower().replace('/', '_')}"
 
 
-def detect_gaps(symbol: str, lookback_hours: int = MAX_GAP_HOURS) -> List[Tuple]:
+def detect_gaps(symbol: str, lookback_hours: int = MAX_GAP_HOURS) -> Tuple[List[Tuple], Optional[str]]:
+    """Detect gaps in candle data. Returns (gaps, error)."""
     table_name = symbol_to_table(symbol)
+    
     try:
         since = (datetime.now(timezone.utc) - timedelta(hours=lookback_hours)).isoformat()
-        result = sb.table(table_name).select("timestamp").gte("timestamp", since).order("timestamp", desc=False).execute()
+        
+        result = sb.table(table_name).select("timestamp").gte(
+            "timestamp", since
+        ).order("timestamp", desc=False).execute()
+        
         if not result.data or len(result.data) < 2:
-            return []
+            return [], None
+        
         gaps = []
-        timestamps = [datetime.fromisoformat(r["timestamp"].replace("Z", "+00:00")) for r in result.data]
+        timestamps = [
+            datetime.fromisoformat(r["timestamp"].replace("Z", "+00:00")) 
+            for r in result.data
+        ]
+        
         for i in range(1, len(timestamps)):
             gap_minutes = (timestamps[i] - timestamps[i-1]).total_seconds() / 60
             if gap_minutes > MIN_GAP_MINUTES:
-                gaps.append((timestamps[i-1] + timedelta(minutes=1), timestamps[i] - timedelta(minutes=1)))
-        return gaps
-    except Exception:
-        return []
+                gaps.append((
+                    timestamps[i-1] + timedelta(minutes=1),
+                    timestamps[i] - timedelta(minutes=1)
+                ))
+        
+        return gaps, None
+        
+    except Exception as e:
+        return [], str(e)
 
 
 async def gap_fill_task():
-    log.info("Gap fill service started")
+    """Task 4: Detect and report gaps in candle data."""
+    task_metrics = metrics.get_or_create(GAP_TASK)
+    
+    info(GAP_TASK, f"Gap fill service started ({len(PRIORITY_SYMBOLS)} priority symbols)")
+    
     while not tick_streamer._shutdown.is_set():
         try:
             total_gaps = 0
+            symbols_with_gaps = []
+            
             for symbol in PRIORITY_SYMBOLS:
-                gaps = detect_gaps(symbol)
-                if gaps:
-                    log.info(f"{symbol}: {len(gaps)} gaps detected")
+                gaps, gap_error = detect_gaps(symbol)
+                
+                if gap_error:
+                    debug(GAP_TASK, f"  {symbol}: Error - {gap_error}")
+                elif gaps:
                     total_gaps += len(gaps)
-            log.info(f"Gap scan complete: {total_gaps} total gaps")
+                    symbols_with_gaps.append(f"{symbol}({len(gaps)})")
+                    debug(GAP_TASK, f"  {symbol}: {len(gaps)} gaps detected")
+            
+            if symbols_with_gaps:
+                info(GAP_TASK, f"Gap scan: {total_gaps} gaps in {', '.join(symbols_with_gaps)}")
+            else:
+                info(GAP_TASK, "Gap scan: No gaps detected")
+            
+            task_metrics.record_success()
+            task_metrics.custom_metrics["total_gaps"] = total_gaps
+            
             await asyncio.sleep(GAP_SCAN_INTERVAL)
+            
         except Exception as e:
-            log.error(f"Gap fill error: {e}")
+            error(GAP_TASK, f"Task error: {e}", exc_info=DEBUG_MODE)
+            task_metrics.record_error(str(e))
             await asyncio.sleep(60)
 
 
 # ============================================================================
-#                    TASK 5: BOND YIELDS (G20)
+#                    TASK 5: BOND YIELDS
 # ============================================================================
+
+BOND_TASK = "BOND_YIELDS"
 
 G20_BONDS = [
     {"country": "US", "name": "United States", "url": "https://www.investing.com/rates-bonds/u.s.-10-year-bond-yield"},
@@ -921,130 +1572,206 @@ G20_BONDS = [
 ]
 
 
-def scrape_bond_yield(url: str) -> Optional[float]:
+def scrape_bond_yield(url: str) -> Tuple[Optional[float], Optional[str]]:
+    """Scrape bond yield from Investing.com. Returns (yield, error)."""
     try:
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         response = requests.get(url, headers=headers, timeout=15)
+        
         if response.status_code != 200:
-            return None
+            return None, f"HTTP {response.status_code}"
+        
         soup = BeautifulSoup(response.text, "html.parser")
         price_elem = soup.find("span", {"data-test": "instrument-price-last"})
+        
         if price_elem:
-            return float(price_elem.text.strip().replace(",", ""))
-        return None
-    except Exception:
-        return None
+            yield_val = float(price_elem.text.strip().replace(",", ""))
+            return yield_val, None
+        
+        return None, "Price element not found"
+        
+    except Exception as e:
+        return None, str(e)
 
 
-def scrape_all_bond_yields() -> List[Dict]:
-    results = []
-    for bond in G20_BONDS:
-        yield_10y = scrape_bond_yield(bond["url"])
-        results.append({
-            "country": bond["country"],
-            "country_name": bond["name"],
-            "yield_10y": yield_10y,
-            "yield_2y": None,
-            "spread_10y_2y": None,
-            "scraped_at": datetime.now(timezone.utc).isoformat(),
-        })
-        time.sleep(1)
-    return results
-
-
-def store_bond_yields(yields: List[Dict]) -> int:
-    stored = 0
-    for y in yields:
-        try:
-            sb.table("sovereign_yields").upsert(y, on_conflict="country").execute()
-            stored += 1
-        except Exception:
-            pass
-    return stored
+def store_bond_yield(data: Dict) -> Tuple[bool, Optional[str]]:
+    """Store bond yield data. Returns (success, error)."""
+    try:
+        # Try insert first, then update if exists
+        sb.table("sovereign_yields").insert(data).execute()
+        return True, None
+    except Exception as e:
+        error_str = str(e).lower()
+        if "duplicate" in error_str or "unique" in error_str or "conflict" in error_str:
+            # Try update instead
+            try:
+                sb.table("sovereign_yields").update({
+                    "yield_10y": data["yield_10y"],
+                    "scraped_at": data["scraped_at"],
+                }).eq("country", data["country"]).execute()
+                return True, None
+            except Exception as e2:
+                return False, str(e2)
+        return False, str(e)
 
 
 async def bond_yield_task():
-    log.info("Bond yield scraper started")
+    """Task 5: Scrape and store G20 bond yields."""
+    task_metrics = metrics.get_or_create(BOND_TASK)
+    
+    info(BOND_TASK, f"Bond yield scraper started ({len(G20_BONDS)} countries)")
+    
     while not tick_streamer._shutdown.is_set():
         try:
-            log.info("Scraping G20 bond yields...")
+            info(BOND_TASK, "Scraping G20 bond yields...")
+            
+            success_count = 0
+            error_count = 0
+            results = []
+            
             loop = asyncio.get_event_loop()
-            yields = await loop.run_in_executor(None, scrape_all_bond_yields)
-            if yields:
-                has_10y = sum(1 for y in yields if y["yield_10y"])
-                await loop.run_in_executor(None, store_bond_yields, yields)
-                log.info(f"Bond scrape complete: {has_10y}/{len(G20_BONDS)} countries")
+            
+            for bond in G20_BONDS:
+                yield_val, scrape_error = await loop.run_in_executor(
+                    None, scrape_bond_yield, bond["url"]
+                )
+                
+                if scrape_error:
+                    debug(BOND_TASK, f"  {bond['country']}: Scrape error - {scrape_error}")
+                    error_count += 1
+                    continue
+                
+                data = {
+                    "country": bond["country"],
+                    "country_name": bond["name"],
+                    "yield_10y": yield_val,
+                    "yield_2y": None,
+                    "spread_10y_2y": None,
+                    "scraped_at": datetime.now(timezone.utc).isoformat(),
+                }
+                
+                stored, store_error = store_bond_yield(data)
+                
+                if stored:
+                    success_count += 1
+                    results.append(f"{bond['country']}:{yield_val:.2f}%")
+                else:
+                    debug(BOND_TASK, f"  {bond['country']}: Store error - {store_error}")
+                    error_count += 1
+                
+                await asyncio.sleep(1)  # Rate limit scraping
+            
+            info(BOND_TASK, f"Bond scrape complete: {success_count}/{len(G20_BONDS)} countries")
+            if DEBUG_MODE and results:
+                debug(BOND_TASK, f"  Yields: {', '.join(results[:6])}")
+            
+            if success_count > 0:
+                task_metrics.record_success()
+            else:
+                task_metrics.record_error("No yields scraped")
+            
+            task_metrics.custom_metrics.update({
+                "last_success_count": success_count,
+                "last_error_count": error_count,
+            })
+            
             await asyncio.sleep(BOND_SCRAPE_INTERVAL)
+            
         except Exception as e:
-            log.error(f"Bond yield task error: {e}")
+            error(BOND_TASK, f"Task error: {e}", exc_info=DEBUG_MODE)
+            task_metrics.record_error(str(e))
             await asyncio.sleep(300)
 
 
 # ============================================================================
-#                    TASK 6: WHALE FLOW TRACKER (Simplified)
+#                    TASK 6: WHALE FLOW TRACKER
 # ============================================================================
 
+WHALE_TASK = "WHALE_FLOW"
+
+
 class WhaleFlowTracker:
+    """Track large BTC transactions via Blockchain.com WebSocket."""
+    
     def __init__(self):
         self._shutdown = asyncio.Event()
         self._btc_price = 50000.0
         self._tx_count = 0
         self._whale_count = 0
+        self._metrics = metrics.get_or_create(WHALE_TASK)
     
     def shutdown(self):
         self._shutdown.set()
     
     async def _fetch_btc_price(self):
+        """Fetch current BTC price."""
         try:
             url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
             response = requests.get(url, timeout=10)
             if response.status_code == 200:
                 self._btc_price = response.json()["bitcoin"]["usd"]
-        except Exception:
-            pass
+                debug(WHALE_TASK, f"BTC price updated: ${self._btc_price:,.0f}")
+        except Exception as e:
+            debug(WHALE_TASK, f"BTC price fetch error: {e}")
     
     async def run(self):
-        log.info("Whale Flow Tracker started")
+        """Main whale tracking loop."""
+        info(WHALE_TASK, "Whale Flow Tracker started")
+        
         await self._fetch_btc_price()
+        
         url = "wss://ws.blockchain.info/inv"
         backoff = 1
         
         while not self._shutdown.is_set():
             try:
+                debug(WHALE_TASK, "Connecting to Blockchain.com WebSocket...")
+                
                 async with websockets.connect(url, ping_interval=30) as ws:
                     await ws.send(json.dumps({"op": "unconfirmed_sub"}))
-                    log.info("Subscribed to BTC unconfirmed transactions")
+                    info(WHALE_TASK, "Subscribed to BTC unconfirmed transactions")
                     backoff = 1
                     
                     async for message in ws:
                         if self._shutdown.is_set():
                             break
+                        
                         try:
                             data = json.loads(message)
+                            
                             if data.get("op") == "utx":
                                 self._tx_count += 1
                                 tx = data.get("x", {})
                                 outputs = tx.get("out", [])
                                 total_btc = sum(o.get("value", 0) for o in outputs) / 1e8
                                 total_usd = total_btc * self._btc_price
+                                
                                 if total_usd >= 500000:
                                     self._whale_count += 1
-                                    log.info(f"WHALE: {total_btc:.2f} BTC (${total_usd:,.0f})")
-                        except Exception:
-                            pass
+                                    info(WHALE_TASK, f"WHALE: {total_btc:.2f} BTC (${total_usd:,.0f})")
+                                    self._metrics.record_success()
+                                    
+                        except Exception as e:
+                            debug(WHALE_TASK, f"Message parse error: {e}")
+                            
             except Exception as e:
-                log.warning(f"Whale tracker error: {e}")
+                warning(WHALE_TASK, f"WebSocket error: {e}")
+                self._metrics.record_error(str(e))
             
             if self._shutdown.is_set():
                 break
+            
             await asyncio.sleep(backoff)
             backoff = min(30, backoff * 2)
+        
+        info(WHALE_TASK, f"Whale tracker stopped. Total: {self._tx_count} txs, {self._whale_count} whales")
 
 
 whale_tracker = WhaleFlowTracker()
 
 
 async def whale_flow_task():
+    """Task 6: Track whale BTC movements."""
     await whale_tracker.run()
 
 
@@ -1052,18 +1779,31 @@ async def whale_flow_task():
 #                    TASK 7: AI NEWS DESK (Placeholder)
 # ============================================================================
 
+AI_NEWS_TASK = "AI_NEWS_DESK"
+
+
 async def ai_news_desk_task():
-    log.info("AI News Desk started (placeholder)")
+    """Task 7: AI news synthesis (placeholder)."""
+    task_metrics = metrics.get_or_create(AI_NEWS_TASK)
+    
+    info(AI_NEWS_TASK, "AI News Desk started (placeholder)")
+    
     while not tick_streamer._shutdown.is_set():
         try:
             now = datetime.now(timezone.utc)
+            
             if now.weekday() >= 5:
                 await asyncio.sleep(14400)
                 continue
+            
             interval = 1800 if 8 <= now.hour < 21 else 3600
+            task_metrics.record_success()
+            
             await asyncio.sleep(interval)
+            
         except Exception as e:
-            log.error(f"AI News Desk error: {e}")
+            error(AI_NEWS_TASK, f"Task error: {e}", exc_info=DEBUG_MODE)
+            task_metrics.record_error(str(e))
             await asyncio.sleep(300)
 
 
@@ -1071,261 +1811,180 @@ async def ai_news_desk_task():
 #                    TASK 8: G20 MACRO FETCHER
 # ============================================================================
 
+MACRO_TASK = "MACRO_FETCHER"
+
 G20_MACRO_COUNTRIES = {
-    "US": {"name": "United States", "currency": "USD", "econ_code": "US"},
-    "UK": {"name": "United Kingdom", "currency": "GBP", "econ_code": "UK"},
-    "DE": {"name": "Germany", "currency": "EUR", "econ_code": "DE"},
-    "FR": {"name": "France", "currency": "EUR", "econ_code": "FR"},
-    "IT": {"name": "Italy", "currency": "EUR", "econ_code": "IT"},
-    "JP": {"name": "Japan", "currency": "JPY", "econ_code": "JP"},
-    "CN": {"name": "China", "currency": "CNY", "econ_code": "CN"},
-    "IN": {"name": "India", "currency": "INR", "econ_code": "IN"},
-    "BR": {"name": "Brazil", "currency": "BRL", "econ_code": "BR"},
-    "RU": {"name": "Russia", "currency": "RUB", "econ_code": "RU"},
-    "CA": {"name": "Canada", "currency": "CAD", "econ_code": "CA"},
-    "AU": {"name": "Australia", "currency": "AUD", "econ_code": "AU"},
-    "MX": {"name": "Mexico", "currency": "MXN", "econ_code": "MX"},
-    "KR": {"name": "South Korea", "currency": "KRW", "econ_code": "KR"},
-    "ID": {"name": "Indonesia", "currency": "IDR", "econ_code": "ID"},
-    "TR": {"name": "Turkey", "currency": "TRY", "econ_code": "TR"},
-    "SA": {"name": "Saudi Arabia", "currency": "SAR", "econ_code": "SA"},
-    "ZA": {"name": "South Africa", "currency": "ZAR", "econ_code": "ZA"},
-    "AR": {"name": "Argentina", "currency": "ARS", "econ_code": "AR"},
-    "EU": {"name": "European Union", "currency": "EUR", "econ_code": "EU"},
+    "US": {"name": "United States", "currency": "USD"},
+    "UK": {"name": "United Kingdom", "currency": "GBP"},
+    "DE": {"name": "Germany", "currency": "EUR"},
+    "FR": {"name": "France", "currency": "EUR"},
+    "IT": {"name": "Italy", "currency": "EUR"},
+    "JP": {"name": "Japan", "currency": "JPY"},
+    "CN": {"name": "China", "currency": "CNY"},
+    "IN": {"name": "India", "currency": "INR"},
+    "BR": {"name": "Brazil", "currency": "BRL"},
+    "RU": {"name": "Russia", "currency": "RUB"},
+    "CA": {"name": "Canada", "currency": "CAD"},
+    "AU": {"name": "Australia", "currency": "AUD"},
+    "MX": {"name": "Mexico", "currency": "MXN"},
+    "KR": {"name": "South Korea", "currency": "KRW"},
+    "ID": {"name": "Indonesia", "currency": "IDR"},
+    "TR": {"name": "Turkey", "currency": "TRY"},
+    "SA": {"name": "Saudi Arabia", "currency": "SAR"},
+    "ZA": {"name": "South Africa", "currency": "ZAR"},
+    "AR": {"name": "Argentina", "currency": "ARS"},
+    "EU": {"name": "European Union", "currency": "EUR"},
 }
 
 MACRO_INDICATORS = {
-    "CPI YoY": {"patterns": [("Inflation Rate", "yoy"), ("Inflation Rate", None), ("CPI", None), ("Consumer Price Index", "yoy")]},
-    "Core CPI YoY": {"patterns": [("Core Inflation Rate", "yoy"), ("Core Inflation Rate", None), ("Core CPI", "yoy")]},
-    "Consumer Confidence": {"patterns": [("Consumer Confidence", None), ("CB Consumer Confidence", None), ("Michigan Consumer Sentiment", None)]},
-    "PCE YoY": {"patterns": [("PCE Price Index", "yoy"), ("PCE Price Index", None), ("Core PCE Price Index", "yoy")]},
-    "GDP QoQ": {"patterns": [("GDP Growth Rate", "qoq"), ("Gross Domestic Product", "qoq"), ("GDP", "qoq")]},
-    "GDP YoY": {"patterns": [("GDP Growth Rate", "yoy"), ("Gross Domestic Product", "yoy"), ("GDP", "yoy")]},
-    "Manufacturing PMI": {"patterns": [("ISM Manufacturing PMI", None), ("S&P Global Manufacturing PMI", None), ("Manufacturing PMI", None)]},
-    "Services PMI": {"patterns": [("ISM Services PMI", None), ("ISM Non-Manufacturing PMI", None), ("S&P Global Services PMI", None), ("Services PMI", None)]},
-    "Composite PMI": {"patterns": [("S&P Global Composite PMI", None), ("Composite PMI", None)]},
-    "Employment": {"patterns": [("Non Farm Payrolls", None), ("Employment Change", None)]},
-    "Unemployment": {"patterns": [("Unemployment Rate", None), ("Jobless Rate", None)]},
-    "Jobless Claims": {"patterns": [("Initial Jobless Claims", None), ("Continuing Jobless Claims", None)]},
-    "PPI MoM": {"patterns": [("Producer Price Index", "mom"), ("Producer Price Index", None), ("PPI", "mom")]},
-    "Retail Sales MoM": {"patterns": [("Retail Sales", "mom"), ("Retail Sales", None)]},
-    "Interest Rate": {"patterns": [("Interest Rate Decision", None), ("Fed Interest Rate Decision", None), ("ECB Interest Rate Decision", None)]},
-    "Trade Balance": {"patterns": [("Balance of Trade", None), ("Trade Balance", None)]},
+    "CPI YoY": ["Inflation Rate", "CPI", "Consumer Price Index"],
+    "GDP QoQ": ["GDP Growth Rate", "Gross Domestic Product"],
+    "Unemployment": ["Unemployment Rate", "Jobless Rate"],
+    "Interest Rate": ["Interest Rate Decision"],
+    "Manufacturing PMI": ["ISM Manufacturing PMI", "Manufacturing PMI"],
+    "Retail Sales MoM": ["Retail Sales"],
 }
 
 
-def classify_macro_event(event_type: str, comparison: str = None) -> Optional[str]:
-    event_lower = event_type.lower().strip()
-    comp_lower = comparison.lower().strip() if comparison else None
-    for indicator_name, config in MACRO_INDICATORS.items():
-        for pattern_name, pattern_comp in config["patterns"]:
-            if pattern_name.lower() in event_lower or event_lower in pattern_name.lower():
-                if pattern_comp is None or comp_lower == pattern_comp:
-                    return indicator_name
-    return None
-
-
-def parse_float_safe(value: Any) -> Optional[float]:
-    if value in [None, "", "null", "N/A", "-"]:
-        return None
-    try:
-        return float(value)
-    except (ValueError, TypeError):
-        return None
-
-
-def calculate_surprise(actual: float, estimate: float) -> Tuple[Optional[float], Optional[str]]:
-    if actual is None or estimate is None or estimate == 0:
-        return None, None
-    surprise = ((actual - estimate) / abs(estimate)) * 100
-    if abs(surprise) < 1:
-        direction = "inline"
-    elif surprise > 0:
-        direction = "beat"
-    else:
-        direction = "miss"
-    return round(surprise, 2), direction
-
-
-def fetch_country_macro_events(country_code: str) -> List[Dict]:
-    country_info = G20_MACRO_COUNTRIES.get(country_code, {})
-    econ_code = country_info.get("econ_code", country_code)
+def fetch_country_macro_events(country_code: str) -> Tuple[List[Dict], Optional[str]]:
+    """Fetch macro events for a country. Returns (events, error)."""
     from_date = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
     to_date = (datetime.now() + timedelta(days=60)).strftime("%Y-%m-%d")
+    
     url = "https://eodhd.com/api/economic-events"
-    params = {"api_token": EODHD_API_KEY, "country": econ_code, "from": from_date, "to": to_date, "limit": 1000, "fmt": "json"}
+    params = {
+        "api_token": EODHD_API_KEY,
+        "country": country_code,
+        "from": from_date,
+        "to": to_date,
+        "limit": 500,
+        "fmt": "json"
+    }
+    
     try:
         response = requests.get(url, params=params, timeout=30)
         if response.status_code == 200:
-            return response.json()
-        return []
-    except Exception:
-        return []
-
-
-def process_country_indicators(country_code: str, events: List[Dict]) -> Dict[str, Dict]:
-    country_info = G20_MACRO_COUNTRIES.get(country_code, {})
-    indicators_data = {}
-    for event in events:
-        event_type = event.get("type", "")
-        comparison = event.get("comparison", "")
-        indicator = classify_macro_event(event_type, comparison)
-        if not indicator:
-            continue
-        actual = parse_float_safe(event.get("actual"))
-        estimate = parse_float_safe(event.get("estimate"))
-        previous = parse_float_safe(event.get("previous"))
-        change = parse_float_safe(event.get("change"))
-        change_pct = parse_float_safe(event.get("change_percentage"))
-        if actual is None and previous is None:
-            continue
-        event_date = event.get("date", "")
-        period = event.get("period", "")
-        surprise, surprise_dir = calculate_surprise(actual, estimate)
-        current = indicators_data.get(indicator)
-        if current is None or (actual is not None and event_date > current.get("event_date", "")):
-            indicators_data[indicator] = {
-                "country_code": country_code,
-                "country_name": country_info.get("name", country_code),
-                "currency": country_info.get("currency"),
-                "indicator": indicator,
-                "event_type": event_type,
-                "comparison": comparison,
-                "actual": actual,
-                "previous": previous,
-                "estimate": estimate,
-                "change": change,
-                "change_pct": change_pct,
-                "surprise": surprise,
-                "surprise_direction": surprise_dir,
-                "period": period,
-                "event_date": event_date,
-            }
-    return indicators_data
-
-
-def upsert_macro_indicator(data: Dict) -> bool:
-    try:
-        existing = sb.table("macro_indicators").select("actual, previous, estimate, event_date").eq(
-            "country_code", data["country_code"]
-        ).eq("indicator", data["indicator"]).execute()
-        if existing.data:
-            row = existing.data[0]
-            if (row["actual"] == data["actual"] and row["previous"] == data["previous"] and 
-                row["estimate"] == data["estimate"] and row["event_date"] == data["event_date"]):
-                return False
-        sb.table("macro_indicators").upsert({
-            "country_code": data["country_code"],
-            "country_name": data["country_name"],
-            "currency": data["currency"],
-            "indicator": data["indicator"],
-            "event_type": data["event_type"],
-            "comparison": data["comparison"],
-            "actual": data["actual"],
-            "previous": data["previous"],
-            "estimate": data["estimate"],
-            "change": data["change"],
-            "change_pct": data["change_pct"],
-            "surprise": data["surprise"],
-            "surprise_direction": data["surprise_direction"],
-            "period": data["period"],
-            "event_date": data["event_date"],
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }, on_conflict="country_code,indicator").execute()
-        return True
+            return response.json(), None
+        return [], f"HTTP {response.status_code}"
     except Exception as e:
-        log.error(f"Error upserting macro indicator: {e}")
-        return False
+        return [], str(e)
 
 
-def run_macro_fetch_cycle():
-    log.info("Starting G20 macro fetch cycle (16 indicators x 20 countries)")
-    total_indicators = 0
-    updated_count = 0
-    countries_processed = 0
-    for country_code in G20_MACRO_COUNTRIES.keys():
-        try:
-            events = fetch_country_macro_events(country_code)
-            if not events:
-                continue
-            indicators = process_country_indicators(country_code, events)
-            country_updates = 0
-            for indicator_name, data in indicators.items():
-                if upsert_macro_indicator(data):
-                    updated_count += 1
-                    country_updates += 1
-                total_indicators += 1
-            countries_processed += 1
-            if country_updates > 0:
-                log.info(f"  {country_code}: {len(indicators)} indicators, {country_updates} updated")
-            time.sleep(0.2)
-        except Exception as e:
-            log.error(f"  {country_code}: Error - {e}")
-    log.info(f"Macro cycle complete: {countries_processed}/{len(G20_MACRO_COUNTRIES)} countries, {total_indicators} indicators, {updated_count} updated")
-    return updated_count
+def upsert_macro_indicator(data: Dict) -> Tuple[bool, Optional[str]]:
+    """Upsert macro indicator. Returns (success, error)."""
+    try:
+        sb.table("macro_indicators").upsert(
+            data,
+            on_conflict="country_code,indicator"
+        ).execute()
+        return True, None
+    except Exception as e:
+        return False, str(e)
 
 
 async def macro_fetcher_task():
-    log.info("G20 Macro Fetcher started (hourly, upsert-only)")
-    await asyncio.sleep(30)
+    """Task 8: Fetch G20 macro indicators."""
+    task_metrics = metrics.get_or_create(MACRO_TASK)
+    
+    info(MACRO_TASK, f"G20 Macro Fetcher started ({len(G20_MACRO_COUNTRIES)} countries)")
+    await asyncio.sleep(30)  # Stagger startup
+    
     while not tick_streamer._shutdown.is_set():
         try:
+            info(MACRO_TASK, "Starting macro fetch cycle...")
+            
+            total_updated = 0
+            total_errors = 0
+            
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, run_macro_fetch_cycle)
-            log.info(f"Next macro fetch in {MACRO_FETCH_INTERVAL // 60} minutes")
+            
+            for country_code, country_info in G20_MACRO_COUNTRIES.items():
+                events, fetch_error = await loop.run_in_executor(
+                    None, fetch_country_macro_events, country_code
+                )
+                
+                if fetch_error:
+                    debug(MACRO_TASK, f"  {country_code}: Fetch error - {fetch_error}")
+                    total_errors += 1
+                    continue
+                
+                if not events:
+                    continue
+                
+                # Process most recent events for each indicator type
+                for indicator_name, keywords in MACRO_INDICATORS.items():
+                    for event in events:
+                        event_type = event.get("type", "").lower()
+                        
+                        if any(kw.lower() in event_type for kw in keywords):
+                            actual = event.get("actual")
+                            if actual is None:
+                                continue
+                            
+                            data = {
+                                "country_code": country_code,
+                                "country_name": country_info["name"],
+                                "currency": country_info["currency"],
+                                "indicator": indicator_name,
+                                "event_type": event.get("type"),
+                                "actual": float(actual) if actual else None,
+                                "previous": float(event.get("previous")) if event.get("previous") else None,
+                                "estimate": float(event.get("estimate")) if event.get("estimate") else None,
+                                "event_date": event.get("date", "").split(" ")[0],
+                                "updated_at": datetime.now(timezone.utc).isoformat(),
+                            }
+                            
+                            success, upsert_error = upsert_macro_indicator(data)
+                            if success:
+                                total_updated += 1
+                            else:
+                                total_errors += 1
+                            break
+                
+                await asyncio.sleep(0.2)  # Rate limit
+            
+            info(MACRO_TASK, f"Macro cycle complete: {total_updated} updated, {total_errors} errors")
+            
+            task_metrics.record_success()
+            task_metrics.custom_metrics.update({
+                "last_updated": total_updated,
+                "last_errors": total_errors,
+            })
+            
             await asyncio.sleep(MACRO_FETCH_INTERVAL)
+            
         except Exception as e:
-            log.error(f"Macro fetcher task error: {e}")
+            error(MACRO_TASK, f"Task error: {e}", exc_info=DEBUG_MODE)
+            task_metrics.record_error(str(e))
             await asyncio.sleep(300)
 
 
 # ============================================================================
-#                       TASK 9: INDEX POLLER (REST API) - FIXED
-# ============================================================================
-# FIX: Track minute-level OHLC since EODHD real-time API returns DAILY values!
-# The API's "high", "low", "open" are the DAY's values, not minute values.
-# This caused all candles to have identical open/high/low (the static candle bug).
+#                    TASK 9: INDEX POLLER
 # ============================================================================
 
-# Index symbols: EODHD API symbol -> (display_symbol, candle_table)
-INDEX_SYMBOLS = {
-    "GSPC.INDX": ("SPX", "candles_spx"),
-    "DJI.INDX": ("US30", "candles_us30"),
-    "IXIC.INDX": ("NASDAQ", "candles_nasdaq"),
-    "NDX.INDX": ("NAS100", "candles_nas100"),
-    "RUT.INDX": ("RUT", "candles_rut"),
-    "FTSE.INDX": ("UK100", "candles_uk100"),
-    "GDAXI.INDX": ("DAX", "candles_dax"),
-    "FCHI.INDX": ("CAC40", "candles_cac40"),
-    "N225.INDX": ("NIKKEI", "candles_nikkei"),
-    "HSI.INDX": ("HSI", "candles_hsi"),
-    "STOXX50E.INDX": ("STOXX50", "candles_stoxx50"),
-}
+INDEX_TASK = "INDEX_POLLER"
 
-# Track minute-level OHLC in memory: {symbol: {minute_ts: {open, high, low, close}}}
+# Track minute-level OHLC in memory
 _index_minute_ohlc: Dict[str, Dict[str, Dict[str, float]]] = {}
 _index_ohlc_lock = threading.Lock()
 
 
 def update_minute_ohlc(symbol: str, minute_ts: str, price: float) -> Dict[str, float]:
-    """
-    Track minute-level OHLC since EODHD API only provides daily values.
-    Returns the current minute's OHLC for the symbol.
-    """
+    """Track minute-level OHLC since API only provides daily values."""
     with _index_ohlc_lock:
         if symbol not in _index_minute_ohlc:
             _index_minute_ohlc[symbol] = {}
         
         candles = _index_minute_ohlc[symbol]
         
-        # Cleanup: keep only last 5 minutes to prevent memory growth
+        # Cleanup old minutes
         if len(candles) > 10:
             sorted_minutes = sorted(candles.keys())
             for old_minute in sorted_minutes[:-5]:
                 del candles[old_minute]
         
         if minute_ts not in candles:
-            # First tick of this minute - price becomes OHLC
             candles[minute_ts] = {
                 "open": price,
                 "high": price,
@@ -1333,7 +1992,6 @@ def update_minute_ohlc(symbol: str, minute_ts: str, price: float) -> Dict[str, f
                 "close": price
             }
         else:
-            # Update existing minute candle
             c = candles[minute_ts]
             c["high"] = max(c["high"], price)
             c["low"] = min(c["low"], price)
@@ -1342,72 +2000,84 @@ def update_minute_ohlc(symbol: str, minute_ts: str, price: float) -> Dict[str, f
         return candles[minute_ts].copy()
 
 
-def fetch_index_realtime(eodhd_symbol: str) -> Optional[Dict]:
-    """Fetch real-time quote for a single index."""
+def fetch_index_realtime(eodhd_symbol: str) -> Tuple[Optional[Dict], Optional[str]]:
+    """Fetch real-time index quote. Returns (data, error)."""
     url = f"https://eodhd.com/api/real-time/{eodhd_symbol}"
     params = {"api_token": EODHD_API_KEY, "fmt": "json"}
+    
     try:
-        r = requests.get(url, params=params, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
+        response = requests.get(url, params=params, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
             if data and data.get("close") and data.get("close") != "NA":
-                return data
+                return data, None
+            return None, "Invalid data"
+        return None, f"HTTP {response.status_code}"
+        
     except Exception as e:
-        log.warning(f"Index fetch error {eodhd_symbol}: {e}")
-    return None
+        return None, str(e)
 
 
-def fetch_all_indices_parallel() -> Dict[str, Dict]:
-    """Fetch all indices in parallel using ThreadPoolExecutor."""
+def fetch_all_indices_parallel() -> Dict[str, Tuple[Optional[Dict], Optional[str]]]:
+    """Fetch all indices in parallel."""
     results = {}
+    
     with ThreadPoolExecutor(max_workers=11) as executor:
-        futures = {executor.submit(fetch_index_realtime, sym): sym for sym in INDEX_SYMBOLS.keys()}
+        futures = {
+            executor.submit(fetch_index_realtime, sym): sym 
+            for sym in INDEX_SYMBOLS.keys()
+        }
+        
         for future in as_completed(futures):
             symbol = futures[future]
             try:
-                data = future.result()
-                if data:
-                    results[symbol] = data
-            except Exception:
-                pass
+                data, err = future.result()
+                results[symbol] = (data, err)
+            except Exception as e:
+                results[symbol] = (None, str(e))
+    
     return results
 
 
-def run_index_poll_cycle() -> int:
-    """Run one cycle of index polling. Returns number of indices updated."""
-    data = fetch_all_indices_parallel()
+def run_index_poll_cycle() -> Tuple[int, int, List[str]]:
+    """Run one index polling cycle. Returns (updated, errors, error_messages)."""
+    results = fetch_all_indices_parallel()
     updated = 0
+    error_count = 0
+    error_messages = []
+    
     now = datetime.now(timezone.utc)
     minute_ts = now.replace(second=0, microsecond=0).isoformat()
     
     for eodhd_symbol, (display_symbol, candle_table) in INDEX_SYMBOLS.items():
-        d = data.get(eodhd_symbol)
-        if not d:
+        data, fetch_error = results.get(eodhd_symbol, (None, "Not fetched"))
+        
+        if fetch_error or not data:
+            error_count += 1
+            if fetch_error:
+                error_messages.append(f"{display_symbol}: {fetch_error}")
             continue
         
         try:
-            # API returns current price as "close"
-            # IMPORTANT: "high", "low", "open" are DAILY values, NOT minute values!
-            price = float(d["close"])
-            
-            # Use our minute-level OHLC tracker instead of daily values
+            price = float(data["close"])
             minute_ohlc = update_minute_ohlc(display_symbol, minute_ts, price)
             
-            # 1. Insert to tickdata (note: column is day_volume, not volume)
+            # Insert to tickdata (use 'volume' column)
             try:
                 tick = {
                     "symbol": display_symbol,
                     "price": price,
                     "bid": None,
                     "ask": None,
-                    "day_volume": None,
+                    "volume": None,
                     "ts": now.isoformat(),
                 }
                 sb.table(SUPABASE_TABLE).insert(tick).execute()
             except Exception as e:
-                log.warning(f"Index tickdata insert failed for {display_symbol}: {e}")
+                error_messages.append(f"{display_symbol} tickdata: {str(e)[:50]}")
             
-            # 2. Upsert to candle table with PROPER minute OHLC
+            # Upsert candle
             try:
                 candle = {
                     "timestamp": minute_ts,
@@ -1419,20 +2089,23 @@ def run_index_poll_cycle() -> int:
                 }
                 sb.table(candle_table).upsert(candle, on_conflict="timestamp").execute()
             except Exception as e:
-                log.warning(f"Index candle insert failed for {display_symbol} -> {candle_table}: {e}")
+                error_messages.append(f"{display_symbol} candle: {str(e)[:50]}")
             
             updated += 1
             
         except Exception as e:
-            log.warning(f"Index process error {display_symbol}: {e}")
+            error_count += 1
+            error_messages.append(f"{display_symbol}: {str(e)[:50]}")
     
-    return updated
+    return updated, error_count, error_messages
 
 
 async def index_poller_task():
-    """Task 9: Poll global indices every 20 seconds via REST API."""
-    log.info(f"Index Poller started ({len(INDEX_SYMBOLS)} indices, every {INDEX_POLL_INTERVAL}s)")
-    await asyncio.sleep(5)  # Small delay at startup
+    """Task 9: Poll global indices via REST API."""
+    task_metrics = metrics.get_or_create(INDEX_TASK)
+    
+    info(INDEX_TASK, f"Index Poller started ({len(INDEX_SYMBOLS)} indices, every {INDEX_POLL_INTERVAL}s)")
+    await asyncio.sleep(5)
     
     poll_count = 0
     total_updates = 0
@@ -1440,18 +2113,40 @@ async def index_poller_task():
     while not tick_streamer._shutdown.is_set():
         try:
             poll_count += 1
+            
             loop = asyncio.get_event_loop()
-            updated = await loop.run_in_executor(None, run_index_poll_cycle)
+            updated, errors, error_messages = await loop.run_in_executor(
+                None, run_index_poll_cycle
+            )
+            
             total_updates += updated
             
-            # Log every poll for first 10, then every 30
+            # Log progress
             if poll_count <= 10 or poll_count % 30 == 0:
-                log.info(f"Index Poller: poll #{poll_count}, {updated} indices updated this cycle, {total_updates} total")
+                info(INDEX_TASK, f"Poll #{poll_count}: {updated}/{len(INDEX_SYMBOLS)} updated, {errors} errors")
+            
+            # Log errors in debug mode
+            if DEBUG_MODE and error_messages:
+                for msg in error_messages[:5]:
+                    debug(INDEX_TASK, f"  {msg}")
+            
+            if updated > 0:
+                task_metrics.record_success()
+            elif errors > 0:
+                task_metrics.record_error(f"{errors} fetch errors")
+            
+            task_metrics.custom_metrics.update({
+                "poll_count": poll_count,
+                "total_updates": total_updates,
+                "last_updated": updated,
+                "last_errors": errors,
+            })
             
             await asyncio.sleep(INDEX_POLL_INTERVAL)
             
         except Exception as e:
-            log.error(f"Index poller error: {e}")
+            error(INDEX_TASK, f"Task error: {e}", exc_info=DEBUG_MODE)
+            task_metrics.record_error(str(e))
             await asyncio.sleep(60)
 
 
@@ -1460,53 +2155,64 @@ async def index_poller_task():
 # ============================================================================
 
 async def main():
+    """Main entry point."""
+    
+    # Run startup diagnostics
+    run_startup_diagnostics()
+    
     log.info("=" * 70)
-    log.info("LONDON STRATEGIC EDGE - WORKER v8.3 (FIXED)")
+    log.info("LONDON STRATEGIC EDGE - WORKER v9.0 (DEBUG)")
     log.info("=" * 70)
-    log.info(f"  1. Tick streaming (EODHD) - {TOTAL_SYMBOLS} symbols")
-    log.info(f"  2. Economic calendar (EODHD API) - every 5 min")
-    log.info(f"  3. Financial news ({len(RSS_FEEDS)} RSS + Gemini)")
-    log.info(f"  4. Gap detection & backfill")
-    log.info(f"  5. Bond yields (G20) - 30 min")
-    log.info(f"  6. Whale flow tracker")
-    log.info(f"  7. AI News Desk (placeholder)")
-    log.info(f"  8. G20 Macro Fetcher - 16 indicators x 20 countries (hourly)")
-    log.info(f"  9. Index Poller - {len(INDEX_SYMBOLS)} indices (every {INDEX_POLL_INTERVAL}s)")
+    log.info("Starting all tasks...")
     log.info("=" * 70)
-    log.info(f"Symbols: Forex={len(ALL_FOREX)} Crypto={len(ALL_CRYPTO)} Stocks={len(ALL_US_STOCKS)} ETFs={len(ALL_ETFS)} Indices={len(INDEX_SYMBOLS)}")
-    log.info("=" * 70)
-
+    
+    # Setup signal handlers
     def signal_handler(sig, frame):
-        log.info(f"Received signal {sig}, shutting down...")
+        log.info(f"Received signal {sig}, initiating shutdown...")
         tick_streamer.shutdown()
         whale_tracker.shutdown()
     
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
-
+    
+    # Create all tasks
     tasks = [
         asyncio.create_task(tick_streaming_task(), name="tick_stream"),
-        asyncio.create_task(economic_calendar_task(), name="econ_calendar"),
+        asyncio.create_task(economic_calendar_task(), name="calendar"),
         asyncio.create_task(financial_news_task(), name="news"),
         asyncio.create_task(gap_fill_task(), name="gap_fill"),
-        asyncio.create_task(bond_yield_task(), name="bond_yields"),
-        asyncio.create_task(whale_flow_task(), name="whale_flow"),
-        asyncio.create_task(ai_news_desk_task(), name="ai_news_desk"),
-        asyncio.create_task(macro_fetcher_task(), name="macro_fetcher"),
-        asyncio.create_task(index_poller_task(), name="index_poller"),
+        asyncio.create_task(bond_yield_task(), name="bonds"),
+        asyncio.create_task(whale_flow_task(), name="whale"),
+        asyncio.create_task(ai_news_desk_task(), name="ai_news"),
+        asyncio.create_task(macro_fetcher_task(), name="macro"),
+        asyncio.create_task(index_poller_task(), name="index"),
     ]
-
+    
+    # Periodic metrics logging
+    async def metrics_logger():
+        while not tick_streamer._shutdown.is_set():
+            await asyncio.sleep(300)  # Every 5 minutes
+            metrics.log_summary()
+            log.info(f"Supabase stats: {sb.get_stats()}")
+    
+    tasks.append(asyncio.create_task(metrics_logger(), name="metrics"))
+    
     try:
         await asyncio.gather(*tasks, return_exceptions=True)
     except Exception as e:
-        log.error(f"Main loop error: {e}")
+        log.error(f"Main loop error: {e}", exc_info=True)
     finally:
         tick_streamer.shutdown()
         whale_tracker.shutdown()
+        
         for task in tasks:
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
+        
+        # Final metrics report
+        log.info("")
+        metrics.log_summary()
         log.info("Worker shutdown complete")
 
 
@@ -1514,5 +2220,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        log.info("Goodbye!")
+        log.info("Interrupted by user")
         sys.exit(0)
