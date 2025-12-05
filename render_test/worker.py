@@ -269,7 +269,7 @@ class EODHDTickStreamer:
                 "price": price,
                 "bid": bid,
                 "ask": ask,
-                "volume": volume,
+                "day_volume": volume,
                 "ts": datetime.now(timezone.utc).isoformat(),
             }
             
@@ -498,50 +498,91 @@ def fetch_eodhd_calendar(days_ahead: int = 7) -> List[Dict]:
 
 
 def store_calendar_events(events: List[Dict]) -> Tuple[int, int]:
-    """Store calendar events using upsert to handle duplicates gracefully.
-    Returns (stored_count, error_count)."""
-    stored = 0
-    errors = 0
+    """Store calendar events efficiently with batch duplicate checking.
+    Returns (stored_count, skipped_count)."""
+    if not events:
+        return 0, 0
     
+    stored = 0
+    skipped = 0
+    
+    # Parse all events first
+    parsed_events = []
     for event in events:
         try:
             event_date = event.get("date", "")
             date_part = event_date.split(" ")[0] if event_date else None
             time_part = event_date.split(" ")[1] if event_date and " " in event_date else None
             
-            # Skip events without a date
             if not date_part:
                 continue
             
-            data = {
-                "event": event.get("type", "") or "",
-                "country": event.get("country", "") or "",
+            event_name = event.get("type", "") or ""
+            country = event.get("country", "") or ""
+            
+            parsed_events.append({
+                "event": event_name,
+                "country": country,
                 "date": date_part,
                 "time": time_part,
                 "actual": str(event.get("actual")) if event.get("actual") is not None else None,
                 "previous": str(event.get("previous")) if event.get("previous") is not None else None,
                 "consensus": str(event.get("estimate")) if event.get("estimate") is not None else None,
-                "importance": classify_calendar_impact(event.get("type", "")),
-            }
-            
-            # Use upsert - requires the UNIQUE constraint from SQL above
-            try:
-                sb.table("Economic_calander").upsert(
-                    data, 
-                    on_conflict="date,time,country,event"
-                ).execute()
-                stored += 1
-            except Exception as e:
-                # Silently skip duplicates/conflicts, log others at debug level
-                err = str(e).lower()
-                if "duplicate" not in err and "unique" not in err and "conflict" not in err:
-                    log.debug(f"Calendar upsert issue: {e}")
-                errors += 1
-                    
+                "importance": classify_calendar_impact(event_name),
+            })
         except Exception:
-            errors += 1
+            continue
     
-    return stored, errors
+    if not parsed_events:
+        return 0, 0
+    
+    # Get date range for batch lookup
+    dates = set(e["date"] for e in parsed_events if e["date"])
+    if not dates:
+        return 0, 0
+    
+    # Batch fetch existing events for these dates (one query)
+    existing_keys = set()
+    try:
+        min_date = min(dates)
+        max_date = max(dates)
+        existing = sb.table("Economic_calander").select(
+            "date,time,country,event"
+        ).gte("date", min_date).lte("date", max_date).execute()
+        
+        for row in existing.data:
+            key = (row.get("date"), row.get("time"), row.get("country"), row.get("event"))
+            existing_keys.add(key)
+    except Exception as e:
+        log.warning(f"Calendar batch lookup failed: {e}")
+        # Continue anyway - inserts will fail for duplicates
+    
+    # Filter to only new events
+    new_events = []
+    for evt in parsed_events:
+        key = (evt["date"], evt["time"], evt["country"], evt["event"])
+        if key in existing_keys:
+            skipped += 1
+        else:
+            new_events.append(evt)
+    
+    # Batch insert new events (in chunks to avoid payload limits)
+    chunk_size = 50
+    for i in range(0, len(new_events), chunk_size):
+        chunk = new_events[i:i+chunk_size]
+        try:
+            sb.table("Economic_calander").insert(chunk).execute()
+            stored += len(chunk)
+        except Exception as e:
+            # If batch fails, try individual inserts
+            for evt in chunk:
+                try:
+                    sb.table("Economic_calander").insert(evt).execute()
+                    stored += 1
+                except Exception:
+                    skipped += 1
+    
+    return stored, skipped
 
 
 async def economic_calendar_task():
@@ -1352,14 +1393,14 @@ def run_index_poll_cycle() -> int:
             # Use our minute-level OHLC tracker instead of daily values
             minute_ohlc = update_minute_ohlc(display_symbol, minute_ts, price)
             
-            # 1. Insert to tickdata
+            # 1. Insert to tickdata (note: column is day_volume, not volume)
             try:
                 tick = {
                     "symbol": display_symbol,
                     "price": price,
                     "bid": None,
                     "ask": None,
-                    "volume": None,
+                    "day_volume": None,
                     "ts": now.isoformat(),
                 }
                 sb.table(SUPABASE_TABLE).insert(tick).execute()
