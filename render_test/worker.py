@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-LONDON STRATEGIC EDGE - BULLETPROOF WORKER v8.1
+LONDON STRATEGIC EDGE - BULLETPROOF WORKER v8.2
 ================================================================================
 Production-grade data pipeline with EODHD WebSocket streaming.
 
@@ -14,6 +14,7 @@ TASKS:
   6. Whale Flow Tracker - BTC whale movements via Blockchain.com WebSocket
   7. AI News Desk       - Placeholder for article synthesis
   8. G20 Macro Fetcher  - 16 indicators x 20 countries (hourly)
+  9. Index Poller       - 11 global indices via REST API (every 20 seconds)
 
 SYMBOL CAPACITY: 280/300 WebSocket credits used
 ================================================================================
@@ -32,6 +33,7 @@ from difflib import SequenceMatcher
 from typing import Optional, List, Dict, Tuple, Any
 from contextlib import suppress
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import websockets
 import requests
@@ -151,6 +153,7 @@ MAX_GAP_HOURS = 4
 GAP_SCAN_INTERVAL = 300
 BOND_SCRAPE_INTERVAL = 1800
 MACRO_FETCH_INTERVAL = 3600
+INDEX_POLL_INTERVAL = 20  # Poll indices every 20 seconds
 
 # ============================================================================
 #                              LOGGING
@@ -1197,12 +1200,134 @@ async def macro_fetcher_task():
 
 
 # ============================================================================
+#                       TASK 9: INDEX POLLER (REST API)
+# ============================================================================
+
+# Index symbols: EODHD API symbol -> (display_symbol, candle_table)
+INDEX_SYMBOLS = {
+    "GSPC.INDX": ("SPX", "candles_spx"),
+    "DJI.INDX": ("US30", "candles_us30"),
+    "IXIC.INDX": ("NASDAQ", "candles_nasdaq"),
+    "NDX.INDX": ("NAS100", "candles_nas100"),
+    "RUT.INDX": ("RUT", "candles_rut"),
+    "FTSE.INDX": ("UK100", "candles_uk100"),
+    "GDAXI.INDX": ("DAX", "candles_dax"),
+    "FCHI.INDX": ("CAC40", "candles_cac40"),
+    "N225.INDX": ("NIKKEI", "candles_nikkei"),
+    "HSI.INDX": ("HSI", "candles_hsi"),
+    "STOXX50E.INDX": ("STOXX50", "candles_stoxx50"),
+}
+
+
+def fetch_index_realtime(eodhd_symbol: str) -> Optional[Dict]:
+    """Fetch real-time quote for a single index."""
+    url = f"https://eodhd.com/api/real-time/{eodhd_symbol}"
+    params = {"api_token": EODHD_API_KEY, "fmt": "json"}
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            if data and data.get("close") and data.get("close") != "NA":
+                return data
+    except Exception as e:
+        log.warning(f"Index fetch error {eodhd_symbol}: {e}")
+    return None
+
+
+def fetch_all_indices_parallel() -> Dict[str, Dict]:
+    """Fetch all indices in parallel using ThreadPoolExecutor."""
+    results = {}
+    with ThreadPoolExecutor(max_workers=11) as executor:
+        futures = {executor.submit(fetch_index_realtime, sym): sym for sym in INDEX_SYMBOLS.keys()}
+        for future in as_completed(futures):
+            symbol = futures[future]
+            try:
+                data = future.result()
+                if data:
+                    results[symbol] = data
+            except Exception:
+                pass
+    return results
+
+
+def insert_index_to_tickdata(display_symbol: str, price: float, change: float, change_p: float):
+    """Insert index tick into tickdata table."""
+    try:
+        tick = {
+            "symbol": display_symbol,
+            "price": price,
+            "bid": None,
+            "ask": None,
+            "volume": None,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+        sb.table(SUPABASE_TABLE).insert(tick).execute()
+        return True
+    except Exception as e:
+        log.warning(f"Index tickdata insert failed for {display_symbol}: {e}")
+        return False
+
+
+def run_index_poll_cycle() -> int:
+    """Run one cycle of index polling. Returns number of indices updated."""
+    data = fetch_all_indices_parallel()
+    updated = 0
+    
+    for eodhd_symbol, (display_symbol, candle_table) in INDEX_SYMBOLS.items():
+        d = data.get(eodhd_symbol)
+        if not d:
+            continue
+        
+        try:
+            price = float(d["close"])
+            change = float(d.get("change", 0) or 0)
+            change_p = float(d.get("change_p", 0) or 0)
+            high = float(d.get("high", price) or price)
+            low = float(d.get("low", price) or price)
+            open_price = float(d.get("open", price) or price)
+            
+            # Insert to tickdata
+            if insert_index_to_tickdata(display_symbol, price, change, change_p):
+                updated += 1
+            
+        except Exception as e:
+            log.warning(f"Index process error {display_symbol}: {e}")
+    
+    return updated
+
+
+async def index_poller_task():
+    """Task 9: Poll global indices every 20 seconds via REST API."""
+    log.info(f"Index Poller started ({len(INDEX_SYMBOLS)} indices, every {INDEX_POLL_INTERVAL}s)")
+    await asyncio.sleep(5)  # Small delay at startup
+    
+    poll_count = 0
+    total_updates = 0
+    
+    while not tick_streamer._shutdown.is_set():
+        try:
+            poll_count += 1
+            loop = asyncio.get_event_loop()
+            updated = await loop.run_in_executor(None, run_index_poll_cycle)
+            total_updates += updated
+            
+            if poll_count % 30 == 0:  # Log every 30 polls (10 minutes)
+                log.info(f"Index Poller: {poll_count} polls, {total_updates} total updates, {updated} this cycle")
+            
+            await asyncio.sleep(INDEX_POLL_INTERVAL)
+            
+        except Exception as e:
+            log.error(f"Index poller error: {e}")
+            await asyncio.sleep(60)
+
+
+# ============================================================================
 #                              MAIN ENTRY POINT
 # ============================================================================
 
 async def main():
     log.info("=" * 70)
-    log.info("LONDON STRATEGIC EDGE - WORKER v8.1")
+    log.info("LONDON STRATEGIC EDGE - WORKER v8.2")
     log.info("=" * 70)
     log.info(f"  1. Tick streaming (EODHD) - {TOTAL_SYMBOLS} symbols")
     log.info(f"  2. Economic calendar (EODHD API) - every 5 min")
@@ -1212,8 +1337,9 @@ async def main():
     log.info(f"  6. Whale flow tracker")
     log.info(f"  7. AI News Desk (placeholder)")
     log.info(f"  8. G20 Macro Fetcher - 16 indicators x 20 countries (hourly)")
+    log.info(f"  9. Index Poller - {len(INDEX_SYMBOLS)} indices (every {INDEX_POLL_INTERVAL}s)")
     log.info("=" * 70)
-    log.info(f"Symbols: Forex={len(ALL_FOREX)} Crypto={len(ALL_CRYPTO)} Stocks={len(ALL_US_STOCKS)} ETFs={len(ALL_ETFS)}")
+    log.info(f"Symbols: Forex={len(ALL_FOREX)} Crypto={len(ALL_CRYPTO)} Stocks={len(ALL_US_STOCKS)} ETFs={len(ALL_ETFS)} Indices={len(INDEX_SYMBOLS)}")
     log.info("=" * 70)
 
     def signal_handler(sig, frame):
@@ -1233,6 +1359,7 @@ async def main():
         asyncio.create_task(whale_flow_task(), name="whale_flow"),
         asyncio.create_task(ai_news_desk_task(), name="ai_news_desk"),
         asyncio.create_task(macro_fetcher_task(), name="macro_fetcher"),
+        asyncio.create_task(index_poller_task(), name="index_poller"),
     ]
 
     try:
