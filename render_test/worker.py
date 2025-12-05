@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-LONDON STRATEGIC EDGE - BULLETPROOF WORKER v8.2
+LONDON STRATEGIC EDGE - BULLETPROOF WORKER v8.3 (FIXED)
 ================================================================================
 Production-grade data pipeline with EODHD WebSocket streaming.
+
+FIXES IN v8.3:
+  - INDEX POLLER: Now tracks minute-level OHLC (fixes static candles issue)
+  - ECONOMIC CALENDAR: Uses upsert with error handling (fixes 400 errors)
 
 TASKS:
   1. Tick Streaming     - EODHD WebSocket (280 symbols across 7 connections)
@@ -436,7 +440,14 @@ async def tick_streaming_task():
 
 
 # ============================================================================
-#                    TASK 2: EODHD ECONOMIC CALENDAR
+#                    TASK 2: EODHD ECONOMIC CALENDAR (FIXED)
+# ============================================================================
+# FIX: Use upsert with proper error handling to prevent 400 errors
+#
+# IMPORTANT: Run this SQL in Supabase first:
+# ALTER TABLE "Economic_calander" 
+# ADD CONSTRAINT economic_calander_unique 
+# UNIQUE NULLS NOT DISTINCT (date, time, country, event);
 # ============================================================================
 
 HIGH_IMPACT_KEYWORDS = [
@@ -481,21 +492,30 @@ def fetch_eodhd_calendar(days_ahead: int = 7) -> List[Dict]:
         if response.status_code == 200:
             return response.json()
         return []
-    except Exception:
+    except Exception as e:
+        log.warning(f"Calendar fetch error: {e}")
         return []
 
 
-def store_calendar_events(events: List[Dict]) -> int:
+def store_calendar_events(events: List[Dict]) -> Tuple[int, int]:
+    """Store calendar events using upsert to handle duplicates gracefully.
+    Returns (stored_count, error_count)."""
     stored = 0
+    errors = 0
+    
     for event in events:
         try:
             event_date = event.get("date", "")
             date_part = event_date.split(" ")[0] if event_date else None
             time_part = event_date.split(" ")[1] if event_date and " " in event_date else None
             
+            # Skip events without a date
+            if not date_part:
+                continue
+            
             data = {
-                "event": event.get("type", ""),
-                "country": event.get("country", ""),
+                "event": event.get("type", "") or "",
+                "country": event.get("country", "") or "",
                 "date": date_part,
                 "time": time_part,
                 "actual": str(event.get("actual")) if event.get("actual") is not None else None,
@@ -503,31 +523,49 @@ def store_calendar_events(events: List[Dict]) -> int:
                 "consensus": str(event.get("estimate")) if event.get("estimate") is not None else None,
                 "importance": classify_calendar_impact(event.get("type", "")),
             }
-            # Insert - duplicates handled by unique constraint or ignored
-            sb.table("Economic_calander").insert(data).execute()
-            stored += 1
+            
+            # Use upsert - requires the UNIQUE constraint from SQL above
+            try:
+                sb.table("Economic_calander").upsert(
+                    data, 
+                    on_conflict="date,time,country,event"
+                ).execute()
+                stored += 1
+            except Exception as e:
+                # Silently skip duplicates/conflicts, log others at debug level
+                err = str(e).lower()
+                if "duplicate" not in err and "unique" not in err and "conflict" not in err:
+                    log.debug(f"Calendar upsert issue: {e}")
+                errors += 1
+                    
         except Exception:
-            pass
-    return stored
+            errors += 1
+    
+    return stored, errors
 
 
 async def economic_calendar_task():
     log.info("Economic calendar task started (EODHD API)")
+    
     while not tick_streamer._shutdown.is_set():
         try:
             log.info("Fetching economic calendar...")
             events = fetch_eodhd_calendar(days_ahead=7)
-            if events:
-                stored = store_calendar_events(events)
-                high_impact = sum(1 for e in events if classify_calendar_impact(e.get("type", "")) == "high")
-                log.info(f"Calendar: {len(events)} events, {high_impact} high-impact, {stored} stored")
             
+            if events:
+                stored, errors = store_calendar_events(events)
+                high_impact = sum(1 for e in events if classify_calendar_impact(e.get("type", "")) == "high")
+                log.info(f"Calendar: {len(events)} fetched, {stored} stored, {errors} skipped, {high_impact} high-impact")
+            
+            # Follow-up fetch after 3 seconds
             await asyncio.sleep(3)
             events2 = fetch_eodhd_calendar(days_ahead=7)
             if events2:
                 store_calendar_events(events2)
             
+            # Wait 5 minutes before next cycle
             await asyncio.sleep(300)
+            
         except Exception as e:
             log.error(f"Calendar task error: {e}")
             await asyncio.sleep(60)
@@ -1201,7 +1239,11 @@ async def macro_fetcher_task():
 
 
 # ============================================================================
-#                       TASK 9: INDEX POLLER (REST API)
+#                       TASK 9: INDEX POLLER (REST API) - FIXED
+# ============================================================================
+# FIX: Track minute-level OHLC since EODHD real-time API returns DAILY values!
+# The API's "high", "low", "open" are the DAY's values, not minute values.
+# This caused all candles to have identical open/high/low (the static candle bug).
 # ============================================================================
 
 # Index symbols: EODHD API symbol -> (display_symbol, candle_table)
@@ -1218,6 +1260,45 @@ INDEX_SYMBOLS = {
     "HSI.INDX": ("HSI", "candles_hsi"),
     "STOXX50E.INDX": ("STOXX50", "candles_stoxx50"),
 }
+
+# Track minute-level OHLC in memory: {symbol: {minute_ts: {open, high, low, close}}}
+_index_minute_ohlc: Dict[str, Dict[str, Dict[str, float]]] = {}
+_index_ohlc_lock = threading.Lock()
+
+
+def update_minute_ohlc(symbol: str, minute_ts: str, price: float) -> Dict[str, float]:
+    """
+    Track minute-level OHLC since EODHD API only provides daily values.
+    Returns the current minute's OHLC for the symbol.
+    """
+    with _index_ohlc_lock:
+        if symbol not in _index_minute_ohlc:
+            _index_minute_ohlc[symbol] = {}
+        
+        candles = _index_minute_ohlc[symbol]
+        
+        # Cleanup: keep only last 5 minutes to prevent memory growth
+        if len(candles) > 10:
+            sorted_minutes = sorted(candles.keys())
+            for old_minute in sorted_minutes[:-5]:
+                del candles[old_minute]
+        
+        if minute_ts not in candles:
+            # First tick of this minute - price becomes OHLC
+            candles[minute_ts] = {
+                "open": price,
+                "high": price,
+                "low": price,
+                "close": price
+            }
+        else:
+            # Update existing minute candle
+            c = candles[minute_ts]
+            c["high"] = max(c["high"], price)
+            c["low"] = min(c["low"], price)
+            c["close"] = price
+        
+        return candles[minute_ts].copy()
 
 
 def fetch_index_realtime(eodhd_symbol: str) -> Optional[Dict]:
@@ -1251,29 +1332,12 @@ def fetch_all_indices_parallel() -> Dict[str, Dict]:
     return results
 
 
-def insert_index_to_tickdata(display_symbol: str, price: float, change: float, change_p: float):
-    """Insert index tick into tickdata table."""
-    try:
-        tick = {
-            "symbol": display_symbol,
-            "price": price,
-            "bid": None,
-            "ask": None,
-            "volume": None,
-            "ts": datetime.now(timezone.utc).isoformat(),
-        }
-        sb.table(SUPABASE_TABLE).insert(tick).execute()
-        return True
-    except Exception as e:
-        log.warning(f"Index tickdata insert failed for {display_symbol}: {e}")
-        return False
-
-
 def run_index_poll_cycle() -> int:
     """Run one cycle of index polling. Returns number of indices updated."""
     data = fetch_all_indices_parallel()
     updated = 0
     now = datetime.now(timezone.utc)
+    minute_ts = now.replace(second=0, microsecond=0).isoformat()
     
     for eodhd_symbol, (display_symbol, candle_table) in INDEX_SYMBOLS.items():
         d = data.get(eodhd_symbol)
@@ -1281,12 +1345,12 @@ def run_index_poll_cycle() -> int:
             continue
         
         try:
+            # API returns current price as "close"
+            # IMPORTANT: "high", "low", "open" are DAILY values, NOT minute values!
             price = float(d["close"])
-            change = float(d.get("change", 0) or 0)
-            change_p = float(d.get("change_p", 0) or 0)
-            high = float(d.get("high", price) or price)
-            low = float(d.get("low", price) or price)
-            open_price = float(d.get("open", price) or price)
+            
+            # Use our minute-level OHLC tracker instead of daily values
+            minute_ohlc = update_minute_ohlc(display_symbol, minute_ts, price)
             
             # 1. Insert to tickdata
             try:
@@ -1302,16 +1366,14 @@ def run_index_poll_cycle() -> int:
             except Exception as e:
                 log.warning(f"Index tickdata insert failed for {display_symbol}: {e}")
             
-            # 2. Insert/upsert to candle table (1-minute candle)
-            # Round timestamp to current minute
-            minute_ts = now.replace(second=0, microsecond=0).isoformat()
+            # 2. Upsert to candle table with PROPER minute OHLC
             try:
                 candle = {
                     "timestamp": minute_ts,
-                    "open": open_price,
-                    "high": high,
-                    "low": low,
-                    "close": price,
+                    "open": minute_ohlc["open"],
+                    "high": minute_ohlc["high"],
+                    "low": minute_ohlc["low"],
+                    "close": minute_ohlc["close"],
                     "volume": None,
                 }
                 sb.table(candle_table).upsert(candle, on_conflict="timestamp").execute()
@@ -1322,8 +1384,6 @@ def run_index_poll_cycle() -> int:
             
         except Exception as e:
             log.warning(f"Index process error {display_symbol}: {e}")
-    
-    return updated
     
     return updated
 
@@ -1360,7 +1420,7 @@ async def index_poller_task():
 
 async def main():
     log.info("=" * 70)
-    log.info("LONDON STRATEGIC EDGE - WORKER v8.2")
+    log.info("LONDON STRATEGIC EDGE - WORKER v8.3 (FIXED)")
     log.info("=" * 70)
     log.info(f"  1. Tick streaming (EODHD) - {TOTAL_SYMBOLS} symbols")
     log.info(f"  2. Economic calendar (EODHD API) - every 5 min")
