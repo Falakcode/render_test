@@ -20,9 +20,10 @@ TASKS:
   5. Bond Yields        - G20 sovereign yields (every 30 minutes)
   6. Whale Flow Tracker - BTC whale movements via Blockchain.com WebSocket
   7. AI News Desk       - Placeholder for article synthesis
-  8. G20 Macro Fetcher  - 16 indicators x 20 countries (hourly)
+  8. G20 Macro Fetcher  - DISABLED (table not ready)
   9. Index Poller       - 11 global indices via REST API (every 20 seconds)
   10. Sector Sentiment  - AI market sentiment analysis (scheduled updates)
+  11. News Articles     - Multi-source news scraper with filtering
 
 ================================================================================
 """
@@ -1689,17 +1690,28 @@ async def bond_yield_task():
 # ============================================================================
 
 WHALE_TASK = "WHALE_FLOW"
+WHALE_THRESHOLD_USD = 500000  # Minimum USD value to be considered a whale
+WHALE_PRICE_UPDATE_INTERVAL = 300  # Update BTC price every 5 minutes
 
 
 class WhaleFlowTracker:
-    """Track large BTC transactions via Blockchain.com WebSocket."""
+    """Track large BTC transactions via Blockchain.com WebSocket and store to Supabase."""
     
     def __init__(self):
         self._shutdown = asyncio.Event()
-        self._btc_price = 50000.0
+        self._btc_price = 100000.0
         self._tx_count = 0
         self._whale_count = 0
+        self._last_price_update = 0
         self._metrics = metrics.get_or_create(WHALE_TASK)
+        self._daily_stats = {
+            "date": None,
+            "total_transactions": 0,
+            "total_btc": 0.0,
+            "total_usd": 0.0,
+            "largest_tx_btc": 0.0,
+            "largest_tx_usd": 0.0,
+        }
     
     def shutdown(self):
         self._shutdown.set()
@@ -1707,17 +1719,109 @@ class WhaleFlowTracker:
     async def _fetch_btc_price(self):
         """Fetch current BTC price."""
         try:
+            # Try CoinGecko first
             url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
             response = requests.get(url, timeout=10)
             if response.status_code == 200:
                 self._btc_price = response.json()["bitcoin"]["usd"]
+                self._last_price_update = time.time()
                 debug(WHALE_TASK, f"BTC price updated: ${self._btc_price:,.0f}")
+                return
+        except Exception as e:
+            debug(WHALE_TASK, f"CoinGecko error: {e}")
+        
+        # Fallback to Blockchain.info
+        try:
+            url = "https://blockchain.info/ticker"
+            response = requests.get(url, timeout=10)
+            if response.status_code == 200:
+                self._btc_price = response.json()["USD"]["last"]
+                self._last_price_update = time.time()
+                debug(WHALE_TASK, f"BTC price (fallback): ${self._btc_price:,.0f}")
         except Exception as e:
             debug(WHALE_TASK, f"BTC price fetch error: {e}")
+    
+    def _store_whale_transaction(self, tx_hash: str, btc_amount: float, usd_value: float,
+                                  from_addrs: List[str], to_addrs: List[str]):
+        """Store whale transaction to Supabase."""
+        try:
+            record = {
+                "tx_hash": tx_hash,
+                "btc_amount": btc_amount,
+                "usd_value": usd_value,
+                "btc_price": self._btc_price,
+                "direction": "unknown",  # Could enhance with exchange detection
+                "from_addresses": from_addrs[:5],  # Limit array size
+                "to_addresses": to_addrs[:5],
+                "is_confirmed": False,
+                "detected_at": datetime.now(timezone.utc).isoformat()
+            }
+            
+            sb.table("whale_flows").upsert(record, on_conflict="tx_hash").execute()
+            debug(WHALE_TASK, f"Stored whale tx: {tx_hash[:16]}...")
+            return True
+        except Exception as e:
+            debug(WHALE_TASK, f"Failed to store whale tx: {e}")
+            return False
+    
+    def _update_daily_stats(self, btc_amount: float, usd_value: float):
+        """Update daily aggregated stats."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        
+        # Reset if new day
+        if self._daily_stats["date"] != today:
+            self._daily_stats = {
+                "date": today,
+                "total_transactions": 0,
+                "total_btc": 0.0,
+                "total_usd": 0.0,
+                "largest_tx_btc": 0.0,
+                "largest_tx_usd": 0.0,
+            }
+        
+        self._daily_stats["total_transactions"] += 1
+        self._daily_stats["total_btc"] += btc_amount
+        self._daily_stats["total_usd"] += usd_value
+        
+        if btc_amount > self._daily_stats["largest_tx_btc"]:
+            self._daily_stats["largest_tx_btc"] = btc_amount
+            self._daily_stats["largest_tx_usd"] = usd_value
+        
+        # Store to database every 10 transactions
+        if self._daily_stats["total_transactions"] % 10 == 0:
+            self._flush_daily_stats()
+    
+    def _flush_daily_stats(self):
+        """Flush daily stats to Supabase."""
+        try:
+            if not self._daily_stats["date"]:
+                return
+            
+            stats = self._daily_stats
+            avg_btc = stats["total_btc"] / stats["total_transactions"] if stats["total_transactions"] > 0 else 0
+            avg_usd = stats["total_usd"] / stats["total_transactions"] if stats["total_transactions"] > 0 else 0
+            
+            record = {
+                "date": stats["date"],
+                "total_transactions": stats["total_transactions"],
+                "total_btc": stats["total_btc"],
+                "total_usd": stats["total_usd"],
+                "avg_tx_size_btc": avg_btc,
+                "avg_tx_size_usd": avg_usd,
+                "largest_tx_btc": stats["largest_tx_btc"],
+                "largest_tx_usd": stats["largest_tx_usd"],
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }
+            
+            sb.table("whale_stats").upsert(record, on_conflict="date").execute()
+            debug(WHALE_TASK, f"Updated daily stats: {stats['total_transactions']} whales today")
+        except Exception as e:
+            debug(WHALE_TASK, f"Failed to update daily stats: {e}")
     
     async def run(self):
         """Main whale tracking loop."""
         info(WHALE_TASK, "Whale Flow Tracker started")
+        info(WHALE_TASK, f"Threshold: ${WHALE_THRESHOLD_USD:,}")
         
         await self._fetch_btc_price()
         
@@ -1726,6 +1830,10 @@ class WhaleFlowTracker:
         
         while not self._shutdown.is_set():
             try:
+                # Update BTC price periodically
+                if time.time() - self._last_price_update > WHALE_PRICE_UPDATE_INTERVAL:
+                    await self._fetch_btc_price()
+                
                 debug(WHALE_TASK, "Connecting to Blockchain.com WebSocket...")
                 
                 async with websockets.connect(url, ping_interval=30) as ws:
@@ -1743,14 +1851,36 @@ class WhaleFlowTracker:
                             if data.get("op") == "utx":
                                 self._tx_count += 1
                                 tx = data.get("x", {})
+                                tx_hash = tx.get("hash", "")
+                                
+                                # Calculate total output value
                                 outputs = tx.get("out", [])
+                                inputs = tx.get("inputs", [])
+                                
                                 total_btc = sum(o.get("value", 0) for o in outputs) / 1e8
                                 total_usd = total_btc * self._btc_price
                                 
-                                if total_usd >= 500000:
+                                # Extract addresses
+                                from_addrs = [i.get("prev_out", {}).get("addr", "") for i in inputs if i.get("prev_out", {}).get("addr")]
+                                to_addrs = [o.get("addr", "") for o in outputs if o.get("addr")]
+                                
+                                if total_usd >= WHALE_THRESHOLD_USD:
                                     self._whale_count += 1
-                                    info(WHALE_TASK, f"WHALE: {total_btc:.2f} BTC (${total_usd:,.0f})")
+                                    info(WHALE_TASK, f"🐋 WHALE: {total_btc:.2f} BTC (${total_usd:,.0f})")
+                                    
+                                    # Store to database
+                                    self._store_whale_transaction(
+                                        tx_hash, total_btc, total_usd, from_addrs, to_addrs
+                                    )
+                                    
+                                    # Update daily stats
+                                    self._update_daily_stats(total_btc, total_usd)
+                                    
                                     self._metrics.record_success()
+                                
+                                # Update price periodically during message processing
+                                if time.time() - self._last_price_update > WHALE_PRICE_UPDATE_INTERVAL:
+                                    await self._fetch_btc_price()
                                     
                         except Exception as e:
                             debug(WHALE_TASK, f"Message parse error: {e}")
@@ -1765,6 +1895,8 @@ class WhaleFlowTracker:
             await asyncio.sleep(backoff)
             backoff = min(30, backoff * 2)
         
+        # Flush final stats on shutdown
+        self._flush_daily_stats()
         info(WHALE_TASK, f"Whale tracker stopped. Total: {self._tx_count} txs, {self._whale_count} whales")
 
 
@@ -2687,6 +2819,334 @@ async def sector_sentiment_task():
 
 
 # ============================================================================
+#                    TASK 11: NEWS ARTICLES SCRAPER
+# ============================================================================
+# Scrapes financial news from multiple RSS sources with content filtering
+# Updates: Every 15 min during market hours, every 30 min off-hours, every 2 hours weekend
+# ============================================================================
+
+NEWS_ARTICLES_TASK = "NEWS_ARTICLES"
+
+# News sources configuration
+NEWS_SOURCES_CONFIG = {
+    "yahoo_finance": {
+        "name": "Yahoo Finance",
+        "logo": "https://s.yimg.com/cv/apiv2/default/20190501/yahoo_finance_en-US_2x.png",
+        "color": "#6001D2",
+        "rss_feeds": ["https://finance.yahoo.com/news/rssindex"],
+        "categories": ["markets", "stocks", "economy"],
+    },
+    "marketwatch": {
+        "name": "MarketWatch",
+        "logo": "https://mw3.wsj.net/mw5/content/logos/mw_logo_social.png",
+        "color": "#00AC4E",
+        "rss_feeds": [
+            "http://feeds.marketwatch.com/marketwatch/topstories/",
+            "http://feeds.marketwatch.com/marketwatch/marketpulse/",
+        ],
+        "categories": ["markets", "stocks"],
+    },
+    "cnbc": {
+        "name": "CNBC",
+        "logo": "https://sc.cnbcfm.com/applications/cnbc.com/staticcontent/img/cnbc_logo.gif",
+        "color": "#005594",
+        "rss_feeds": [
+            "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114",
+            "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10001147",
+        ],
+        "categories": ["markets", "stocks", "economy"],
+    },
+    "coindesk": {
+        "name": "CoinDesk",
+        "logo": "https://www.coindesk.com/resizer/V5yJVoHqWN6hPBs1nB_mzVmBDjk=/800x600/cloudfront-us-east-1.images.arcpublishing.com/coindesk/ZJKJPH5BVBHFNMU32B6PJVGSUY.png",
+        "color": "#0033FF",
+        "rss_feeds": ["https://www.coindesk.com/arc/outboundfeeds/rss/"],
+        "categories": ["crypto", "bitcoin", "ethereum"],
+    },
+    "cointelegraph": {
+        "name": "CoinTelegraph",
+        "logo": "https://cointelegraph.com/assets/img/logo.svg",
+        "color": "#000000",
+        "rss_feeds": ["https://cointelegraph.com/rss"],
+        "categories": ["crypto", "blockchain", "defi"],
+    },
+    "benzinga": {
+        "name": "Benzinga",
+        "logo": "https://www.benzinga.com/next-assets/images/schema-image.png",
+        "color": "#00C805",
+        "rss_feeds": ["https://www.benzinga.com/feed"],
+        "categories": ["stocks", "markets", "trading"],
+    }
+}
+
+# Content filtering - reject these
+NEWS_REJECT_KEYWORDS = [
+    "palestinian", "bethlehem", "gaza", "israel conflict", "christmas",
+    "holiday gift", "thanksgiving", "family gathering",
+    "investor news: if you have suffered", "class action", "lawsuit alert",
+    "securities fraud", "investor alert", "legal action",
+    "how to talk to your family", "gift guide",
+    "shibarium", "shib explorer", "meme coin", "pump and dump",
+    "airdrop alert", "free tokens", "moonshot",
+    "geekstake", "sponsored content", "partner content",
+    "press release:", "prn newswire", "business wire",
+]
+
+# Priority keywords - boost these
+NEWS_PRIORITY_KEYWORDS = [
+    "breaking:", "just in:", "alert:", "developing:",
+    "earnings", "revenue", "profit", "quarterly results",
+    "beats estimates", "misses estimates", "guidance",
+    "surges", "plunges", "rallies", "tumbles", "soars",
+    "all-time high", "52-week", "record high", "record low",
+    "fed", "federal reserve", "rate decision", "rate hike", "rate cut",
+    "inflation", "cpi", "jobs report", "unemployment", "gdp",
+    "ipo", "merger", "acquisition", "buyout",
+    "upgrade", "downgrade", "price target", "initiates coverage",
+    "bitcoin", "btc", "ethereum", "eth", "sec crypto", "etf approval",
+]
+
+
+def news_should_reject(title: str, summary: str) -> bool:
+    """Check if article should be rejected."""
+    text = f"{title} {summary}".lower()
+    for keyword in NEWS_REJECT_KEYWORDS:
+        if keyword.lower() in text:
+            return True
+    if "investor" in text and ("loss" in text or "suffered" in text):
+        return True
+    return False
+
+
+def news_calculate_priority(title: str, summary: str, symbols: List[str]) -> int:
+    """Calculate priority score (0-100)."""
+    text = f"{title} {summary}".lower()
+    score = 50
+    
+    for keyword in NEWS_PRIORITY_KEYWORDS:
+        if keyword.lower() in text:
+            score += 5
+    
+    score += len(symbols) * 3
+    
+    if any(x in title.lower() for x in ["breaking", "just in", "alert"]):
+        score += 15
+    if any(x in text for x in ["earnings", "quarterly", "revenue beat"]):
+        score += 10
+    if any(x in text for x in ["federal reserve", "fed ", "rate decision"]):
+        score += 10
+    if any(x in title.lower() for x in ["my favorite", "could", "should you"]):
+        score -= 10
+    if any(x in title.lower() for x in ["top 10", "5 stocks", "3 reasons"]):
+        score -= 5
+    
+    return min(100, max(0, score))
+
+
+def news_detect_symbols(text: str) -> List[str]:
+    """Detect stock symbols in text."""
+    import re
+    patterns = [r'\$([A-Z]{1,5})\b', r'\(([A-Z]{1,5})\)', r'\b([A-Z]{2,5})(?::\s)']
+    symbols = set()
+    for pattern in patterns:
+        symbols.update(re.findall(pattern, text))
+    false_positives = {'CEO', 'CFO', 'IPO', 'ETF', 'NYSE', 'SEC', 'GDP', 'CPI', 'USD', 'EUR', 'THE', 'FOR', 'AND'}
+    return [s for s in symbols if s not in false_positives][:5]
+
+
+def news_clean_html(text: str) -> str:
+    """Remove HTML tags."""
+    if not text:
+        return ""
+    soup = BeautifulSoup(text, "html.parser")
+    text = soup.get_text(separator=" ")
+    import re
+    return re.sub(r'\s+', ' ', text).strip()[:500]
+
+
+def news_extract_image(entry) -> Optional[str]:
+    """Extract image URL from RSS entry."""
+    if hasattr(entry, 'media_content') and entry.media_content:
+        for media in entry.media_content:
+            if media.get('url'):
+                return media.get('url')
+    if hasattr(entry, 'media_thumbnail') and entry.media_thumbnail:
+        for thumb in entry.media_thumbnail:
+            if thumb.get('url'):
+                return thumb.get('url')
+    if hasattr(entry, 'enclosures') and entry.enclosures:
+        for enc in entry.enclosures:
+            if enc.get('type', '').startswith('image'):
+                return enc.get('url')
+    return None
+
+
+def news_parse_date(entry) -> str:
+    """Parse publication date."""
+    if hasattr(entry, 'published_parsed') and entry.published_parsed:
+        try:
+            return datetime(*entry.published_parsed[:6], tzinfo=timezone.utc).isoformat()
+        except:
+            pass
+    if hasattr(entry, 'updated_parsed') and entry.updated_parsed:
+        try:
+            return datetime(*entry.updated_parsed[:6], tzinfo=timezone.utc).isoformat()
+        except:
+            pass
+    return datetime.now(timezone.utc).isoformat()
+
+
+def scrape_news_source(source_id: str, source_config: dict) -> List[Dict]:
+    """Scrape a single news source."""
+    import feedparser
+    import hashlib
+    
+    articles = []
+    
+    for feed_url in source_config.get("rss_feeds", []):
+        try:
+            feed = feedparser.parse(feed_url)
+            
+            for entry in feed.entries[:15]:
+                url = entry.get('link', '')
+                if not url:
+                    continue
+                
+                title = news_clean_html(entry.get('title', ''))
+                if not title:
+                    continue
+                
+                summary = news_clean_html(entry.get('summary', entry.get('description', '')))
+                if not summary:
+                    summary = title
+                
+                # Filter
+                if news_should_reject(title, summary):
+                    continue
+                
+                symbols = news_detect_symbols(f"{title} {summary}")
+                priority = news_calculate_priority(title, summary, symbols)
+                
+                if priority < 30:
+                    continue
+                
+                article = {
+                    "id": hashlib.md5(url.encode()).hexdigest()[:16],
+                    "title": title[:200],
+                    "summary": summary[:400],
+                    "url": url,
+                    "source_id": source_id,
+                    "source_name": source_config["name"],
+                    "source_logo": source_config.get("logo", ""),
+                    "source_color": source_config.get("color", "#333333"),
+                    "image_url": news_extract_image(entry),
+                    "published_at": news_parse_date(entry),
+                    "categories": source_config.get("categories", []),
+                    "symbols": symbols,
+                    "sentiment": None,
+                    "ai_summary": None,
+                    "priority": priority,
+                }
+                
+                articles.append(article)
+                
+        except Exception as e:
+            debug(NEWS_ARTICLES_TASK, f"Feed error {source_id}: {e}")
+    
+    return articles
+
+
+def store_news_articles(articles: List[Dict]) -> int:
+    """Store articles to Supabase."""
+    stored = 0
+    for article in articles:
+        try:
+            record = {
+                "id": article["id"],
+                "title": article["title"],
+                "summary": article["summary"],
+                "url": article["url"],
+                "source_id": article["source_id"],
+                "source_name": article["source_name"],
+                "source_logo": article["source_logo"],
+                "source_color": article["source_color"],
+                "image_url": article["image_url"],
+                "published_at": article["published_at"],
+                "categories": article["categories"],
+                "symbols": article["symbols"],
+                "sentiment": article["sentiment"],
+                "ai_summary": article["ai_summary"],
+                "priority": article["priority"],
+                "scraped_at": datetime.now(timezone.utc).isoformat(),
+            }
+            sb.table("news_articles").upsert(record, on_conflict="id").execute()
+            stored += 1
+        except Exception as e:
+            debug(NEWS_ARTICLES_TASK, f"Failed to store article: {e}")
+    return stored
+
+
+async def news_articles_task():
+    """Task 11: Scrape and store financial news articles."""
+    task_metrics = metrics.get_or_create(NEWS_ARTICLES_TASK)
+    
+    info(NEWS_ARTICLES_TASK, f"News Articles Scraper started ({len(NEWS_SOURCES_CONFIG)} sources)")
+    
+    while not tick_streamer._shutdown.is_set():
+        try:
+            now = datetime.now(timezone.utc)
+            
+            # Determine interval based on time
+            if now.weekday() >= 5:  # Weekend
+                interval = 7200  # 2 hours
+            elif 8 <= now.hour < 21:  # Market hours
+                interval = 900  # 15 minutes
+            else:  # Off hours
+                interval = 1800  # 30 minutes
+            
+            info(NEWS_ARTICLES_TASK, "Starting news scrape cycle...")
+            
+            all_articles = []
+            loop = asyncio.get_event_loop()
+            
+            for source_id, source_config in NEWS_SOURCES_CONFIG.items():
+                articles = await loop.run_in_executor(None, scrape_news_source, source_id, source_config)
+                all_articles.extend(articles)
+                debug(NEWS_ARTICLES_TASK, f"  {source_config['name']}: {len(articles)} articles")
+                await asyncio.sleep(0.5)  # Rate limit
+            
+            # Deduplicate by URL
+            seen_urls = set()
+            unique_articles = []
+            for article in all_articles:
+                if article["url"] not in seen_urls:
+                    seen_urls.add(article["url"])
+                    unique_articles.append(article)
+            
+            # Sort by priority
+            unique_articles.sort(key=lambda x: x["priority"], reverse=True)
+            unique_articles = unique_articles[:100]  # Limit
+            
+            # Store to database
+            stored = await loop.run_in_executor(None, store_news_articles, unique_articles)
+            
+            info(NEWS_ARTICLES_TASK, f"Scraped {len(unique_articles)} articles, stored {stored}")
+            
+            task_metrics.record_success()
+            task_metrics.custom_metrics.update({
+                "last_article_count": len(unique_articles),
+                "last_stored": stored,
+            })
+            
+            await asyncio.sleep(interval)
+            
+        except Exception as e:
+            error(NEWS_ARTICLES_TASK, f"Task error: {e}", exc_info=DEBUG_MODE)
+            task_metrics.record_error(str(e))
+            await asyncio.sleep(300)
+
+
+# ============================================================================
 #                              MAIN ENTRY POINT
 # ============================================================================
 
@@ -2720,9 +3180,10 @@ async def main():
         asyncio.create_task(bond_yield_task(), name="bonds"),
         asyncio.create_task(whale_flow_task(), name="whale"),
         asyncio.create_task(ai_news_desk_task(), name="ai_news"),
-        asyncio.create_task(macro_fetcher_task(), name="macro"),
+        # asyncio.create_task(macro_fetcher_task(), name="macro"),  # DISABLED - table not ready
         asyncio.create_task(index_poller_task(), name="index"),
         asyncio.create_task(sector_sentiment_task(), name="sentiment"),
+        asyncio.create_task(news_articles_task(), name="news_articles"),
     ]
     
     # Periodic metrics logging
