@@ -22,6 +22,7 @@ TASKS:
   7. AI News Desk       - Placeholder for article synthesis
   8. G20 Macro Fetcher  - 16 indicators x 20 countries (hourly)
   9. Index Poller       - 11 global indices via REST API (every 20 seconds)
+  10. Sector Sentiment  - AI market sentiment analysis (scheduled updates)
 
 ================================================================================
 """
@@ -2151,6 +2152,541 @@ async def index_poller_task():
 
 
 # ============================================================================
+#                    TASK 10: SECTOR SENTIMENT ENGINE
+# ============================================================================
+# AI-powered market sentiment analysis with Gemini explanations
+#
+# UPDATE SCHEDULE (UTC - all at :05 past the hour):
+# - London (07:00-12:00): Every 2 hours → 07:05, 09:05, 11:05
+# - US/London Overlap (12:00-16:00): Every 1 hour → 12:05, 13:05, 14:05, 15:05
+# - US Session (16:00-21:00): Every 2 hours → 16:05, 18:05, 20:05
+# - Off-Hours (21:00-07:00): Every 4 hours → 21:05, 01:05, 05:05
+# - Weekend: Every 12 hours → 07:05, 19:05
+# ============================================================================
+
+SENTIMENT_TASK = "SENTIMENT"
+
+SENTIMENT_SECTORS = {
+    "tech": {
+        "name": "Technology",
+        "symbols": ["AAPL.US", "MSFT.US", "NVDA.US", "META.US", "GOOGL.US", "AMZN.US", "TSM.US", "AVGO.US"],
+        "tags": ["technology", "ai", "artificial intelligence"],
+        "weight": 0.30,
+        "emoji": "💻",
+        "color": "#3B82F6"
+    },
+    "crypto": {
+        "name": "Cryptocurrency",
+        "symbols": ["BTC-USD.CC", "ETH-USD.CC", "SOL-USD.CC", "XRP-USD.CC", "ADA-USD.CC", "BNB-USD.CC"],
+        "tags": ["crypto", "bitcoin", "ethereum", "blockchain"],
+        "weight": 0.20,
+        "emoji": "₿",
+        "color": "#F59E0B"
+    },
+    "commodities": {
+        "name": "Commodities",
+        "symbols": [],
+        "tags": ["oil", "gold", "silver", "commodities", "natural gas", "copper"],
+        "weight": 0.20,
+        "emoji": "🛢️",
+        "color": "#10B981"
+    },
+    "us_market": {
+        "name": "US Market",
+        "symbols": ["GSPC.INDX", "DJI.INDX", "IXIC.INDX"],
+        "tags": ["economy", "fed", "federal reserve", "interest rate", "inflation", "earnings"],
+        "weight": 0.30,
+        "emoji": "🇺🇸",
+        "color": "#EF4444"
+    }
+}
+
+SENTIMENT_SCHEDULE = {
+    "london": {"hours": range(7, 12), "times": ["07:05", "09:05", "11:05"]},
+    "overlap": {"hours": range(12, 16), "times": ["12:05", "13:05", "14:05", "15:05"]},
+    "us": {"hours": range(16, 21), "times": ["16:05", "18:05", "20:05"]},
+    "off_hours": {"hours": list(range(21, 24)) + list(range(0, 7)), "times": ["21:05", "01:05", "05:05"]},
+    "weekend": {"times": ["07:05", "19:05"]}
+}
+
+
+def get_sentiment_session() -> str:
+    """Determine current trading session."""
+    now = datetime.now(timezone.utc)
+    if now.weekday() >= 5:
+        return "weekend"
+    hour = now.hour
+    if 7 <= hour < 12:
+        return "london"
+    elif 12 <= hour < 16:
+        return "overlap"
+    elif 16 <= hour < 21:
+        return "us"
+    return "off_hours"
+
+
+def get_next_sentiment_update() -> Tuple[datetime, str]:
+    """Calculate next scheduled sentiment update time."""
+    now = datetime.now(timezone.utc)
+    session = get_sentiment_session()
+    schedule = SENTIMENT_SCHEDULE[session]
+    
+    for time_str in schedule["times"]:
+        hour, minute = map(int, time_str.split(":"))
+        scheduled = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if scheduled > now:
+            return scheduled, session
+    
+    tomorrow = now + timedelta(days=1)
+    next_time = "07:05"
+    if tomorrow.weekday() >= 5:
+        next_time = SENTIMENT_SCHEDULE["weekend"]["times"][0]
+    
+    hour, minute = map(int, next_time.split(":"))
+    return tomorrow.replace(hour=hour, minute=minute, second=0, microsecond=0), session
+
+
+def should_run_sentiment_update() -> bool:
+    """Check if we should run sentiment update now."""
+    now = datetime.now(timezone.utc)
+    session = get_sentiment_session()
+    schedule = SENTIMENT_SCHEDULE[session]
+    
+    for time_str in schedule["times"]:
+        hour, minute = map(int, time_str.split(":"))
+        scheduled = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if abs((now - scheduled).total_seconds()) <= 120:
+            return True
+    return False
+
+
+def sentiment_transform_score(raw_score: float) -> int:
+    """Transform raw sentiment (-1 to +1) to final score (-95 to +95)."""
+    import math
+    raw_score = max(-1.0, min(1.0, raw_score))
+    compressed = math.tanh(1.5 * raw_score)
+    
+    if compressed >= 0:
+        scaled = math.pow(compressed, 0.7)
+        final = scaled * 95
+    else:
+        scaled = -math.pow(abs(compressed), 0.7)
+        final = scaled * 95
+    
+    if abs(final) > 85:
+        excess = abs(final) - 85
+        dampened_excess = 10 * math.log10(1 + excess / 10)
+        final = math.copysign(85 + dampened_excess, final)
+    
+    return int(max(-95, min(95, final)))
+
+
+def sentiment_get_label(score: int) -> str:
+    """Get sentiment label from score."""
+    if score <= -85:
+        return "EXTREME FEAR"
+    elif score <= -60:
+        return "VERY BEARISH"
+    elif score <= -35:
+        return "BEARISH"
+    elif score <= -15:
+        return "CAUTIOUS"
+    elif score <= 15:
+        return "NEUTRAL"
+    elif score <= 35:
+        return "OPTIMISTIC"
+    elif score <= 60:
+        return "BULLISH"
+    elif score <= 85:
+        return "VERY BULLISH"
+    return "EXTREME GREED"
+
+
+def fetch_eodhd_sentiment(symbol: str, days_back: int = 3) -> List[Dict]:
+    """Fetch daily aggregated sentiment from EODHD."""
+    try:
+        to_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        from_date = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%d")
+        
+        r = requests.get(
+            "https://eodhd.com/api/sentiments",
+            params={"s": symbol, "from": from_date, "to": to_date, "api_token": EODHD_API_KEY, "fmt": "json"},
+            timeout=30
+        )
+        if r.status_code == 200:
+            data = r.json()
+            return data.get(symbol, [])
+        return []
+    except Exception as e:
+        debug(SENTIMENT_TASK, f"Error fetching sentiment for {symbol}: {e}")
+        return []
+
+
+def fetch_eodhd_news_by_symbol(symbol: str, limit: int = 15) -> List[Dict]:
+    """Fetch news articles by symbol."""
+    try:
+        to_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        from_date = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%d")
+        
+        r = requests.get(
+            "https://eodhd.com/api/news",
+            params={"s": symbol, "from": from_date, "to": to_date, "limit": limit, "api_token": EODHD_API_KEY, "fmt": "json"},
+            timeout=30
+        )
+        if r.status_code == 200:
+            return r.json()
+        return []
+    except Exception as e:
+        debug(SENTIMENT_TASK, f"Error fetching news for {symbol}: {e}")
+        return []
+
+
+def fetch_eodhd_news_by_tag(tag: str, limit: int = 20) -> List[Dict]:
+    """Fetch news articles by topic tag."""
+    try:
+        to_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        from_date = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%d")
+        
+        r = requests.get(
+            "https://eodhd.com/api/news",
+            params={"t": tag, "from": from_date, "to": to_date, "limit": limit, "api_token": EODHD_API_KEY, "fmt": "json"},
+            timeout=30
+        )
+        if r.status_code == 200:
+            return r.json()
+        return []
+    except Exception as e:
+        debug(SENTIMENT_TASK, f"Error fetching news for tag {tag}: {e}")
+        return []
+
+
+def generate_sentiment_explanation(sector_name: str, score: int, label: str, 
+                                   article_count: int, top_articles: List[Dict]) -> str:
+    """Generate AI explanation using Gemini."""
+    if not GOOGLE_GEMINI_API_KEY:
+        return f"{sector_name} sentiment is {label.lower()} based on {article_count} articles analyzed."
+    
+    headlines = "\n".join([f"- {a.get('title', '')[:120]}" for a in top_articles[:10]])
+    
+    prompt = f"""You are a senior financial analyst writing a market intelligence briefing.
+
+SECTOR: {sector_name}
+SENTIMENT SCORE: {score:+d} (scale: -95 to +95)
+SENTIMENT LABEL: {label}
+ARTICLES ANALYZED: {article_count}
+
+TOP HEADLINES:
+{headlines}
+
+Write a 4-5 sentence analysis explaining the {sector_name} sentiment:
+1. State the overall sentiment and primary driver (name specific companies/events)
+2. Explain a supporting factor with concrete details
+3. Mention any counterbalancing risks
+4. What this means for traders/investors
+5. Any upcoming catalysts to watch
+
+Be specific with company names and events. Professional tone. No bullet points. 80-120 words."""
+
+    try:
+        response = requests.post(
+            f"{GEMINI_API_URL}?key={GOOGLE_GEMINI_API_KEY}",
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"temperature": 0.4, "maxOutputTokens": 300}
+            },
+            timeout=30
+        )
+        if response.status_code == 200:
+            data = response.json()
+            return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except Exception as e:
+        debug(SENTIMENT_TASK, f"Gemini error: {e}")
+    
+    return f"{sector_name} sentiment is {label.lower()} based on {article_count} articles."
+
+
+def generate_overall_sentiment_explanation(overall_score: int, overall_label: str, 
+                                           sector_data: Dict[str, Dict]) -> str:
+    """Generate overall market explanation using Gemini."""
+    if not GOOGLE_GEMINI_API_KEY:
+        return f"Overall market sentiment is {overall_label.lower()}."
+    
+    sector_summary = "\n".join([
+        f"- {s['name']}: {s['score']:+d} ({s['label']})"
+        for sid, s in sector_data.items() if sid != 'overall'
+    ])
+    
+    prompt = f"""You are a senior market strategist writing a daily market intelligence summary.
+
+OVERALL SCORE: {overall_score:+d} (scale: -95 to +95)
+OVERALL LABEL: {overall_label}
+
+SECTOR BREAKDOWN:
+{sector_summary}
+
+Write a 4-5 sentence executive summary:
+1. Declare overall market mood and dominant theme
+2. Which sectors are leading and why
+3. Note any sector divergences
+4. What this suggests for market direction
+5. Key risk or catalyst to monitor
+
+Professional tone for institutional investors. No bullet points. 90-130 words."""
+
+    try:
+        response = requests.post(
+            f"{GEMINI_API_URL}?key={GOOGLE_GEMINI_API_KEY}",
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"temperature": 0.4, "maxOutputTokens": 350}
+            },
+            timeout=30
+        )
+        if response.status_code == 200:
+            data = response.json()
+            return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except Exception as e:
+        debug(SENTIMENT_TASK, f"Gemini error: {e}")
+    
+    return f"Market sentiment is {overall_label.lower()} across major sectors."
+
+
+def extract_sentiment_key_drivers(articles: List[Dict], top_n: int = 5) -> List[str]:
+    """Extract key drivers from article titles."""
+    if not articles:
+        return []
+    
+    sorted_articles = sorted(
+        articles,
+        key=lambda a: abs(a.get("sentiment", {}).get("pos", 0) - a.get("sentiment", {}).get("neg", 0)),
+        reverse=True
+    )
+    
+    drivers = []
+    for article in sorted_articles[:top_n]:
+        title = article.get("title", "")[:80]
+        sentiment = article.get("sentiment", {})
+        pos = sentiment.get("pos", 0)
+        neg = sentiment.get("neg", 0)
+        direction = "📈" if pos > neg else "📉" if neg > pos else "➡️"
+        drivers.append(f"{direction} {title}")
+    
+    return drivers
+
+
+def analyze_sentiment_sector(sector_id: str, sector_config: Dict) -> Dict:
+    """Analyze sentiment for a single sector."""
+    debug(SENTIMENT_TASK, f"Analyzing {sector_config['name']}...")
+    
+    all_articles = []
+    sentiment_scores = []
+    
+    for symbol in sector_config.get("symbols", []):
+        daily_sent = fetch_eodhd_sentiment(symbol, days_back=3)
+        if daily_sent:
+            latest = daily_sent[0]
+            normalized = latest.get("normalized", 0)
+            count = latest.get("count", 0)
+            sentiment_scores.append((normalized, count))
+            debug(SENTIMENT_TASK, f"  {symbol}: {normalized:.3f} ({count} articles)")
+        
+        articles = fetch_eodhd_news_by_symbol(symbol, limit=15)
+        all_articles.extend(articles)
+    
+    for tag in sector_config.get("tags", []):
+        articles = fetch_eodhd_news_by_tag(tag, limit=20)
+        all_articles.extend(articles)
+    
+    seen_urls = set()
+    unique_articles = []
+    for article in all_articles:
+        url = article.get("link", "")
+        if url and url not in seen_urls:
+            seen_urls.add(url)
+            unique_articles.append(article)
+    
+    debug(SENTIMENT_TASK, f"  Total unique articles: {len(unique_articles)}")
+    
+    if sentiment_scores:
+        total_weight = sum(count for _, count in sentiment_scores)
+        if total_weight > 0:
+            raw_score = sum(score * count for score, count in sentiment_scores) / total_weight
+        else:
+            raw_score = sum(score for score, _ in sentiment_scores) / len(sentiment_scores)
+    elif unique_articles:
+        scores = []
+        for article in unique_articles:
+            sent = article.get("sentiment", {})
+            if sent:
+                pos = sent.get("pos", 0)
+                neg = sent.get("neg", 0)
+                polarity = sent.get("polarity", 0.5)
+                scores.append((pos - neg) * polarity)
+        raw_score = sum(scores) / len(scores) if scores else 0
+    else:
+        raw_score = 0
+    
+    final_score = sentiment_transform_score(raw_score)
+    label = sentiment_get_label(final_score)
+    confidence = min(1.0, len(unique_articles) / 50)
+    key_drivers = extract_sentiment_key_drivers(unique_articles, top_n=5)
+    
+    explanation = generate_sentiment_explanation(
+        sector_config["name"], final_score, label, len(unique_articles), unique_articles[:10]
+    )
+    
+    return {
+        "sector_id": sector_id,
+        "name": sector_config["name"],
+        "emoji": sector_config["emoji"],
+        "color": sector_config["color"],
+        "score": final_score,
+        "raw_score": round(raw_score, 4),
+        "label": label,
+        "confidence": round(confidence, 2),
+        "explanation": explanation,
+        "key_drivers": key_drivers,
+        "article_count": len(unique_articles),
+        "top_articles": [
+            {
+                "title": a.get("title", "")[:100],
+                "url": a.get("link", ""),
+                "sentiment": {"pos": a.get("sentiment", {}).get("pos", 0), "neg": a.get("sentiment", {}).get("neg", 0)}
+            }
+            for a in unique_articles[:10]
+        ]
+    }
+
+
+def store_sentiment_to_supabase(sector_data: Dict, session: str) -> bool:
+    """Store sentiment data in Supabase."""
+    try:
+        record = {
+            "sector_id": sector_data["sector_id"],
+            "name": sector_data["name"],
+            "emoji": sector_data["emoji"],
+            "color": sector_data["color"],
+            "score": sector_data["score"],
+            "raw_score": sector_data["raw_score"],
+            "label": sector_data["label"],
+            "confidence": sector_data["confidence"],
+            "explanation": sector_data["explanation"],
+            "key_drivers": sector_data["key_drivers"],
+            "article_count": sector_data["article_count"],
+            "top_articles": sector_data["top_articles"],
+            "session": session,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }
+        
+        sb.table("sector_sentiment").upsert(record, on_conflict="sector_id").execute()
+        
+        history_record = {
+            "sector_id": sector_data["sector_id"],
+            "score": sector_data["score"],
+            "raw_score": sector_data["raw_score"],
+            "label": sector_data["label"],
+            "session": session
+        }
+        sb.table("sector_sentiment_history").insert(history_record).execute()
+        
+        return True
+    except Exception as e:
+        error(SENTIMENT_TASK, f"Failed to store {sector_data['sector_id']}: {e}")
+        return False
+
+
+async def sector_sentiment_task():
+    """Task 10: Sector Sentiment Engine with AI analysis."""
+    task_metrics = metrics.get_or_create(SENTIMENT_TASK)
+    
+    info(SENTIMENT_TASK, f"Sector Sentiment Engine started ({len(SENTIMENT_SECTORS)} sectors)")
+    
+    last_run_key = None
+    
+    while not tick_streamer._shutdown.is_set():
+        try:
+            now = datetime.now(timezone.utc)
+            session = get_sentiment_session()
+            
+            if should_run_sentiment_update():
+                current_key = f"{now.hour}:{now.minute // 5 * 5}"
+                if last_run_key == current_key:
+                    await asyncio.sleep(60)
+                    continue
+                last_run_key = current_key
+                
+                info(SENTIMENT_TASK, f"Starting sentiment analysis ({session} session)")
+                
+                sector_results = {}
+                loop = asyncio.get_event_loop()
+                
+                for sector_id, sector_config in SENTIMENT_SECTORS.items():
+                    result = await loop.run_in_executor(None, analyze_sentiment_sector, sector_id, sector_config)
+                    sector_results[sector_id] = result
+                    info(SENTIMENT_TASK, f"  {result['name']}: {result['score']:+d} ({result['label']})")
+                    await asyncio.sleep(0.5)
+                
+                total_weight = sum(SENTIMENT_SECTORS[s]["weight"] for s in sector_results)
+                overall_raw = sum(
+                    sector_results[s]["raw_score"] * SENTIMENT_SECTORS[s]["weight"]
+                    for s in sector_results
+                ) / total_weight
+                
+                overall_score = sentiment_transform_score(overall_raw)
+                overall_label = sentiment_get_label(overall_score)
+                total_articles = sum(s["article_count"] for s in sector_results.values())
+                
+                overall_explanation = await loop.run_in_executor(
+                    None, generate_overall_sentiment_explanation, overall_score, overall_label, sector_results
+                )
+                
+                overall_data = {
+                    "sector_id": "overall",
+                    "name": "Overall Market",
+                    "emoji": "🌍",
+                    "color": "#6366F1",
+                    "score": overall_score,
+                    "raw_score": round(overall_raw, 4),
+                    "label": overall_label,
+                    "confidence": 0.85,
+                    "explanation": overall_explanation,
+                    "key_drivers": [],
+                    "article_count": total_articles,
+                    "top_articles": []
+                }
+                
+                info(SENTIMENT_TASK, f"  Overall: {overall_score:+d} ({overall_label})")
+                
+                stored = 0
+                for sector_id, data in sector_results.items():
+                    if store_sentiment_to_supabase(data, session):
+                        stored += 1
+                
+                if store_sentiment_to_supabase(overall_data, session):
+                    stored += 1
+                
+                info(SENTIMENT_TASK, f"Complete: {stored}/{len(sector_results) + 1} sectors stored")
+                
+                next_update, _ = get_next_sentiment_update()
+                info(SENTIMENT_TASK, f"Next update: {next_update.strftime('%H:%M')} UTC")
+                
+                task_metrics.record_success()
+                task_metrics.custom_metrics.update({
+                    "last_overall_score": overall_score,
+                    "last_session": session,
+                    "sectors_analyzed": len(sector_results),
+                    "total_articles": total_articles
+                })
+            
+            await asyncio.sleep(30)
+            
+        except Exception as e:
+            error(SENTIMENT_TASK, f"Task error: {e}", exc_info=DEBUG_MODE)
+            task_metrics.record_error(str(e))
+            await asyncio.sleep(60)
+
+
+# ============================================================================
 #                              MAIN ENTRY POINT
 # ============================================================================
 
@@ -2186,6 +2722,7 @@ async def main():
         asyncio.create_task(ai_news_desk_task(), name="ai_news"),
         asyncio.create_task(macro_fetcher_task(), name="macro"),
         asyncio.create_task(index_poller_task(), name="index"),
+        asyncio.create_task(sector_sentiment_task(), name="sentiment"),
     ]
     
     # Periodic metrics logging
