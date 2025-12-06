@@ -20,7 +20,7 @@ TASKS:
   5. Bond Yields        - G20 sovereign yields (every 30 minutes)
   6. Whale Flow Tracker - BTC whale movements via Blockchain.com WebSocket
   7. AI News Desk       - Placeholder for article synthesis
-  8. G20 Macro Fetcher  - DISABLED (table not ready)
+  8. G20 Macro Fetcher  - 20 countries x 6 indicators (hourly)
   9. Index Poller       - 11 global indices via REST API (every 20 seconds)
   10. Sector Sentiment  - AI market sentiment analysis (scheduled updates)
   11. News Articles     - Multi-source news scraper with filtering
@@ -3180,7 +3180,7 @@ async def main():
         asyncio.create_task(bond_yield_task(), name="bonds"),
         asyncio.create_task(whale_flow_task(), name="whale"),
         asyncio.create_task(ai_news_desk_task(), name="ai_news"),
-        # asyncio.create_task(macro_fetcher_task(), name="macro"),  # DISABLED - table not ready
+        asyncio.create_task(macro_fetcher_task(), name="macro"),
         asyncio.create_task(index_poller_task(), name="index"),
         asyncio.create_task(sector_sentiment_task(), name="sentiment"),
         asyncio.create_task(news_articles_task(), name="news_articles"),
