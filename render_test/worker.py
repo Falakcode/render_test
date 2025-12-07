@@ -3245,7 +3245,7 @@ async def main():
     tasks = [
         asyncio.create_task(tick_streaming_task(), name="tick_stream"),
         asyncio.create_task(economic_calendar_task(), name="calendar"),
-        asyncio.create_task(financial_news_task(), name="news"),
+        # asyncio.create_task(financial_news_task(), name="news"),  # DISABLED - uses non-existent financial_news table, replaced by news_articles_task
         asyncio.create_task(gap_fill_task(), name="gap_fill"),
         asyncio.create_task(bond_yield_task(), name="bonds"),
         asyncio.create_task(whale_flow_task(), name="whale"),
