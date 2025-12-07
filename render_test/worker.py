@@ -50,6 +50,7 @@ import requests
 from bs4 import BeautifulSoup
 from supabase import create_client
 import feedparser
+import pytz
 
 # ============================================================================
 #                              CONFIGURATION
@@ -508,6 +509,70 @@ INDEX_SYMBOLS = {
 }
 
 # ============================================================================
+#                          MARKET HOURS FILTER
+# ============================================================================
+# Prevents bad tick data during market close from corrupting charts.
+# Uses pytz for automatic DST handling.
+
+# Eastern Time zone (handles DST automatically)
+ET = pytz.timezone('America/New_York')
+
+# Crypto symbols that trade 24/7
+CRYPTO_BASE_SYMBOLS = {
+    'BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'DOGE', 'BNB', 'AVAX', 'DOT', 'LINK',
+    'ATOM', 'LTC', 'ALGO', 'NEAR', 'FIL', 'AAVE', 'UNI', 'COMP', 'CRV', 'XLM',
+    'ARB', 'OP', 'SAND', 'MANA', 'LDO', 'SNX', 'VET', 'MATIC', 'FTM', 'ICP',
+    'IMX', 'APT', 'AXS', 'BLUR', 'CHZ', 'ENJ', 'GALA', 'GMX', 'MKR', 'RPL',
+    'DAI', 'USDC', 'USDT', 'BUSD', 'TUSD'
+}
+
+
+def is_crypto_symbol(symbol: str) -> bool:
+    """Check if symbol is a crypto pair (trades 24/7)."""
+    symbol_upper = symbol.upper().replace('/', '').replace('-', '')
+    # Check if any crypto base is in the symbol
+    for crypto in CRYPTO_BASE_SYMBOLS:
+        if crypto in symbol_upper:
+            return True
+    return False
+
+
+def is_market_open(symbol: str) -> bool:
+    """
+    Check if market is open for a given symbol.
+    
+    - Crypto: Always open (24/7)
+    - Forex/Stocks/ETFs: Closed Friday 5PM ET to Sunday 5PM ET
+    
+    Uses pytz for automatic DST handling.
+    """
+    # Crypto trades 24/7
+    if is_crypto_symbol(symbol):
+        return True
+    
+    # Get current time in Eastern Time (DST-aware)
+    now_et = datetime.now(ET)
+    weekday = now_et.weekday()  # 0=Monday, 4=Friday, 5=Saturday, 6=Sunday
+    hour = now_et.hour
+    
+    # Forex/Stocks closed: Friday 5PM ET to Sunday 5PM ET
+    # Friday (4) after 5PM = closed
+    if weekday == 4 and hour >= 17:
+        return False
+    
+    # Saturday (5) = closed all day
+    if weekday == 5:
+        return False
+    
+    # Sunday (6) before 5PM = closed
+    if weekday == 6 and hour < 17:
+        return False
+    
+    # All other times = open
+    return True
+
+
+# ============================================================================
 #                          EODHD WEBSOCKET CONFIG
 # ============================================================================
 
@@ -711,6 +776,11 @@ class EODHDTickStreamer:
                 return
             
             normalized = self._normalize_symbol(symbol, endpoint)
+            
+            # Skip ticks when market is closed (prevents weekend/after-hours garbage data)
+            if not is_market_open(normalized):
+                return
+            
             price = self._to_float(data.get("p", data.get("price")))
             bid = self._to_float(data.get("b", data.get("bid")))
             ask = self._to_float(data.get("a", data.get("ask")))
