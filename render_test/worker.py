@@ -2988,16 +2988,6 @@ NEWS_SOURCES_CONFIG = {
         "rss_feeds": ["https://finance.yahoo.com/news/rssindex"],
         "categories": ["markets", "stocks", "economy"],
     },
-    "marketwatch": {
-        "name": "MarketWatch",
-        "logo": "https://mw3.wsj.net/mw5/content/logos/mw_logo_social.png",
-        "color": "#00AC4E",
-        "rss_feeds": [
-            "http://feeds.marketwatch.com/marketwatch/topstories/",
-            "http://feeds.marketwatch.com/marketwatch/marketpulse/",
-        ],
-        "categories": ["markets", "stocks"],
-    },
     "cnbc": {
         "name": "CNBC",
         "logo": "https://sc.cnbcfm.com/applications/cnbc.com/staticcontent/img/cnbc_logo.gif",
