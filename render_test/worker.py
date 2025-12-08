@@ -21,9 +21,8 @@ TASKS:
   6. Whale Flow Tracker - BTC whale movements via Blockchain.com WebSocket
   7. AI News Desk       - Placeholder for article synthesis
   8. G20 Macro Fetcher  - 20 countries x 6 indicators (hourly)
-  9. Index Poller       - 11 global indices via REST API (every 20 seconds)
-  10. Sector Sentiment  - AI market sentiment analysis (scheduled updates)
-  11. News Articles     - Multi-source news scraper with filtering
+  9. Sector Sentiment   - AI market sentiment analysis (scheduled updates)
+  10. News Articles     - Multi-source news scraper with filtering
 
 ================================================================================
 """
@@ -83,7 +82,6 @@ MAX_GAP_HOURS = 4
 GAP_SCAN_INTERVAL = 300
 BOND_SCRAPE_INTERVAL = 1800
 MACRO_FETCH_INTERVAL = 3600
-INDEX_POLL_INTERVAL = 20
 CALENDAR_FETCH_INTERVAL = 300
 NEWS_SCAN_INTERVAL_ACTIVE = 600
 NEWS_SCAN_INTERVAL_QUIET = 1800
@@ -494,20 +492,6 @@ ALL_ETFS = ETFS
 TOTAL_SYMBOLS = len(ALL_FOREX) + len(ALL_CRYPTO) + len(ALL_US_STOCKS) + len(ALL_ETFS)
 
 # Index symbols: EODHD API symbol -> (display_symbol, candle_table)
-INDEX_SYMBOLS = {
-    "GSPC.INDX": ("SPX", "candles_spx"),
-    "DJI.INDX": ("US30", "candles_us30"),
-    "IXIC.INDX": ("NASDAQ", "candles_nasdaq"),
-    "NDX.INDX": ("NAS100", "candles_nas100"),
-    "RUT.INDX": ("RUT", "candles_rut"),
-    "FTSE.INDX": ("UK100", "candles_uk100"),
-    "GDAXI.INDX": ("DAX", "candles_dax"),
-    "FCHI.INDX": ("CAC40", "candles_cac40"),
-    "N225.INDX": ("NIKKEI", "candles_nikkei"),
-    "HSI.INDX": ("HSI", "candles_hsi"),
-    "STOXX50E.INDX": ("STOXX50", "candles_stoxx50"),
-}
-
 # ============================================================================
 #                          MARKET HOURS FILTER
 # ============================================================================
@@ -634,7 +618,6 @@ def run_startup_diagnostics():
     log.info(f"  DEBUG_LOG_RESPONSES: {DEBUG_LOG_RESPONSES}")
     log.info(f"  BATCH_MAX: {BATCH_MAX}")
     log.info(f"  BATCH_FLUSH_INTERVAL: {BATCH_FLUSH_INTERVAL}s")
-    log.info(f"  INDEX_POLL_INTERVAL: {INDEX_POLL_INTERVAL}s")
     log.info(f"  CALENDAR_FETCH_INTERVAL: {CALENDAR_FETCH_INTERVAL}s")
     
     # Log symbol counts
@@ -644,8 +627,7 @@ def run_startup_diagnostics():
     log.info(f"  Crypto: {len(ALL_CRYPTO)}")
     log.info(f"  US Stocks: {len(ALL_US_STOCKS)}")
     log.info(f"  ETFs: {len(ALL_ETFS)}")
-    log.info(f"  Indices: {len(INDEX_SYMBOLS)}")
-    log.info(f"  TOTAL: {TOTAL_SYMBOLS + len(INDEX_SYMBOLS)}")
+    log.info(f"  TOTAL: {TOTAL_SYMBOLS}")
     
     # Test Supabase connection
     log.info("")
@@ -2732,197 +2714,6 @@ async def macro_fetcher_task():
 
 
 # ============================================================================
-#                    TASK 9: INDEX POLLER
-# ============================================================================
-
-INDEX_TASK = "INDEX_POLLER"
-
-# Track minute-level OHLC in memory
-_index_minute_ohlc: Dict[str, Dict[str, Dict[str, float]]] = {}
-_index_ohlc_lock = threading.Lock()
-
-
-def update_minute_ohlc(symbol: str, minute_ts: str, price: float) -> Dict[str, float]:
-    """Track minute-level OHLC since API only provides daily values."""
-    with _index_ohlc_lock:
-        if symbol not in _index_minute_ohlc:
-            _index_minute_ohlc[symbol] = {}
-        
-        candles = _index_minute_ohlc[symbol]
-        
-        # Cleanup old minutes
-        if len(candles) > 10:
-            sorted_minutes = sorted(candles.keys())
-            for old_minute in sorted_minutes[:-5]:
-                del candles[old_minute]
-        
-        if minute_ts not in candles:
-            candles[minute_ts] = {
-                "open": price,
-                "high": price,
-                "low": price,
-                "close": price
-            }
-        else:
-            c = candles[minute_ts]
-            c["high"] = max(c["high"], price)
-            c["low"] = min(c["low"], price)
-            c["close"] = price
-        
-        return candles[minute_ts].copy()
-
-
-def fetch_index_realtime(eodhd_symbol: str) -> Tuple[Optional[Dict], Optional[str]]:
-    """Fetch real-time index quote. Returns (data, error)."""
-    url = f"https://eodhd.com/api/real-time/{eodhd_symbol}"
-    params = {"api_token": EODHD_API_KEY, "fmt": "json"}
-    
-    try:
-        response = requests.get(url, params=params, timeout=10)
-        
-        if response.status_code == 200:
-            data = response.json()
-            if data and data.get("close") and data.get("close") != "NA":
-                return data, None
-            return None, "Invalid data"
-        return None, f"HTTP {response.status_code}"
-        
-    except Exception as e:
-        return None, str(e)
-
-
-def fetch_all_indices_parallel() -> Dict[str, Tuple[Optional[Dict], Optional[str]]]:
-    """Fetch all indices in parallel."""
-    results = {}
-    
-    with ThreadPoolExecutor(max_workers=11) as executor:
-        futures = {
-            executor.submit(fetch_index_realtime, sym): sym 
-            for sym in INDEX_SYMBOLS.keys()
-        }
-        
-        for future in as_completed(futures):
-            symbol = futures[future]
-            try:
-                data, err = future.result()
-                results[symbol] = (data, err)
-            except Exception as e:
-                results[symbol] = (None, str(e))
-    
-    return results
-
-
-def run_index_poll_cycle() -> Tuple[int, int, List[str]]:
-    """Run one index polling cycle. Returns (updated, errors, error_messages)."""
-    results = fetch_all_indices_parallel()
-    updated = 0
-    error_count = 0
-    error_messages = []
-    
-    now = datetime.now(timezone.utc)
-    minute_ts = now.replace(second=0, microsecond=0).isoformat()
-    
-    for eodhd_symbol, (display_symbol, candle_table) in INDEX_SYMBOLS.items():
-        data, fetch_error = results.get(eodhd_symbol, (None, "Not fetched"))
-        
-        if fetch_error or not data:
-            error_count += 1
-            if fetch_error:
-                error_messages.append(f"{display_symbol}: {fetch_error}")
-            continue
-        
-        try:
-            price = float(data["close"])
-            minute_ohlc = update_minute_ohlc(display_symbol, minute_ts, price)
-            
-            # Insert to tickdata (use 'volume' column)
-            try:
-                tick = {
-                    "symbol": display_symbol,
-                    "price": price,
-                    "bid": None,
-                    "ask": None,
-                    "volume": None,
-                    "ts": now.isoformat(),
-                }
-                sb.table(SUPABASE_TABLE).insert(tick).execute()
-            except Exception as e:
-                error_messages.append(f"{display_symbol} tickdata: {str(e)[:50]}")
-            
-            # Upsert candle
-            try:
-                candle = {
-                    "timestamp": minute_ts,
-                    "open": minute_ohlc["open"],
-                    "high": minute_ohlc["high"],
-                    "low": minute_ohlc["low"],
-                    "close": minute_ohlc["close"],
-                    "volume": None,
-                }
-                sb.table(candle_table).upsert(candle, on_conflict="timestamp").execute()
-            except Exception as e:
-                error_messages.append(f"{display_symbol} candle: {str(e)[:50]}")
-            
-            updated += 1
-            
-        except Exception as e:
-            error_count += 1
-            error_messages.append(f"{display_symbol}: {str(e)[:50]}")
-    
-    return updated, error_count, error_messages
-
-
-async def index_poller_task():
-    """Task 9: Poll global indices via REST API."""
-    task_metrics = metrics.get_or_create(INDEX_TASK)
-    
-    info(INDEX_TASK, f"Index Poller started ({len(INDEX_SYMBOLS)} indices, every {INDEX_POLL_INTERVAL}s)")
-    await asyncio.sleep(5)
-    
-    poll_count = 0
-    total_updates = 0
-    
-    while not tick_streamer._shutdown.is_set():
-        try:
-            poll_count += 1
-            
-            loop = asyncio.get_event_loop()
-            updated, errors, error_messages = await loop.run_in_executor(
-                None, run_index_poll_cycle
-            )
-            
-            total_updates += updated
-            
-            # Log progress
-            if poll_count <= 10 or poll_count % 30 == 0:
-                info(INDEX_TASK, f"Poll #{poll_count}: {updated}/{len(INDEX_SYMBOLS)} updated, {errors} errors")
-            
-            # Log errors in debug mode
-            if DEBUG_MODE and error_messages:
-                for msg in error_messages[:5]:
-                    debug(INDEX_TASK, f"  {msg}")
-            
-            if updated > 0:
-                task_metrics.record_success()
-            elif errors > 0:
-                task_metrics.record_error(f"{errors} fetch errors")
-            
-            task_metrics.custom_metrics.update({
-                "poll_count": poll_count,
-                "total_updates": total_updates,
-                "last_updated": updated,
-                "last_errors": errors,
-            })
-            
-            await asyncio.sleep(INDEX_POLL_INTERVAL)
-            
-        except Exception as e:
-            error(INDEX_TASK, f"Task error: {e}", exc_info=DEBUG_MODE)
-            task_metrics.record_error(str(e))
-            await asyncio.sleep(60)
-
-
-# ============================================================================
 #                    TASK 10: SECTOR SENTIMENT ENGINE
 # ============================================================================
 # AI-powered market sentiment analysis with Gemini explanations
@@ -3820,7 +3611,6 @@ async def main():
         asyncio.create_task(whale_flow_task(), name="whale"),
         asyncio.create_task(ai_news_desk_task(), name="ai_news"),
         asyncio.create_task(macro_fetcher_task(), name="macro"),
-        asyncio.create_task(index_poller_task(), name="index"),
         asyncio.create_task(sector_sentiment_task(), name="sentiment"),
         asyncio.create_task(news_articles_task(), name="news_articles"),
     ]
