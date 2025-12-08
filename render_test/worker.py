@@ -17,13 +17,12 @@ TASKS:
   2. Economic Calendar  - EODHD API (every 5 min)
   3. Financial News     - RSS feeds + Gemini AI classification
   4. Gap Fill Service   - Auto-detect and repair missing candle data
-  5. Bond Yields        - G20 sovereign yields (every 30 minutes)
-  6. Whale Flow Tracker - BTC whale movements via Blockchain.com WebSocket
-  7. AI News Desk       - Placeholder for article synthesis
-  8. G20 Macro Fetcher  - 20 countries x 6 indicators (hourly)
-  9. Sector Sentiment   - AI market sentiment analysis (scheduled updates)
-  10. News Articles     - Multi-source news scraper with filtering
-  11. OANDA Streaming   - Commodities & indices real-time (24 instruments)
+  5. Whale Flow Tracker - BTC whale movements via Blockchain.com WebSocket
+  6. AI News Desk       - Placeholder for article synthesis
+  7. Sector Sentiment   - AI market sentiment analysis (scheduled updates)
+  8. News Articles      - Multi-source news scraper with filtering
+  9. OANDA Streaming    - Commodities & indices real-time (24 instruments)
+  10. Bond Yields 4H    - Government bonds via OANDA streaming (6 bonds)
 
 ================================================================================
 """
@@ -1612,138 +1611,6 @@ async def gap_fill_task():
 
 
 # ============================================================================
-#                    TASK 5: BOND YIELDS
-# ============================================================================
-
-BOND_TASK = "BOND_YIELDS"
-
-G20_BONDS = [
-    {"country": "US", "name": "United States", "url": "https://www.investing.com/rates-bonds/u.s.-10-year-bond-yield"},
-    {"country": "DE", "name": "Germany", "url": "https://www.investing.com/rates-bonds/germany-10-year-bond-yield"},
-    {"country": "GB", "name": "United Kingdom", "url": "https://www.investing.com/rates-bonds/uk-10-year-bond-yield"},
-    {"country": "JP", "name": "Japan", "url": "https://www.investing.com/rates-bonds/japan-10-year-bond-yield"},
-    {"country": "FR", "name": "France", "url": "https://www.investing.com/rates-bonds/france-10-year-bond-yield"},
-    {"country": "IT", "name": "Italy", "url": "https://www.investing.com/rates-bonds/italy-10-year-bond-yield"},
-    {"country": "CA", "name": "Canada", "url": "https://www.investing.com/rates-bonds/canada-10-year-bond-yield"},
-    {"country": "AU", "name": "Australia", "url": "https://www.investing.com/rates-bonds/australia-10-year-bond-yield"},
-    {"country": "CN", "name": "China", "url": "https://www.investing.com/rates-bonds/china-10-year-bond-yield"},
-    {"country": "IN", "name": "India", "url": "https://www.investing.com/rates-bonds/india-10-year-bond-yield"},
-    {"country": "BR", "name": "Brazil", "url": "https://www.investing.com/rates-bonds/brazil-10-year-bond-yield"},
-    {"country": "MX", "name": "Mexico", "url": "https://www.investing.com/rates-bonds/mexico-10-year-bond-yield"},
-]
-
-
-def scrape_bond_yield(url: str) -> Tuple[Optional[float], Optional[str]]:
-    """Scrape bond yield from Investing.com. Returns (yield, error)."""
-    try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        response = requests.get(url, headers=headers, timeout=15)
-        
-        if response.status_code != 200:
-            return None, f"HTTP {response.status_code}"
-        
-        soup = BeautifulSoup(response.text, "html.parser")
-        price_elem = soup.find("span", {"data-test": "instrument-price-last"})
-        
-        if price_elem:
-            yield_val = float(price_elem.text.strip().replace(",", ""))
-            return yield_val, None
-        
-        return None, "Price element not found"
-        
-    except Exception as e:
-        return None, str(e)
-
-
-def store_bond_yield(data: Dict) -> Tuple[bool, Optional[str]]:
-    """Store bond yield data. Returns (success, error)."""
-    try:
-        # Try insert first, then update if exists
-        sb.table("sovereign_yields").insert(data).execute()
-        return True, None
-    except Exception as e:
-        error_str = str(e).lower()
-        if "duplicate" in error_str or "unique" in error_str or "conflict" in error_str:
-            # Try update instead
-            try:
-                sb.table("sovereign_yields").update({
-                    "yield_10y": data["yield_10y"],
-                    "scraped_at": data["scraped_at"],
-                }).eq("country", data["country"]).execute()
-                return True, None
-            except Exception as e2:
-                return False, str(e2)
-        return False, str(e)
-
-
-async def bond_yield_task():
-    """Task 5: Scrape and store G20 bond yields."""
-    task_metrics = metrics.get_or_create(BOND_TASK)
-    
-    info(BOND_TASK, f"Bond yield scraper started ({len(G20_BONDS)} countries)")
-    
-    while not tick_streamer._shutdown.is_set():
-        try:
-            info(BOND_TASK, "Scraping G20 bond yields...")
-            
-            success_count = 0
-            error_count = 0
-            results = []
-            
-            loop = asyncio.get_event_loop()
-            
-            for bond in G20_BONDS:
-                yield_val, scrape_error = await loop.run_in_executor(
-                    None, scrape_bond_yield, bond["url"]
-                )
-                
-                if scrape_error:
-                    debug(BOND_TASK, f"  {bond['country']}: Scrape error - {scrape_error}")
-                    error_count += 1
-                    continue
-                
-                data = {
-                    "country": bond["country"],
-                    "country_name": bond["name"],
-                    "yield_10y": yield_val,
-                    "yield_2y": None,
-                    "spread_10y_2y": None,
-                    "scraped_at": datetime.now(timezone.utc).isoformat(),
-                }
-                
-                stored, store_error = store_bond_yield(data)
-                
-                if stored:
-                    success_count += 1
-                    results.append(f"{bond['country']}:{yield_val:.2f}%")
-                else:
-                    debug(BOND_TASK, f"  {bond['country']}: Store error - {store_error}")
-                    error_count += 1
-                
-                await asyncio.sleep(1)  # Rate limit scraping
-            
-            info(BOND_TASK, f"Bond scrape complete: {success_count}/{len(G20_BONDS)} countries")
-            if DEBUG_MODE and results:
-                debug(BOND_TASK, f"  Yields: {', '.join(results[:6])}")
-            
-            if success_count > 0:
-                task_metrics.record_success()
-            else:
-                task_metrics.record_error("No yields scraped")
-            
-            task_metrics.custom_metrics.update({
-                "last_success_count": success_count,
-                "last_error_count": error_count,
-            })
-            
-            await asyncio.sleep(BOND_SCRAPE_INTERVAL)
-            
-        except Exception as e:
-            error(BOND_TASK, f"Task error: {e}", exc_info=DEBUG_MODE)
-            task_metrics.record_error(str(e))
-            await asyncio.sleep(300)
-
-# ============================================================================
 #                    TASK 6: BTC WHALE FLOW TRACKER v3.2
 # ============================================================================
 """
@@ -2564,158 +2431,6 @@ async def ai_news_desk_task():
             
         except Exception as e:
             error(AI_NEWS_TASK, f"Task error: {e}", exc_info=DEBUG_MODE)
-            task_metrics.record_error(str(e))
-            await asyncio.sleep(300)
-
-
-# ============================================================================
-#                    TASK 8: G20 MACRO FETCHER
-# ============================================================================
-
-MACRO_TASK = "MACRO_FETCHER"
-
-G20_MACRO_COUNTRIES = {
-    "US": {"name": "United States", "currency": "USD"},
-    "UK": {"name": "United Kingdom", "currency": "GBP"},
-    "DE": {"name": "Germany", "currency": "EUR"},
-    "FR": {"name": "France", "currency": "EUR"},
-    "IT": {"name": "Italy", "currency": "EUR"},
-    "JP": {"name": "Japan", "currency": "JPY"},
-    "CN": {"name": "China", "currency": "CNY"},
-    "IN": {"name": "India", "currency": "INR"},
-    "BR": {"name": "Brazil", "currency": "BRL"},
-    "RU": {"name": "Russia", "currency": "RUB"},
-    "CA": {"name": "Canada", "currency": "CAD"},
-    "AU": {"name": "Australia", "currency": "AUD"},
-    "MX": {"name": "Mexico", "currency": "MXN"},
-    "KR": {"name": "South Korea", "currency": "KRW"},
-    "ID": {"name": "Indonesia", "currency": "IDR"},
-    "TR": {"name": "Turkey", "currency": "TRY"},
-    "SA": {"name": "Saudi Arabia", "currency": "SAR"},
-    "ZA": {"name": "South Africa", "currency": "ZAR"},
-    "AR": {"name": "Argentina", "currency": "ARS"},
-    "EU": {"name": "European Union", "currency": "EUR"},
-}
-
-MACRO_INDICATORS = {
-    "CPI YoY": ["Inflation Rate", "CPI", "Consumer Price Index"],
-    "GDP QoQ": ["GDP Growth Rate", "Gross Domestic Product"],
-    "Unemployment": ["Unemployment Rate", "Jobless Rate"],
-    "Interest Rate": ["Interest Rate Decision"],
-    "Manufacturing PMI": ["ISM Manufacturing PMI", "Manufacturing PMI"],
-    "Retail Sales MoM": ["Retail Sales"],
-}
-
-
-def fetch_country_macro_events(country_code: str) -> Tuple[List[Dict], Optional[str]]:
-    """Fetch macro events for a country. Returns (events, error)."""
-    from_date = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
-    to_date = (datetime.now() + timedelta(days=60)).strftime("%Y-%m-%d")
-    
-    url = "https://eodhd.com/api/economic-events"
-    params = {
-        "api_token": EODHD_API_KEY,
-        "country": country_code,
-        "from": from_date,
-        "to": to_date,
-        "limit": 500,
-        "fmt": "json"
-    }
-    
-    try:
-        response = requests.get(url, params=params, timeout=30)
-        if response.status_code == 200:
-            return response.json(), None
-        return [], f"HTTP {response.status_code}"
-    except Exception as e:
-        return [], str(e)
-
-
-def upsert_macro_indicator(data: Dict) -> Tuple[bool, Optional[str]]:
-    """Upsert macro indicator. Returns (success, error)."""
-    try:
-        sb.table("macro_indicators").upsert(
-            data,
-            on_conflict="country_code,indicator"
-        ).execute()
-        return True, None
-    except Exception as e:
-        return False, str(e)
-
-
-async def macro_fetcher_task():
-    """Task 8: Fetch G20 macro indicators."""
-    task_metrics = metrics.get_or_create(MACRO_TASK)
-    
-    info(MACRO_TASK, f"G20 Macro Fetcher started ({len(G20_MACRO_COUNTRIES)} countries)")
-    await asyncio.sleep(30)  # Stagger startup
-    
-    while not tick_streamer._shutdown.is_set():
-        try:
-            info(MACRO_TASK, "Starting macro fetch cycle...")
-            
-            total_updated = 0
-            total_errors = 0
-            
-            loop = asyncio.get_event_loop()
-            
-            for country_code, country_info in G20_MACRO_COUNTRIES.items():
-                events, fetch_error = await loop.run_in_executor(
-                    None, fetch_country_macro_events, country_code
-                )
-                
-                if fetch_error:
-                    debug(MACRO_TASK, f"  {country_code}: Fetch error - {fetch_error}")
-                    total_errors += 1
-                    continue
-                
-                if not events:
-                    continue
-                
-                # Process most recent events for each indicator type
-                for indicator_name, keywords in MACRO_INDICATORS.items():
-                    for event in events:
-                        event_type = event.get("type", "").lower()
-                        
-                        if any(kw.lower() in event_type for kw in keywords):
-                            actual = event.get("actual")
-                            if actual is None:
-                                continue
-                            
-                            data = {
-                                "country_code": country_code,
-                                "country_name": country_info["name"],
-                                "currency": country_info["currency"],
-                                "indicator": indicator_name,
-                                "event_type": event.get("type"),
-                                "actual": float(actual) if actual else None,
-                                "previous": float(event.get("previous")) if event.get("previous") else None,
-                                "estimate": float(event.get("estimate")) if event.get("estimate") else None,
-                                "event_date": event.get("date", "").split(" ")[0],
-                                "updated_at": datetime.now(timezone.utc).isoformat(),
-                            }
-                            
-                            success, upsert_error = upsert_macro_indicator(data)
-                            if success:
-                                total_updated += 1
-                            else:
-                                total_errors += 1
-                            break
-                
-                await asyncio.sleep(0.2)  # Rate limit
-            
-            info(MACRO_TASK, f"Macro cycle complete: {total_updated} updated, {total_errors} errors")
-            
-            task_metrics.record_success()
-            task_metrics.custom_metrics.update({
-                "last_updated": total_updated,
-                "last_errors": total_errors,
-            })
-            
-            await asyncio.sleep(MACRO_FETCH_INTERVAL)
-            
-        except Exception as e:
-            error(MACRO_TASK, f"Task error: {e}", exc_info=DEBUG_MODE)
             task_metrics.record_error(str(e))
             await asyncio.sleep(300)
 
@@ -3770,52 +3485,36 @@ def oanda_run_gap_detection_and_fill() -> Dict[str, int]:
     return results
 
 
-async def oanda_streaming_task():
-    """Task 11: Stream real-time prices from OANDA for commodities & indices."""
-    task_metrics = metrics.get_or_create(OANDA_TASK)
+
+def _oanda_stream_worker(shutdown_event: threading.Event, task_metrics):
+    """Worker thread for OANDA streaming - runs blocking requests in separate thread."""
     
-    info(OANDA_TASK, f"OANDA Streaming started ({len(OANDA_INSTRUMENTS)} instruments)")
-    
-    # Run initial gap detection and fill
-    info(OANDA_TASK, "Running startup gap detection...")
-    loop = asyncio.get_event_loop()
-    gap_results = await loop.run_in_executor(None, oanda_run_gap_detection_and_fill)
-    if gap_results:
-        total_filled = sum(gap_results.values())
-        info(OANDA_TASK, f"Gap fill complete: {total_filled} candles filled across {len(gap_results)} instruments")
-    else:
-        info(OANDA_TASK, "No gaps detected")
-    
-    # Build instruments query string
     instruments_str = ",".join(OANDA_INSTRUMENTS.keys())
     url = f"{OANDA_STREAM_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/pricing/stream"
     headers = {"Authorization": f"Bearer {OANDA_API_KEY}"}
     params = {"instruments": instruments_str}
     
-    # Streaming stats
     tick_count = 0
     reconnect_count = 0
     last_health_log = datetime.now(timezone.utc)
     instruments_seen = set()
     
-    while not tick_streamer._shutdown.is_set():
+    while not shutdown_event.is_set():
         try:
             reconnect_count += 1
             info(OANDA_TASK, f"Connecting to OANDA stream (attempt #{reconnect_count})...")
             
-            # Use requests with stream=True for SSE-style streaming
-            with requests.get(url, headers=headers, params=params, stream=True, timeout=None) as resp:
+            with requests.get(url, headers=headers, params=params, stream=True, timeout=60) as resp:
                 if resp.status_code != 200:
                     error(OANDA_TASK, f"Stream connection failed: HTTP {resp.status_code}")
                     task_metrics.record_error(f"HTTP {resp.status_code}")
-                    await asyncio.sleep(30)
+                    time.sleep(30)
                     continue
                 
                 info(OANDA_TASK, f"Connected! Streaming {len(OANDA_INSTRUMENTS)} instruments...")
                 
                 for line in resp.iter_lines():
-                    # Check shutdown
-                    if tick_streamer._shutdown.is_set():
+                    if shutdown_event.is_set():
                         break
                     
                     if not line:
@@ -3843,7 +3542,6 @@ async def oanda_streaming_task():
                             ask = float(asks[0].get("price", 0))
                             price = (bid + ask) / 2
                             
-                            # Get liquidity and map to volume
                             bid_liquidity = int(bids[0].get("liquidity", 0))
                             ask_liquidity = int(asks[0].get("liquidity", 0))
                             volume = bid_liquidity + ask_liquidity
@@ -3851,10 +3549,8 @@ async def oanda_streaming_task():
                             now = datetime.now(timezone.utc)
                             minute_ts = now.replace(second=0, microsecond=0).isoformat()
                             
-                            # Update minute OHLC
                             minute_ohlc = oanda_update_minute_ohlc(display_symbol, minute_ts, price)
                             
-                            # Insert tick to tickdata
                             tick = {
                                 "symbol": display_symbol,
                                 "price": price,
@@ -3867,10 +3563,9 @@ async def oanda_streaming_task():
                             try:
                                 sb.table(SUPABASE_TABLE).insert(tick).execute()
                             except Exception as e:
-                                if tick_count % 1000 == 0:  # Only log occasionally
+                                if tick_count % 1000 == 0:
                                     debug(OANDA_TASK, f"Tick insert error: {e}")
                             
-                            # Upsert candle
                             candle = {
                                 "timestamp": minute_ts,
                                 "open": minute_ohlc["open"],
@@ -3891,7 +3586,6 @@ async def oanda_streaming_task():
                             task_metrics.record_success()
                             
                         elif msg_type == "HEARTBEAT":
-                            # OANDA sends heartbeats every 5 seconds if no price updates
                             pass
                         
                     except json.JSONDecodeError:
@@ -3899,7 +3593,6 @@ async def oanda_streaming_task():
                     except Exception as e:
                         debug(OANDA_TASK, f"Tick processing error: {e}")
                     
-                    # Periodic health logging
                     now = datetime.now(timezone.utc)
                     if (now - last_health_log).total_seconds() >= 60:
                         info(OANDA_TASK, f"HEALTH: {tick_count:,} ticks | {len(instruments_seen)}/{len(OANDA_INSTRUMENTS)} instruments active")
@@ -3909,22 +3602,290 @@ async def oanda_streaming_task():
                             "reconnect_count": reconnect_count,
                         })
                         last_health_log = now
-                        
-                        # Run gap detection every hour
-                        if now.minute == 0:
-                            gap_results = await loop.run_in_executor(None, oanda_run_gap_detection_and_fill)
-                            if gap_results:
-                                total_filled = sum(gap_results.values())
-                                info(OANDA_TASK, f"Hourly gap fill: {total_filled} candles")
-            
+        
         except requests.exceptions.RequestException as e:
             error(OANDA_TASK, f"Stream error: {e}")
             task_metrics.record_error(str(e))
-            await asyncio.sleep(10)
+            time.sleep(10)
         except Exception as e:
-            error(OANDA_TASK, f"Unexpected error: {e}", exc_info=DEBUG_MODE)
+            error(OANDA_TASK, f"Unexpected error: {e}")
             task_metrics.record_error(str(e))
-            await asyncio.sleep(30)
+            time.sleep(30)
+    
+    info(OANDA_TASK, "OANDA stream worker shutting down")
+
+
+async def oanda_streaming_task():
+    """Task 9: Stream real-time prices from OANDA for commodities & indices."""
+    task_metrics = metrics.get_or_create(OANDA_TASK)
+    
+    info(OANDA_TASK, f"OANDA Streaming started ({len(OANDA_INSTRUMENTS)} instruments)")
+    
+    # Run initial gap detection and fill
+    info(OANDA_TASK, "Running startup gap detection...")
+    loop = asyncio.get_event_loop()
+    gap_results = await loop.run_in_executor(None, oanda_run_gap_detection_and_fill)
+    if gap_results:
+        total_filled = sum(gap_results.values())
+        info(OANDA_TASK, f"Gap fill complete: {total_filled} candles filled across {len(gap_results)} instruments")
+    else:
+        info(OANDA_TASK, "No gaps detected")
+    
+    # Create shutdown event for thread
+    shutdown_event = threading.Event()
+    
+    # Start streaming in a separate thread to avoid blocking asyncio
+    stream_thread = threading.Thread(
+        target=_oanda_stream_worker,
+        args=(shutdown_event, task_metrics),
+        daemon=True,
+        name="oanda_stream"
+    )
+    stream_thread.start()
+    info(OANDA_TASK, "OANDA stream thread started")
+    
+    # Wait for main shutdown signal
+    while not tick_streamer._shutdown.is_set():
+        await asyncio.sleep(1)
+    
+    # Signal thread to stop
+    shutdown_event.set()
+    stream_thread.join(timeout=5)
+    info(OANDA_TASK, "OANDA streaming task complete")
+
+
+# ============================================================================
+#                    TASK 10: BOND YIELDS STREAMING (4-Hour Candles)
+# ============================================================================
+# Streams government bond prices via OANDA and builds 4H candles.
+# Bonds: US 2Y/5Y/10Y/30Y Treasury, UK 10Y Gilt, DE 10Y Bund
+# Stores in unified bond_yields table.
+# ============================================================================
+
+BOND_4H_TASK = "BOND_4H"
+
+# OANDA symbol -> (short_symbol, country, maturity)
+BOND_SYMBOLS = {
+    "USB02Y_USD": ("USB02Y", "US", "2Y"),
+    "USB05Y_USD": ("USB05Y", "US", "5Y"),
+    "USB10Y_USD": ("USB10Y", "US", "10Y"),
+    "USB30Y_USD": ("USB30Y", "US", "30Y"),
+    "UK10YB_GBP": ("UK10YB", "UK", "10Y"),
+    "DE10YB_EUR": ("DE10YB", "DE", "10Y"),
+}
+
+# Track 4-hour OHLC in memory
+_bond_4h_ohlc: Dict[str, Dict[str, Dict[str, float]]] = {}
+_bond_4h_lock = threading.Lock()
+
+
+def get_4h_bucket(dt: datetime) -> str:
+    """Get the 4-hour bucket timestamp for a given datetime."""
+    hour_bucket = (dt.hour // 4) * 4
+    return dt.replace(hour=hour_bucket, minute=0, second=0, microsecond=0).isoformat()
+
+
+def bond_update_4h_ohlc(symbol: str, bucket_ts: str, price: float) -> Tuple[Dict[str, float], bool]:
+    """Track 4-hour OHLC for bonds. Returns (current_ohlc, is_new_bucket)."""
+    with _bond_4h_lock:
+        if symbol not in _bond_4h_ohlc:
+            _bond_4h_ohlc[symbol] = {}
+        
+        candles = _bond_4h_ohlc[symbol]
+        is_new_bucket = False
+        
+        if len(candles) > 5:
+            sorted_buckets = sorted(candles.keys())
+            for old_bucket in sorted_buckets[:-3]:
+                del candles[old_bucket]
+        
+        if bucket_ts not in candles:
+            is_new_bucket = len(candles) > 0
+            candles[bucket_ts] = {
+                "open": price,
+                "high": price,
+                "low": price,
+                "close": price,
+            }
+        else:
+            c = candles[bucket_ts]
+            c["high"] = max(c["high"], price)
+            c["low"] = min(c["low"], price)
+            c["close"] = price
+        
+        return candles[bucket_ts].copy(), is_new_bucket
+
+
+def get_previous_4h_candle(symbol: str, current_bucket: str) -> Optional[Tuple[str, Dict[str, float]]]:
+    """Get the completed previous 4H candle if it exists."""
+    with _bond_4h_lock:
+        if symbol not in _bond_4h_ohlc:
+            return None
+        
+        candles = _bond_4h_ohlc[symbol]
+        sorted_buckets = sorted(candles.keys())
+        
+        for i, bucket in enumerate(sorted_buckets):
+            if bucket == current_bucket and i > 0:
+                prev_bucket = sorted_buckets[i - 1]
+                return (prev_bucket, candles[prev_bucket].copy())
+        
+        return None
+
+
+def save_bond_candle(symbol: str, country: str, maturity: str, timestamp: str, ohlc: Dict[str, float]) -> bool:
+    """Save a completed 4H bond candle to Supabase."""
+    try:
+        record = {
+            "symbol": symbol,
+            "country": country,
+            "maturity": maturity,
+            "timestamp": timestamp,
+            "open": ohlc["open"],
+            "high": ohlc["high"],
+            "low": ohlc["low"],
+            "close": ohlc["close"],
+            "volume": 0,
+        }
+        
+        sb.table("bond_yields").upsert(record, on_conflict="symbol,timestamp").execute()
+        return True
+        
+    except Exception as e:
+        debug(BOND_4H_TASK, f"Error saving {symbol} candle: {e}")
+        return False
+
+
+def _bond_stream_worker(shutdown_event: threading.Event, task_metrics):
+    """Worker thread for Bond streaming - runs blocking requests in separate thread."""
+    
+    instruments_str = ",".join(BOND_SYMBOLS.keys())
+    url = f"{OANDA_STREAM_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/pricing/stream"
+    headers = {"Authorization": f"Bearer {OANDA_API_KEY}"}
+    params = {"instruments": instruments_str}
+    
+    tick_count = 0
+    candles_saved = 0
+    reconnect_count = 0
+    last_health_log = datetime.now(timezone.utc)
+    
+    while not shutdown_event.is_set():
+        try:
+            reconnect_count += 1
+            info(BOND_4H_TASK, f"Connecting to OANDA bond stream (attempt #{reconnect_count})...")
+            
+            with requests.get(url, headers=headers, params=params, stream=True, timeout=60) as resp:
+                if resp.status_code != 200:
+                    error(BOND_4H_TASK, f"Stream connection failed: HTTP {resp.status_code}")
+                    task_metrics.record_error(f"HTTP {resp.status_code}")
+                    time.sleep(30)
+                    continue
+                
+                info(BOND_4H_TASK, f"Connected! Streaming {len(BOND_SYMBOLS)} bonds...")
+                
+                for line in resp.iter_lines():
+                    if shutdown_event.is_set():
+                        break
+                    
+                    if not line:
+                        continue
+                    
+                    try:
+                        data = json.loads(line.decode('utf-8'))
+                        msg_type = data.get("type", "")
+                        
+                        if msg_type == "PRICE":
+                            instrument = data.get("instrument", "")
+                            if instrument not in BOND_SYMBOLS:
+                                continue
+                            
+                            short_symbol, country, maturity = BOND_SYMBOLS[instrument]
+                            
+                            bids = data.get("bids", [])
+                            asks = data.get("asks", [])
+                            
+                            if not bids or not asks:
+                                continue
+                            
+                            bid = float(bids[0].get("price", 0))
+                            ask = float(asks[0].get("price", 0))
+                            price = (bid + ask) / 2
+                            
+                            now = datetime.now(timezone.utc)
+                            bucket_ts = get_4h_bucket(now)
+                            
+                            current_ohlc, is_new_bucket = bond_update_4h_ohlc(short_symbol, bucket_ts, price)
+                            
+                            tick_count += 1
+                            
+                            if is_new_bucket:
+                                prev = get_previous_4h_candle(short_symbol, bucket_ts)
+                                if prev:
+                                    prev_ts, prev_ohlc = prev
+                                    saved = save_bond_candle(short_symbol, country, maturity, prev_ts, prev_ohlc)
+                                    if saved:
+                                        candles_saved += 1
+                                        info(BOND_4H_TASK, f"Saved 4H candle: {short_symbol} @ {prev_ts[:16]} close={prev_ohlc['close']:.4f}")
+                            
+                            task_metrics.record_success()
+                            
+                        elif msg_type == "HEARTBEAT":
+                            pass
+                        
+                    except json.JSONDecodeError:
+                        continue
+                    except Exception as e:
+                        debug(BOND_4H_TASK, f"Tick processing error: {e}")
+                    
+                    now = datetime.now(timezone.utc)
+                    if (now - last_health_log).total_seconds() >= 60:
+                        info(BOND_4H_TASK, f"HEALTH: {tick_count:,} ticks | {candles_saved} 4H candles saved")
+                        task_metrics.custom_metrics.update({
+                            "tick_count": tick_count,
+                            "candles_saved": candles_saved,
+                            "reconnect_count": reconnect_count,
+                        })
+                        last_health_log = now
+        
+        except requests.exceptions.RequestException as e:
+            error(BOND_4H_TASK, f"Stream error: {e}")
+            task_metrics.record_error(str(e))
+            time.sleep(10)
+        except Exception as e:
+            error(BOND_4H_TASK, f"Unexpected error: {e}")
+            task_metrics.record_error(str(e))
+            time.sleep(30)
+    
+    info(BOND_4H_TASK, "Bond stream worker shutting down")
+
+
+async def bond_yields_streaming_task():
+    """Task 10: Stream bond prices and build 4H candles."""
+    task_metrics = metrics.get_or_create(BOND_4H_TASK)
+    
+    info(BOND_4H_TASK, f"Bond Yields Streaming started ({len(BOND_SYMBOLS)} bonds)")
+    
+    # Create shutdown event for thread
+    shutdown_event = threading.Event()
+    
+    # Start streaming in a separate thread to avoid blocking asyncio
+    stream_thread = threading.Thread(
+        target=_bond_stream_worker,
+        args=(shutdown_event, task_metrics),
+        daemon=True,
+        name="bond_stream"
+    )
+    stream_thread.start()
+    info(BOND_4H_TASK, "Bond stream thread started")
+    
+    # Wait for main shutdown signal
+    while not tick_streamer._shutdown.is_set():
+        await asyncio.sleep(1)
+    
+    # Signal thread to stop
+    shutdown_event.set()
+    stream_thread.join(timeout=5)
+    info(BOND_4H_TASK, "Bond yields streaming task complete")
 
 
 # ============================================================================
@@ -3958,13 +3919,12 @@ async def main():
         asyncio.create_task(economic_calendar_task(), name="calendar"),
         # asyncio.create_task(financial_news_task(), name="news"),  # DISABLED - uses non-existent financial_news table, replaced by news_articles_task
         asyncio.create_task(gap_fill_task(), name="gap_fill"),
-        asyncio.create_task(bond_yield_task(), name="bonds"),
         asyncio.create_task(whale_flow_task(), name="whale"),
         asyncio.create_task(ai_news_desk_task(), name="ai_news"),
-        asyncio.create_task(macro_fetcher_task(), name="macro"),
         asyncio.create_task(sector_sentiment_task(), name="sentiment"),
         asyncio.create_task(news_articles_task(), name="news_articles"),
         asyncio.create_task(oanda_streaming_task(), name="oanda_stream"),
+        asyncio.create_task(bond_yields_streaming_task(), name="bond_4h"),
     ]
     
     # Periodic metrics logging
@@ -3998,9 +3958,6 @@ async def main():
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except KeyboardInterrupt:
-        log.info("Interrupted by user")
-        sys.exit(0)
     except KeyboardInterrupt:
         log.info("Interrupted by user")
         sys.exit(0)
