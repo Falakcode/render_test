@@ -3008,13 +3008,30 @@ NEWS_SOURCES_CONFIG = {
         "rss_feeds": ["https://www.coindesk.com/arc/outboundfeeds/rss/"],
         "categories": ["crypto", "bitcoin", "ethereum"],
     },
-    "cointelegraph": {
-        "name": "CoinTelegraph",
-        "logo": "https://cointelegraph.com/assets/img/logo.svg",
-        "color": "#000000",
-        "rss_feeds": ["https://cointelegraph.com/rss"],
-        "categories": ["crypto", "blockchain", "defi"],
-    },
+  "thestreet": {
+    "name": "TheStreet",
+    "logo": "https://www.thestreet.com/favicon.ico",
+    "color": "#0033A0",
+    "rss_feeds": [
+        "https://www.thestreet.com/.rss/full",
+        "https://www.thestreet.com/markets/.rss/full"
+    ],
+    "categories": ["markets", "stocks"],
+},
+
+  "ft": {
+    "name": "Financial Times",
+    "logo": "https://upload.wikimedia.org/wikipedia/commons/5/5a/Financial_Times_logo_%282019%29.svg",
+    "color": "#FFE6D5",
+    "rss_feeds": [
+        "https://www.ft.com/?format=rss",
+        "https://www.ft.com/markets?format=rss",
+        "https://www.ft.com/world?format=rss"
+    ],
+    "categories": ["markets", "economy", "stocks", "world"],
+},
+
+ 
     "benzinga": {
         "name": "Benzinga",
         "logo": "https://www.benzinga.com/next-assets/images/schema-image.png",
@@ -3885,11 +3902,16 @@ async def bond_yields_streaming_task():
 #                    STARTUP GAP FILL (One-time on startup)
 # ============================================================================
 # Automatically fills gaps > 15 minutes on worker startup.
-# Uses OANDA API (no delay - real-time historical data).
-# Smart enough to skip expected market closures (weekends, holidays).
+# 
+# Data sources (~300 symbols total):
+#   OANDA (49 symbols): Major forex, commodities, indices - NO delay
+#   EODHD (255 symbols): Crypto, stocks, ETFs, exotic forex - 12-24h delay
 #
-# NOTE: Crypto (BTC, ETH) and US Stocks (AAPL, MSFT) are NOT auto-filled.
-# EODHD has 24-48h delay on intraday data. For those, rely on WebSocket.
+# Smart features:
+#   - Skips expected market closures (weekends, holidays)
+#   - Filters out fake weekend data from EODHD for stocks/forex
+#   - EODHD gaps may not fill on first run, but will fill on next day's startup
+#   - Symbol list generated dynamically from streaming symbol lists
 # ============================================================================
 
 STARTUP_GAP_TASK = "STARTUP_GAP_FILL"
@@ -3911,70 +3933,131 @@ US_MARKET_HOLIDAYS_2025 = {
 }
 
 # Symbol configurations for gap fill
-# OANDA for forex/commodities/indices (no delay - real-time)
-# Crypto/Stocks removed - EODHD has 24-48h delay, can't fill recent gaps
+# OANDA: No delay (major forex, commodities, indices) - fills recent gaps immediately
+# EODHD: 12-24h delay (crypto, stocks, ETFs, exotic forex) - fills gaps eventually
 # Format: (display_symbol, table_name, api_symbol, source, asset_type)
-STARTUP_GAP_SYMBOLS = [
-    # OANDA - Forex (no delay!)
-    ("EUR/USD", "candles_eur_usd", "EUR_USD", "oanda", "forex"),
-    ("GBP/USD", "candles_gbp_usd", "GBP_USD", "oanda", "forex"),
-    ("USD/JPY", "candles_usd_jpy", "USD_JPY", "oanda", "forex"),
-    ("AUD/USD", "candles_aud_usd", "AUD_USD", "oanda", "forex"),
-    ("USD/CAD", "candles_usd_cad", "USD_CAD", "oanda", "forex"),
-    ("USD/CHF", "candles_usd_chf", "USD_CHF", "oanda", "forex"),
-    ("NZD/USD", "candles_nzd_usd", "NZD_USD", "oanda", "forex"),
-    ("EUR/GBP", "candles_eur_gbp", "EUR_GBP", "oanda", "forex"),
-    ("EUR/JPY", "candles_eur_jpy", "EUR_JPY", "oanda", "forex"),
-    ("GBP/JPY", "candles_gbp_jpy", "GBP_JPY", "oanda", "forex"),
-    ("AUD/JPY", "candles_aud_jpy", "AUD_JPY", "oanda", "forex"),
-    ("EUR/AUD", "candles_eur_aud", "EUR_AUD", "oanda", "forex"),
-    ("GBP/AUD", "candles_gbp_aud", "GBP_AUD", "oanda", "forex"),
-    ("EUR/CAD", "candles_eur_cad", "EUR_CAD", "oanda", "forex"),
-    ("GBP/CAD", "candles_gbp_cad", "GBP_CAD", "oanda", "forex"),
-    ("EUR/CHF", "candles_eur_chf", "EUR_CHF", "oanda", "forex"),
-    ("GBP/CHF", "candles_gbp_chf", "GBP_CHF", "oanda", "forex"),
-    ("CAD/JPY", "candles_cad_jpy", "CAD_JPY", "oanda", "forex"),
-    ("CHF/JPY", "candles_chf_jpy", "CHF_JPY", "oanda", "forex"),
-    ("AUD/CAD", "candles_aud_cad", "AUD_CAD", "oanda", "forex"),
-    ("AUD/CHF", "candles_aud_chf", "AUD_CHF", "oanda", "forex"),
-    ("AUD/NZD", "candles_aud_nzd", "AUD_NZD", "oanda", "forex"),
-    ("NZD/JPY", "candles_nzd_jpy", "NZD_JPY", "oanda", "forex"),
-    ("NZD/CAD", "candles_nzd_cad", "NZD_CAD", "oanda", "forex"),
-    ("NZD/CHF", "candles_nzd_chf", "NZD_CHF", "oanda", "forex"),
+
+def build_gap_fill_symbols():
+    """
+    Dynamically build gap fill symbols from existing streaming symbol lists.
+    Returns list of (display_symbol, table_name, api_symbol, source, asset_type) tuples.
+    """
+    symbols = []
+    
+    # Helper to convert symbol to table name
+    def to_table_name(symbol: str, asset_type: str) -> str:
+        if asset_type in ("stock", "etf"):
+            return f"candles_{symbol.lower()}"
+        else:
+            # Forex/crypto: EURUSD -> candles_eur_usd, BTC-USD -> candles_btc_usd
+            clean = symbol.replace("-", "").lower()
+            # Find the quote currency (USD, EUR, GBP, JPY, etc.)
+            quotes = ["usd", "eur", "gbp", "jpy", "cad", "aud", "chf", "nzd", "btc", 
+                      "sek", "nok", "dkk", "mxn", "zar", "try", "brl", "pln", "huf", 
+                      "czk", "sgd", "hkd", "cnh", "thb", "krw", "inr", "idr"]
+            for q in quotes:
+                if clean.endswith(q):
+                    base = clean[:-len(q)]
+                    return f"candles_{base}_{q}"
+            return f"candles_{clean}"
+    
+    # Helper to convert to display symbol
+    def to_display_symbol(symbol: str, asset_type: str) -> str:
+        if asset_type in ("stock", "etf"):
+            return symbol.upper()
+        elif "-" in symbol:
+            # Already has separator: BTC-USD -> BTC/USD
+            return symbol.replace("-", "/")
+        else:
+            # Forex: EURUSD -> EUR/USD
+            quotes = ["USD", "EUR", "GBP", "JPY", "CAD", "AUD", "CHF", "NZD", "BTC",
+                      "SEK", "NOK", "DKK", "MXN", "ZAR", "TRY", "BRL", "PLN", "HUF",
+                      "CZK", "SGD", "HKD", "CNH", "THB", "KRW", "INR", "IDR"]
+            upper = symbol.upper()
+            for q in quotes:
+                if upper.endswith(q):
+                    base = upper[:-len(q)]
+                    return f"{base}/{q}"
+            return upper
+    
+    # OANDA - Major Forex (no delay, real-time)
+    OANDA_FOREX = [
+        "EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CAD", "USD_CHF", "NZD_USD",
+        "EUR_GBP", "EUR_JPY", "GBP_JPY", "AUD_JPY", "EUR_AUD", "GBP_AUD", "EUR_CAD",
+        "GBP_CAD", "EUR_CHF", "GBP_CHF", "CAD_JPY", "CHF_JPY", "AUD_CAD", "AUD_CHF",
+        "AUD_NZD", "NZD_JPY", "NZD_CAD", "NZD_CHF",
+    ]
+    for s in OANDA_FOREX:
+        display = s.replace("_", "/")
+        table = f"candles_{s.lower()}"
+        symbols.append((display, table, s, "oanda", "forex"))
+    
     # OANDA - Metals
-    ("XAU/USD", "candles_xau_usd", "XAU_USD", "oanda", "commodity"),
-    ("XAG/USD", "candles_xag_usd", "XAG_USD", "oanda", "commodity"),
-    ("XPT/USD", "candles_xpt_usd", "XPT_USD", "oanda", "commodity"),
-    ("XPD/USD", "candles_xpd_usd", "XPD_USD", "oanda", "commodity"),
-    ("XCU/USD", "candles_xcu_usd", "XCU_USD", "oanda", "commodity"),
+    OANDA_METALS = ["XAU_USD", "XAG_USD", "XPT_USD", "XPD_USD", "XCU_USD"]
+    for s in OANDA_METALS:
+        display = s.replace("_", "/")
+        table = f"candles_{s.lower()}"
+        symbols.append((display, table, s, "oanda", "commodity"))
+    
     # OANDA - Energy
-    ("WTICO/USD", "candles_wtico_usd", "WTICO_USD", "oanda", "commodity"),
-    ("BCO/USD", "candles_bco_usd", "BCO_USD", "oanda", "commodity"),
-    ("NATGAS/USD", "candles_natgas_usd", "NATGAS_USD", "oanda", "commodity"),
+    OANDA_ENERGY = ["WTICO_USD", "BCO_USD", "NATGAS_USD"]
+    for s in OANDA_ENERGY:
+        display = s.replace("_", "/")
+        table = f"candles_{s.lower()}"
+        symbols.append((display, table, s, "oanda", "commodity"))
+    
     # OANDA - Agriculture
-    ("CORN/USD", "candles_corn_usd", "CORN_USD", "oanda", "commodity"),
-    ("WHEAT/USD", "candles_wheat_usd", "WHEAT_USD", "oanda", "commodity"),
-    ("SOYBN/USD", "candles_soybn_usd", "SOYBN_USD", "oanda", "commodity"),
-    ("SUGAR/USD", "candles_sugar_usd", "SUGAR_USD", "oanda", "commodity"),
-    # OANDA - US Indices
-    ("US30/USD", "candles_us30_usd", "US30_USD", "oanda", "index"),
-    ("SPX500/USD", "candles_spx500_usd", "SPX500_USD", "oanda", "index"),
-    ("NAS100/USD", "candles_nas100_usd", "NAS100_USD", "oanda", "index"),
-    ("US2000/USD", "candles_us2000_usd", "US2000_USD", "oanda", "index"),
-    # OANDA - European Indices
-    ("UK100/GBP", "candles_uk100_gbp", "UK100_GBP", "oanda", "index"),
-    ("DE30/EUR", "candles_de30_eur", "DE30_EUR", "oanda", "index"),
-    ("EU50/EUR", "candles_eu50_eur", "EU50_EUR", "oanda", "index"),
-    ("FR40/EUR", "candles_fr40_eur", "FR40_EUR", "oanda", "index"),
-    # OANDA - Asia-Pacific Indices
-    ("JP225/USD", "candles_jp225_usd", "JP225_USD", "oanda", "index"),
-    ("AU200/AUD", "candles_au200_aud", "AU200_AUD", "oanda", "index"),
-    ("HK33/HKD", "candles_hk33_hkd", "HK33_HKD", "oanda", "index"),
-    ("CN50/USD", "candles_cn50_usd", "CN50_USD", "oanda", "index"),
-    # NOTE: Crypto (BTC, ETH) and US Stocks (AAPL, MSFT) excluded
-    # EODHD has 24-48h delay on intraday data - can't fill recent gaps
-    # For crypto/stocks, rely on WebSocket staying connected
-]
+    OANDA_AGRI = ["CORN_USD", "WHEAT_USD", "SOYBN_USD", "SUGAR_USD"]
+    for s in OANDA_AGRI:
+        display = s.replace("_", "/")
+        table = f"candles_{s.lower()}"
+        symbols.append((display, table, s, "oanda", "commodity"))
+    
+    # OANDA - Indices
+    OANDA_INDICES = [
+        "US30_USD", "SPX500_USD", "NAS100_USD", "US2000_USD",
+        "UK100_GBP", "DE30_EUR", "EU50_EUR", "FR40_EUR",
+        "JP225_USD", "AU200_AUD", "HK33_HKD", "CN50_USD",
+    ]
+    for s in OANDA_INDICES:
+        display = s.replace("_", "/")
+        table = f"candles_{s.lower()}"
+        symbols.append((display, table, s, "oanda", "index"))
+    
+    # EODHD - All Crypto (from CRYPTO_SYMBOLS)
+    for s in CRYPTO_SYMBOLS:
+        display = s.replace("-", "/")
+        table = to_table_name(s, "crypto")
+        api_symbol = f"{s}.CC"
+        symbols.append((display, table, api_symbol, "eodhd", "crypto"))
+    
+    # EODHD - All US Stocks (from US_STOCKS)
+    for s in US_STOCKS:
+        display = s.upper()
+        table = f"candles_{s.lower()}"
+        api_symbol = f"{s}.US"
+        symbols.append((display, table, api_symbol, "eodhd", "stock"))
+    
+    # EODHD - All ETFs (from ETFS)
+    for s in ETFS:
+        display = s.upper()
+        table = f"candles_{s.lower()}"
+        api_symbol = f"{s}.US"
+        symbols.append((display, table, api_symbol, "eodhd", "etf"))
+    
+    # EODHD - Exotic Forex (pairs not covered by OANDA)
+    OANDA_FOREX_SET = {s.replace("_", "").upper() for s in OANDA_FOREX}
+    for s in FOREX_SYMBOLS:
+        if s.upper() not in OANDA_FOREX_SET:
+            display = to_display_symbol(s, "forex")
+            table = to_table_name(s, "forex")
+            api_symbol = f"{s}.FOREX"
+            symbols.append((display, table, api_symbol, "eodhd", "forex"))
+    
+    return symbols
+
+# Build the gap fill symbol list
+STARTUP_GAP_SYMBOLS = build_gap_fill_symbols()
 
 
 def is_us_stock_market_open(dt: datetime) -> bool:
@@ -4178,66 +4261,100 @@ def startup_fetch_oanda_candles(api_symbol: str, start_dt: datetime, end_dt: dat
         return []
 
 
-def startup_fill_single_gap(display_symbol: str, table_name: str, api_symbol: str, source: str, gap: Dict) -> int:
-    """Fill a single gap using OANDA API."""
+def startup_fill_single_gap(display_symbol: str, table_name: str, api_symbol: str, source: str, asset_type: str, gap: Dict) -> int:
+    """Fill a single gap using OANDA or EODHD API."""
     start = gap["start"]
     end = gap["end"]
     
-    # All symbols now use OANDA (no delay, real-time data)
-    candles = startup_fetch_oanda_candles(api_symbol, start, end)
+    # Fetch candles based on source
+    if source == "oanda":
+        candles = startup_fetch_oanda_candles(api_symbol, start, end)
+    else:
+        candles = startup_fetch_eodhd_candles(api_symbol, start, end)
     
     if not candles:
         return 0
     
     inserted = 0
     errors = 0
+    skipped_weekend = 0
     
     for c in candles:
         try:
-            # Skip incomplete candles
-            if not c.get("complete", False):
-                continue
-            
-            # Parse OANDA timestamp (handles nanosecond precision)
-            ts_str = c.get("time", "")
-            # OANDA returns: 2025-12-08T16:23:00.000000000Z
-            # Python can't parse nanoseconds, truncate to microseconds
-            if ".000000000Z" in ts_str:
-                ts_str = ts_str.replace(".000000000Z", "+00:00")
-            elif "." in ts_str and "Z" in ts_str:
-                # Truncate nanoseconds to 6 digits (microseconds)
-                parts = ts_str.replace("Z", "").split(".")
-                if len(parts) == 2 and len(parts[1]) > 6:
-                    ts_str = parts[0] + "." + parts[1][:6] + "+00:00"
+            if source == "oanda":
+                # OANDA format
+                if not c.get("complete", False):
+                    continue
+                
+                # Parse OANDA timestamp (handles nanosecond precision)
+                ts_str = c.get("time", "")
+                if ".000000000Z" in ts_str:
+                    ts_str = ts_str.replace(".000000000Z", "+00:00")
+                elif "." in ts_str and "Z" in ts_str:
+                    parts = ts_str.replace("Z", "").split(".")
+                    if len(parts) == 2 and len(parts[1]) > 6:
+                        ts_str = parts[0] + "." + parts[1][:6] + "+00:00"
+                    else:
+                        ts_str = ts_str.replace("Z", "+00:00")
                 else:
                     ts_str = ts_str.replace("Z", "+00:00")
+                
+                ts = datetime.fromisoformat(ts_str)
+                mid = c.get("mid", {})
+                
+                record = {
+                    "timestamp": ts.replace(second=0, microsecond=0).isoformat(),
+                    "open": float(mid.get("o", 0)),
+                    "high": float(mid.get("h", 0)),
+                    "low": float(mid.get("l", 0)),
+                    "close": float(mid.get("c", 0)),
+                    "volume": int(c.get("volume", 0)),
+                    "symbol": display_symbol,
+                }
             else:
-                ts_str = ts_str.replace("Z", "+00:00")
-            
-            ts = datetime.fromisoformat(ts_str)
-            mid = c.get("mid", {})
-            
-            record = {
-                "timestamp": ts.replace(second=0, microsecond=0).isoformat(),
-                "open": float(mid.get("o", 0)),
-                "high": float(mid.get("h", 0)),
-                "low": float(mid.get("l", 0)),
-                "close": float(mid.get("c", 0)),
-                "volume": int(c.get("volume", 0)),
-                "symbol": display_symbol,
-            }
+                # EODHD format
+                ts = datetime.fromtimestamp(c.get("timestamp", 0), tz=timezone.utc)
+                
+                # Skip weekend candles for stocks/ETFs and exotic forex (EODHD returns fake weekend data)
+                # Stocks/ETFs: Don't trade Saturday/Sunday
+                # Forex: Closes Friday 5PM ET (~10PM UTC), opens Sunday 5PM ET (~10PM UTC)
+                if asset_type in ("stock", "etf") and ts.weekday() >= 5:  # Saturday=5, Sunday=6
+                    skipped_weekend += 1
+                    continue
+                
+                if asset_type == "forex":
+                    # Skip Saturday entirely
+                    if ts.weekday() == 5:
+                        skipped_weekend += 1
+                        continue
+                    # Skip Sunday before 10PM UTC (forex opens ~5PM ET = 10PM UTC)
+                    if ts.weekday() == 6 and ts.hour < 22:
+                        skipped_weekend += 1
+                        continue
+                
+                record = {
+                    "timestamp": ts.isoformat(),
+                    "open": float(c.get("open", 0)),
+                    "high": float(c.get("high", 0)),
+                    "low": float(c.get("low", 0)),
+                    "close": float(c.get("close", 0)),
+                    "volume": int(c.get("volume", 0)),
+                    "symbol": display_symbol,
+                }
             
             sb.table(table_name).upsert(record, on_conflict="timestamp").execute()
-            inserted += 1
             inserted += 1
             
         except Exception as e:
             errors += 1
-            if errors <= 3:  # Only log first 3 errors to avoid spam
+            if errors <= 3:
                 log.warning(f"    Insert error: {e}")
     
     if errors > 3:
         log.warning(f"    ... and {errors - 3} more insert errors")
+    
+    if skipped_weekend > 0:
+        log.info(f"    Skipped {skipped_weekend} weekend candles")
     
     return inserted
 
@@ -4286,7 +4403,7 @@ def run_startup_gap_fill():
             # Fill each gap
             for gap in unexpected_gaps:
                 log.info(f"  {display_symbol}: Filling {gap['start'].strftime('%m/%d %H:%M')} → {gap['end'].strftime('%H:%M')} ({gap['minutes']} min)")
-                filled = startup_fill_single_gap(display_symbol, table_name, api_symbol, source, gap)
+                filled = startup_fill_single_gap(display_symbol, table_name, api_symbol, source, asset_type, gap)
                 total_filled += filled
                 if filled > 0:
                     log.info(f"    → Inserted {filled} candles")
