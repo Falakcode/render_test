@@ -3885,7 +3885,11 @@ async def bond_yields_streaming_task():
 #                    STARTUP GAP FILL (One-time on startup)
 # ============================================================================
 # Automatically fills gaps > 15 minutes on worker startup.
+# Uses OANDA API (no delay - real-time historical data).
 # Smart enough to skip expected market closures (weekends, holidays).
+#
+# NOTE: Crypto (BTC, ETH) and US Stocks (AAPL, MSFT) are NOT auto-filled.
+# EODHD has 24-48h delay on intraday data. For those, rely on WebSocket.
 # ============================================================================
 
 STARTUP_GAP_TASK = "STARTUP_GAP_FILL"
@@ -3907,56 +3911,69 @@ US_MARKET_HOLIDAYS_2025 = {
 }
 
 # Symbol configurations for gap fill
+# OANDA for forex/commodities/indices (no delay - real-time)
+# Crypto/Stocks removed - EODHD has 24-48h delay, can't fill recent gaps
 # Format: (display_symbol, table_name, api_symbol, source, asset_type)
 STARTUP_GAP_SYMBOLS = [
-    # EODHD - Forex (priority)
-    ("EUR/USD", "candles_eur_usd", "EURUSD.FOREX", "eodhd", "forex"),
-    ("GBP/USD", "candles_gbp_usd", "GBPUSD.FOREX", "eodhd", "forex"),
-    ("USD/JPY", "candles_usd_jpy", "USDJPY.FOREX", "eodhd", "forex"),
-    ("AUD/USD", "candles_aud_usd", "AUDUSD.FOREX", "eodhd", "forex"),
-    ("USD/CAD", "candles_usd_cad", "USDCAD.FOREX", "eodhd", "forex"),
-    ("USD/CHF", "candles_usd_chf", "USDCHF.FOREX", "eodhd", "forex"),
-    ("NZD/USD", "candles_nzd_usd", "NZDUSD.FOREX", "eodhd", "forex"),
-    ("EUR/GBP", "candles_eur_gbp", "EURGBP.FOREX", "eodhd", "forex"),
-    ("EUR/JPY", "candles_eur_jpy", "EURJPY.FOREX", "eodhd", "forex"),
-    ("GBP/JPY", "candles_gbp_jpy", "GBPJPY.FOREX", "eodhd", "forex"),
-    # EODHD - Crypto (24/7)
-    ("BTC/USD", "candles_btc_usd", "BTC-USD.CC", "eodhd", "crypto"),
-    ("ETH/USD", "candles_eth_usd", "ETH-USD.CC", "eodhd", "crypto"),
-    ("SOL/USD", "candles_sol_usd", "SOL-USD.CC", "eodhd", "crypto"),
-    ("XRP/USD", "candles_xrp_usd", "XRP-USD.CC", "eodhd", "crypto"),
-    ("DOGE/USD", "candles_doge_usd", "DOGE-USD.CC", "eodhd", "crypto"),
-    ("ADA/USD", "candles_ada_usd", "ADA-USD.CC", "eodhd", "crypto"),
-    # EODHD - US Stocks (priority)
-    ("AAPL", "candles_aapl", "AAPL.US", "eodhd", "stock"),
-    ("MSFT", "candles_msft", "MSFT.US", "eodhd", "stock"),
-    ("GOOGL", "candles_googl", "GOOGL.US", "eodhd", "stock"),
-    ("AMZN", "candles_amzn", "AMZN.US", "eodhd", "stock"),
-    ("TSLA", "candles_tsla", "TSLA.US", "eodhd", "stock"),
-    ("NVDA", "candles_nvda", "NVDA.US", "eodhd", "stock"),
-    ("META", "candles_meta", "META.US", "eodhd", "stock"),
-    # EODHD - ETFs (priority)
-    ("SPY", "candles_spy", "SPY.US", "eodhd", "stock"),
-    ("QQQ", "candles_qqq", "QQQ.US", "eodhd", "stock"),
-    ("IWM", "candles_iwm", "IWM.US", "eodhd", "stock"),
-    ("DIA", "candles_dia", "DIA.US", "eodhd", "stock"),
+    # OANDA - Forex (no delay!)
+    ("EUR/USD", "candles_eur_usd", "EUR_USD", "oanda", "forex"),
+    ("GBP/USD", "candles_gbp_usd", "GBP_USD", "oanda", "forex"),
+    ("USD/JPY", "candles_usd_jpy", "USD_JPY", "oanda", "forex"),
+    ("AUD/USD", "candles_aud_usd", "AUD_USD", "oanda", "forex"),
+    ("USD/CAD", "candles_usd_cad", "USD_CAD", "oanda", "forex"),
+    ("USD/CHF", "candles_usd_chf", "USD_CHF", "oanda", "forex"),
+    ("NZD/USD", "candles_nzd_usd", "NZD_USD", "oanda", "forex"),
+    ("EUR/GBP", "candles_eur_gbp", "EUR_GBP", "oanda", "forex"),
+    ("EUR/JPY", "candles_eur_jpy", "EUR_JPY", "oanda", "forex"),
+    ("GBP/JPY", "candles_gbp_jpy", "GBP_JPY", "oanda", "forex"),
+    ("AUD/JPY", "candles_aud_jpy", "AUD_JPY", "oanda", "forex"),
+    ("EUR/AUD", "candles_eur_aud", "EUR_AUD", "oanda", "forex"),
+    ("GBP/AUD", "candles_gbp_aud", "GBP_AUD", "oanda", "forex"),
+    ("EUR/CAD", "candles_eur_cad", "EUR_CAD", "oanda", "forex"),
+    ("GBP/CAD", "candles_gbp_cad", "GBP_CAD", "oanda", "forex"),
+    ("EUR/CHF", "candles_eur_chf", "EUR_CHF", "oanda", "forex"),
+    ("GBP/CHF", "candles_gbp_chf", "GBP_CHF", "oanda", "forex"),
+    ("CAD/JPY", "candles_cad_jpy", "CAD_JPY", "oanda", "forex"),
+    ("CHF/JPY", "candles_chf_jpy", "CHF_JPY", "oanda", "forex"),
+    ("AUD/CAD", "candles_aud_cad", "AUD_CAD", "oanda", "forex"),
+    ("AUD/CHF", "candles_aud_chf", "AUD_CHF", "oanda", "forex"),
+    ("AUD/NZD", "candles_aud_nzd", "AUD_NZD", "oanda", "forex"),
+    ("NZD/JPY", "candles_nzd_jpy", "NZD_JPY", "oanda", "forex"),
+    ("NZD/CAD", "candles_nzd_cad", "NZD_CAD", "oanda", "forex"),
+    ("NZD/CHF", "candles_nzd_chf", "NZD_CHF", "oanda", "forex"),
     # OANDA - Metals
     ("XAU/USD", "candles_xau_usd", "XAU_USD", "oanda", "commodity"),
     ("XAG/USD", "candles_xag_usd", "XAG_USD", "oanda", "commodity"),
     ("XPT/USD", "candles_xpt_usd", "XPT_USD", "oanda", "commodity"),
     ("XPD/USD", "candles_xpd_usd", "XPD_USD", "oanda", "commodity"),
+    ("XCU/USD", "candles_xcu_usd", "XCU_USD", "oanda", "commodity"),
     # OANDA - Energy
     ("WTICO/USD", "candles_wtico_usd", "WTICO_USD", "oanda", "commodity"),
     ("BCO/USD", "candles_bco_usd", "BCO_USD", "oanda", "commodity"),
     ("NATGAS/USD", "candles_natgas_usd", "NATGAS_USD", "oanda", "commodity"),
-    # OANDA - Indices
+    # OANDA - Agriculture
+    ("CORN/USD", "candles_corn_usd", "CORN_USD", "oanda", "commodity"),
+    ("WHEAT/USD", "candles_wheat_usd", "WHEAT_USD", "oanda", "commodity"),
+    ("SOYBN/USD", "candles_soybn_usd", "SOYBN_USD", "oanda", "commodity"),
+    ("SUGAR/USD", "candles_sugar_usd", "SUGAR_USD", "oanda", "commodity"),
+    # OANDA - US Indices
     ("US30/USD", "candles_us30_usd", "US30_USD", "oanda", "index"),
     ("SPX500/USD", "candles_spx500_usd", "SPX500_USD", "oanda", "index"),
     ("NAS100/USD", "candles_nas100_usd", "NAS100_USD", "oanda", "index"),
     ("US2000/USD", "candles_us2000_usd", "US2000_USD", "oanda", "index"),
+    # OANDA - European Indices
     ("UK100/GBP", "candles_uk100_gbp", "UK100_GBP", "oanda", "index"),
     ("DE30/EUR", "candles_de30_eur", "DE30_EUR", "oanda", "index"),
+    ("EU50/EUR", "candles_eu50_eur", "EU50_EUR", "oanda", "index"),
+    ("FR40/EUR", "candles_fr40_eur", "FR40_EUR", "oanda", "index"),
+    # OANDA - Asia-Pacific Indices
     ("JP225/USD", "candles_jp225_usd", "JP225_USD", "oanda", "index"),
+    ("AU200/AUD", "candles_au200_aud", "AU200_AUD", "oanda", "index"),
+    ("HK33/HKD", "candles_hk33_hkd", "HK33_HKD", "oanda", "index"),
+    ("CN50/USD", "candles_cn50_usd", "CN50_USD", "oanda", "index"),
+    # NOTE: Crypto (BTC, ETH) and US Stocks (AAPL, MSFT) excluded
+    # EODHD has 24-48h delay on intraday data - can't fill recent gaps
+    # For crypto/stocks, rely on WebSocket staying connected
 ]
 
 
@@ -4082,13 +4099,38 @@ def startup_fetch_eodhd_candles(api_symbol: str, start_dt: datetime, end_dt: dat
         "fmt": "json"
     }
     
+    debug(STARTUP_GAP_TASK, f"    Fetching: {url}?interval=1m&from={params['from']}&to={params['to']}")
+    
     try:
         response = requests.get(url, params=params, timeout=30)
-        if response.status_code == 200:
-            return response.json()
+        
+        if response.status_code != 200:
+            log.warning(f"    EODHD API error: HTTP {response.status_code} for {api_symbol}")
+            return []
+        
+        data = response.json()
+        
+        # EODHD returns empty list or error object when no data
+        if isinstance(data, dict) and "error" in data:
+            log.warning(f"    EODHD API error: {data.get('error', 'Unknown error')}")
+            return []
+        
+        if not isinstance(data, list):
+            log.warning(f"    EODHD unexpected response type: {type(data)}")
+            return []
+        
+        if len(data) == 0:
+            log.info(f"    EODHD returned 0 candles (market may have been closed)")
+        else:
+            log.info(f"    EODHD returned {len(data)} candles")
+        
+        return data
+        
+    except requests.exceptions.Timeout:
+        log.warning(f"    EODHD timeout for {api_symbol}")
         return []
     except Exception as e:
-        debug(STARTUP_GAP_TASK, f"EODHD fetch error: {e}")
+        log.warning(f"    EODHD fetch error for {api_symbol}: {e}")
         return []
 
 
@@ -4104,68 +4146,98 @@ def startup_fetch_oanda_candles(api_symbol: str, start_dt: datetime, end_dt: dat
         "price": "M"
     }
     
+    debug(STARTUP_GAP_TASK, f"    Fetching OANDA: {api_symbol} from {params['from']} to {params['to']}")
+    
     try:
         response = requests.get(url, headers=headers, params=params, timeout=30)
-        if response.status_code == 200:
-            return response.json().get("candles", [])
+        
+        if response.status_code != 200:
+            log.warning(f"    OANDA API error: HTTP {response.status_code} for {api_symbol}")
+            try:
+                error_data = response.json()
+                log.warning(f"    OANDA error: {error_data.get('errorMessage', 'Unknown')}")
+            except:
+                pass
+            return []
+        
+        data = response.json()
+        candles = data.get("candles", [])
+        
+        if len(candles) == 0:
+            log.info(f"    OANDA returned 0 candles (market may have been closed)")
+        else:
+            log.info(f"    OANDA returned {len(candles)} candles")
+        
+        return candles
+        
+    except requests.exceptions.Timeout:
+        log.warning(f"    OANDA timeout for {api_symbol}")
         return []
     except Exception as e:
-        debug(STARTUP_GAP_TASK, f"OANDA fetch error: {e}")
+        log.warning(f"    OANDA fetch error for {api_symbol}: {e}")
         return []
 
 
 def startup_fill_single_gap(display_symbol: str, table_name: str, api_symbol: str, source: str, gap: Dict) -> int:
-    """Fill a single gap using the appropriate API."""
+    """Fill a single gap using OANDA API."""
     start = gap["start"]
     end = gap["end"]
     
-    # Fetch candles based on source
-    if source == "eodhd":
-        candles = startup_fetch_eodhd_candles(api_symbol, start, end)
-    else:
-        candles = startup_fetch_oanda_candles(api_symbol, start, end)
+    # All symbols now use OANDA (no delay, real-time data)
+    candles = startup_fetch_oanda_candles(api_symbol, start, end)
     
     if not candles:
         return 0
     
     inserted = 0
+    errors = 0
     
     for c in candles:
         try:
-            if source == "eodhd":
-                # EODHD format
-                ts = datetime.fromtimestamp(c.get("timestamp", 0), tz=timezone.utc)
-                record = {
-                    "timestamp": ts.isoformat(),
-                    "open": float(c.get("open", 0)),
-                    "high": float(c.get("high", 0)),
-                    "low": float(c.get("low", 0)),
-                    "close": float(c.get("close", 0)),
-                    "volume": int(c.get("volume", 0)),
-                    "symbol": display_symbol,
-                }
+            # Skip incomplete candles
+            if not c.get("complete", False):
+                continue
+            
+            # Parse OANDA timestamp (handles nanosecond precision)
+            ts_str = c.get("time", "")
+            # OANDA returns: 2025-12-08T16:23:00.000000000Z
+            # Python can't parse nanoseconds, truncate to microseconds
+            if ".000000000Z" in ts_str:
+                ts_str = ts_str.replace(".000000000Z", "+00:00")
+            elif "." in ts_str and "Z" in ts_str:
+                # Truncate nanoseconds to 6 digits (microseconds)
+                parts = ts_str.replace("Z", "").split(".")
+                if len(parts) == 2 and len(parts[1]) > 6:
+                    ts_str = parts[0] + "." + parts[1][:6] + "+00:00"
+                else:
+                    ts_str = ts_str.replace("Z", "+00:00")
             else:
-                # OANDA format
-                if not c.get("complete", False):
-                    continue
-                ts_str = c.get("time", "").replace("Z", "+00:00")
-                ts = datetime.fromisoformat(ts_str)
-                mid = c.get("mid", {})
-                record = {
-                    "timestamp": ts.replace(second=0, microsecond=0).isoformat(),
-                    "open": float(mid.get("o", 0)),
-                    "high": float(mid.get("h", 0)),
-                    "low": float(mid.get("l", 0)),
-                    "close": float(mid.get("c", 0)),
-                    "volume": int(c.get("volume", 0)),
-                    "symbol": display_symbol,
-                }
+                ts_str = ts_str.replace("Z", "+00:00")
+            
+            ts = datetime.fromisoformat(ts_str)
+            mid = c.get("mid", {})
+            
+            record = {
+                "timestamp": ts.replace(second=0, microsecond=0).isoformat(),
+                "open": float(mid.get("o", 0)),
+                "high": float(mid.get("h", 0)),
+                "low": float(mid.get("l", 0)),
+                "close": float(mid.get("c", 0)),
+                "volume": int(c.get("volume", 0)),
+                "symbol": display_symbol,
+            }
             
             sb.table(table_name).upsert(record, on_conflict="timestamp").execute()
             inserted += 1
+            inserted += 1
             
-        except Exception:
-            pass  # Skip errors silently
+        except Exception as e:
+            errors += 1
+            if errors <= 3:  # Only log first 3 errors to avoid spam
+                log.warning(f"    Insert error: {e}")
+    
+    if errors > 3:
+        log.warning(f"    ... and {errors - 3} more insert errors")
     
     return inserted
 
