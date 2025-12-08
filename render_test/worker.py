@@ -12,11 +12,14 @@ DEBUG FEATURES:
   - Per-task health metrics
   - Configurable debug verbosity
 
+STARTUP:
+  - Gap Fill (one-time) - Auto-fills gaps > 15min from last 24h (market-aware)
+
 TASKS:
   1. Tick Streaming     - EODHD WebSocket (280 symbols across 7 connections)
   2. Economic Calendar  - EODHD API (every 5 min)
   3. Financial News     - RSS feeds + Gemini AI classification
-  4. Gap Fill Service   - Auto-detect and repair missing candle data
+  4. Gap Fill Service   - Auto-detect and report missing candle data
   5. Whale Flow Tracker - BTC whale movements via Blockchain.com WebSocket
   6. AI News Desk       - Placeholder for article synthesis
   7. Sector Sentiment   - AI market sentiment analysis (scheduled updates)
@@ -3879,6 +3882,362 @@ async def bond_yields_streaming_task():
 
 
 # ============================================================================
+#                    STARTUP GAP FILL (One-time on startup)
+# ============================================================================
+# Automatically fills gaps > 15 minutes on worker startup.
+# Smart enough to skip expected market closures (weekends, holidays).
+# ============================================================================
+
+STARTUP_GAP_TASK = "STARTUP_GAP_FILL"
+STARTUP_GAP_THRESHOLD_MINUTES = 15
+STARTUP_GAP_LOOKBACK_HOURS = 24
+
+# US Market Holidays 2025 (YYYY-MM-DD format)
+US_MARKET_HOLIDAYS_2025 = {
+    "2025-01-01",  # New Year's Day
+    "2025-01-20",  # MLK Day
+    "2025-02-17",  # Presidents Day
+    "2025-04-18",  # Good Friday
+    "2025-05-26",  # Memorial Day
+    "2025-06-19",  # Juneteenth
+    "2025-07-04",  # Independence Day
+    "2025-09-01",  # Labor Day
+    "2025-11-27",  # Thanksgiving
+    "2025-12-25",  # Christmas
+}
+
+# Symbol configurations for gap fill
+# Format: (display_symbol, table_name, api_symbol, source, asset_type)
+STARTUP_GAP_SYMBOLS = [
+    # EODHD - Forex (priority)
+    ("EUR/USD", "candles_eur_usd", "EURUSD.FOREX", "eodhd", "forex"),
+    ("GBP/USD", "candles_gbp_usd", "GBPUSD.FOREX", "eodhd", "forex"),
+    ("USD/JPY", "candles_usd_jpy", "USDJPY.FOREX", "eodhd", "forex"),
+    ("AUD/USD", "candles_aud_usd", "AUDUSD.FOREX", "eodhd", "forex"),
+    ("USD/CAD", "candles_usd_cad", "USDCAD.FOREX", "eodhd", "forex"),
+    ("USD/CHF", "candles_usd_chf", "USDCHF.FOREX", "eodhd", "forex"),
+    ("NZD/USD", "candles_nzd_usd", "NZDUSD.FOREX", "eodhd", "forex"),
+    ("EUR/GBP", "candles_eur_gbp", "EURGBP.FOREX", "eodhd", "forex"),
+    ("EUR/JPY", "candles_eur_jpy", "EURJPY.FOREX", "eodhd", "forex"),
+    ("GBP/JPY", "candles_gbp_jpy", "GBPJPY.FOREX", "eodhd", "forex"),
+    # EODHD - Crypto (24/7)
+    ("BTC/USD", "candles_btc_usd", "BTC-USD.CC", "eodhd", "crypto"),
+    ("ETH/USD", "candles_eth_usd", "ETH-USD.CC", "eodhd", "crypto"),
+    ("SOL/USD", "candles_sol_usd", "SOL-USD.CC", "eodhd", "crypto"),
+    ("XRP/USD", "candles_xrp_usd", "XRP-USD.CC", "eodhd", "crypto"),
+    ("DOGE/USD", "candles_doge_usd", "DOGE-USD.CC", "eodhd", "crypto"),
+    ("ADA/USD", "candles_ada_usd", "ADA-USD.CC", "eodhd", "crypto"),
+    # EODHD - US Stocks (priority)
+    ("AAPL", "candles_aapl", "AAPL.US", "eodhd", "stock"),
+    ("MSFT", "candles_msft", "MSFT.US", "eodhd", "stock"),
+    ("GOOGL", "candles_googl", "GOOGL.US", "eodhd", "stock"),
+    ("AMZN", "candles_amzn", "AMZN.US", "eodhd", "stock"),
+    ("TSLA", "candles_tsla", "TSLA.US", "eodhd", "stock"),
+    ("NVDA", "candles_nvda", "NVDA.US", "eodhd", "stock"),
+    ("META", "candles_meta", "META.US", "eodhd", "stock"),
+    # EODHD - ETFs (priority)
+    ("SPY", "candles_spy", "SPY.US", "eodhd", "stock"),
+    ("QQQ", "candles_qqq", "QQQ.US", "eodhd", "stock"),
+    ("IWM", "candles_iwm", "IWM.US", "eodhd", "stock"),
+    ("DIA", "candles_dia", "DIA.US", "eodhd", "stock"),
+    # OANDA - Metals
+    ("XAU/USD", "candles_xau_usd", "XAU_USD", "oanda", "commodity"),
+    ("XAG/USD", "candles_xag_usd", "XAG_USD", "oanda", "commodity"),
+    ("XPT/USD", "candles_xpt_usd", "XPT_USD", "oanda", "commodity"),
+    ("XPD/USD", "candles_xpd_usd", "XPD_USD", "oanda", "commodity"),
+    # OANDA - Energy
+    ("WTICO/USD", "candles_wtico_usd", "WTICO_USD", "oanda", "commodity"),
+    ("BCO/USD", "candles_bco_usd", "BCO_USD", "oanda", "commodity"),
+    ("NATGAS/USD", "candles_natgas_usd", "NATGAS_USD", "oanda", "commodity"),
+    # OANDA - Indices
+    ("US30/USD", "candles_us30_usd", "US30_USD", "oanda", "index"),
+    ("SPX500/USD", "candles_spx500_usd", "SPX500_USD", "oanda", "index"),
+    ("NAS100/USD", "candles_nas100_usd", "NAS100_USD", "oanda", "index"),
+    ("US2000/USD", "candles_us2000_usd", "US2000_USD", "oanda", "index"),
+    ("UK100/GBP", "candles_uk100_gbp", "UK100_GBP", "oanda", "index"),
+    ("DE30/EUR", "candles_de30_eur", "DE30_EUR", "oanda", "index"),
+    ("JP225/USD", "candles_jp225_usd", "JP225_USD", "oanda", "index"),
+]
+
+
+def is_us_stock_market_open(dt: datetime) -> bool:
+    """Check if US stock market is open at a given datetime."""
+    # Convert to ET
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt_et = dt.astimezone(ET)
+    
+    # Check if it's a holiday
+    date_str = dt_et.strftime("%Y-%m-%d")
+    if date_str in US_MARKET_HOLIDAYS_2025:
+        return False
+    
+    # Weekend check
+    if dt_et.weekday() >= 5:  # Saturday=5, Sunday=6
+        return False
+    
+    # Market hours: 9:30 AM - 4:00 PM ET
+    market_open = dt_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close = dt_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    
+    return market_open <= dt_et <= market_close
+
+
+def is_forex_market_open(dt: datetime) -> bool:
+    """Check if forex market is open at a given datetime."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt_et = dt.astimezone(ET)
+    
+    weekday = dt_et.weekday()
+    hour = dt_et.hour
+    
+    # Forex closed: Friday 5PM ET to Sunday 5PM ET
+    if weekday == 4 and hour >= 17:  # Friday after 5PM
+        return False
+    if weekday == 5:  # Saturday
+        return False
+    if weekday == 6 and hour < 17:  # Sunday before 5PM
+        return False
+    
+    return True
+
+
+def is_gap_during_expected_closure(asset_type: str, gap_start: datetime, gap_end: datetime) -> bool:
+    """
+    Check if a gap falls entirely within expected market closure.
+    Returns True if the gap is expected (should be skipped).
+    """
+    # Crypto never has expected closures
+    if asset_type == "crypto":
+        return False
+    
+    # For stocks: check if gap falls outside market hours or on holiday
+    if asset_type == "stock":
+        # If gap START is outside market hours, it's expected
+        if not is_us_stock_market_open(gap_start):
+            # Check if gap END is also outside market hours
+            # If so, entire gap is during closure
+            if not is_us_stock_market_open(gap_end):
+                return True
+        return False
+    
+    # For forex, commodities, indices: check weekend closure
+    if asset_type in ("forex", "commodity", "index"):
+        if not is_forex_market_open(gap_start) and not is_forex_market_open(gap_end):
+            return True
+        return False
+    
+    return False
+
+
+def startup_detect_gaps(table_name: str, lookback_hours: int = STARTUP_GAP_LOOKBACK_HOURS) -> List[Dict]:
+    """Detect gaps in candle data for startup fill."""
+    try:
+        since = (datetime.now(timezone.utc) - timedelta(hours=lookback_hours)).isoformat()
+        
+        result = sb.table(table_name).select("timestamp").gte(
+            "timestamp", since
+        ).order("timestamp", desc=False).execute()
+        
+        if not result.data or len(result.data) < 2:
+            return []
+        
+        gaps = []
+        timestamps = []
+        
+        for r in result.data:
+            ts_str = r["timestamp"]
+            if ts_str.endswith("Z"):
+                ts_str = ts_str.replace("Z", "+00:00")
+            elif "+" not in ts_str and "-" not in ts_str[-6:]:
+                ts_str = ts_str + "+00:00"
+            timestamps.append(datetime.fromisoformat(ts_str))
+        
+        for i in range(1, len(timestamps)):
+            gap_minutes = (timestamps[i] - timestamps[i-1]).total_seconds() / 60
+            if gap_minutes > STARTUP_GAP_THRESHOLD_MINUTES:
+                gaps.append({
+                    "start": timestamps[i-1] + timedelta(minutes=1),
+                    "end": timestamps[i] - timedelta(minutes=1),
+                    "minutes": int(gap_minutes) - 1
+                })
+        
+        return gaps
+        
+    except Exception as e:
+        debug(STARTUP_GAP_TASK, f"Gap detection error for {table_name}: {e}")
+        return []
+
+
+def startup_fetch_eodhd_candles(api_symbol: str, start_dt: datetime, end_dt: datetime) -> List[Dict]:
+    """Fetch candles from EODHD REST API."""
+    url = f"https://eodhd.com/api/intraday/{api_symbol}"
+    
+    params = {
+        "api_token": EODHD_API_KEY,
+        "interval": "1m",
+        "from": int(start_dt.timestamp()),
+        "to": int(end_dt.timestamp()),
+        "fmt": "json"
+    }
+    
+    try:
+        response = requests.get(url, params=params, timeout=30)
+        if response.status_code == 200:
+            return response.json()
+        return []
+    except Exception as e:
+        debug(STARTUP_GAP_TASK, f"EODHD fetch error: {e}")
+        return []
+
+
+def startup_fetch_oanda_candles(api_symbol: str, start_dt: datetime, end_dt: datetime) -> List[Dict]:
+    """Fetch candles from OANDA REST API."""
+    url = f"{OANDA_REST_URL}/v3/instruments/{api_symbol}/candles"
+    
+    headers = {"Authorization": f"Bearer {OANDA_API_KEY}"}
+    params = {
+        "granularity": "M1",
+        "from": start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "to": end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "price": "M"
+    }
+    
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=30)
+        if response.status_code == 200:
+            return response.json().get("candles", [])
+        return []
+    except Exception as e:
+        debug(STARTUP_GAP_TASK, f"OANDA fetch error: {e}")
+        return []
+
+
+def startup_fill_single_gap(display_symbol: str, table_name: str, api_symbol: str, source: str, gap: Dict) -> int:
+    """Fill a single gap using the appropriate API."""
+    start = gap["start"]
+    end = gap["end"]
+    
+    # Fetch candles based on source
+    if source == "eodhd":
+        candles = startup_fetch_eodhd_candles(api_symbol, start, end)
+    else:
+        candles = startup_fetch_oanda_candles(api_symbol, start, end)
+    
+    if not candles:
+        return 0
+    
+    inserted = 0
+    
+    for c in candles:
+        try:
+            if source == "eodhd":
+                # EODHD format
+                ts = datetime.fromtimestamp(c.get("timestamp", 0), tz=timezone.utc)
+                record = {
+                    "timestamp": ts.isoformat(),
+                    "open": float(c.get("open", 0)),
+                    "high": float(c.get("high", 0)),
+                    "low": float(c.get("low", 0)),
+                    "close": float(c.get("close", 0)),
+                    "volume": int(c.get("volume", 0)),
+                    "symbol": display_symbol,
+                }
+            else:
+                # OANDA format
+                if not c.get("complete", False):
+                    continue
+                ts_str = c.get("time", "").replace("Z", "+00:00")
+                ts = datetime.fromisoformat(ts_str)
+                mid = c.get("mid", {})
+                record = {
+                    "timestamp": ts.replace(second=0, microsecond=0).isoformat(),
+                    "open": float(mid.get("o", 0)),
+                    "high": float(mid.get("h", 0)),
+                    "low": float(mid.get("l", 0)),
+                    "close": float(mid.get("c", 0)),
+                    "volume": int(c.get("volume", 0)),
+                    "symbol": display_symbol,
+                }
+            
+            sb.table(table_name).upsert(record, on_conflict="timestamp").execute()
+            inserted += 1
+            
+        except Exception:
+            pass  # Skip errors silently
+    
+    return inserted
+
+
+def run_startup_gap_fill():
+    """
+    Main startup gap fill function.
+    Scans last 24 hours and fills gaps > 15 minutes.
+    Skips gaps that fall during expected market closures.
+    """
+    log.info("=" * 70)
+    log.info("STARTUP GAP FILL - Scanning for data gaps...")
+    log.info("=" * 70)
+    log.info(f"  Threshold: > {STARTUP_GAP_THRESHOLD_MINUTES} minutes")
+    log.info(f"  Lookback: {STARTUP_GAP_LOOKBACK_HOURS} hours")
+    log.info(f"  Symbols: {len(STARTUP_GAP_SYMBOLS)}")
+    log.info("")
+    
+    total_gaps = 0
+    total_filled = 0
+    symbols_with_gaps = []
+    
+    for display_symbol, table_name, api_symbol, source, asset_type in STARTUP_GAP_SYMBOLS:
+        try:
+            # Detect gaps
+            gaps = startup_detect_gaps(table_name)
+            
+            if not gaps:
+                continue
+            
+            # Filter out expected closures
+            unexpected_gaps = []
+            for gap in gaps:
+                if is_gap_during_expected_closure(asset_type, gap["start"], gap["end"]):
+                    debug(STARTUP_GAP_TASK, f"  {display_symbol}: Skipping expected closure gap")
+                else:
+                    unexpected_gaps.append(gap)
+            
+            if not unexpected_gaps:
+                continue
+            
+            total_gaps += len(unexpected_gaps)
+            gap_info = f"{display_symbol}({len(unexpected_gaps)})"
+            symbols_with_gaps.append(gap_info)
+            
+            # Fill each gap
+            for gap in unexpected_gaps:
+                log.info(f"  {display_symbol}: Filling {gap['start'].strftime('%m/%d %H:%M')} → {gap['end'].strftime('%H:%M')} ({gap['minutes']} min)")
+                filled = startup_fill_single_gap(display_symbol, table_name, api_symbol, source, gap)
+                total_filled += filled
+                if filled > 0:
+                    log.info(f"    → Inserted {filled} candles")
+            
+            # Rate limiting
+            time.sleep(0.3)
+            
+        except Exception as e:
+            log.warning(f"  {display_symbol}: Error - {e}")
+    
+    log.info("")
+    log.info("=" * 70)
+    if total_gaps > 0:
+        log.info(f"STARTUP GAP FILL COMPLETE: {total_gaps} gaps found, {total_filled} candles inserted")
+        if symbols_with_gaps:
+            log.info(f"  Symbols with gaps: {', '.join(symbols_with_gaps)}")
+    else:
+        log.info("STARTUP GAP FILL COMPLETE: No unexpected gaps found ✓")
+    log.info("=" * 70)
+    log.info("")
+
+
+# ============================================================================
 #                              MAIN ENTRY POINT
 # ============================================================================
 
@@ -3887,6 +4246,10 @@ async def main():
     
     # Run startup diagnostics
     run_startup_diagnostics()
+    
+    # Run startup gap fill (one-time, fills gaps > 15 min from last 24h)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, run_startup_gap_fill)
     
     log.info("=" * 70)
     log.info("LONDON STRATEGIC EDGE - WORKER v9.0 (DEBUG)")
