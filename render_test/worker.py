@@ -23,6 +23,7 @@ TASKS:
   8. G20 Macro Fetcher  - 20 countries x 6 indicators (hourly)
   9. Sector Sentiment   - AI market sentiment analysis (scheduled updates)
   10. News Articles     - Multi-source news scraper with filtering
+  11. OANDA Streaming   - Commodities & indices real-time (24 instruments)
 
 ================================================================================
 """
@@ -68,6 +69,12 @@ GOOGLE_GEMINI_API_KEY = os.environ.get("GOOGLE_GEMINI_API_KEY", "")
 GEMINI_MODEL = "gemini-2.0-flash"
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 SUPABASE_TABLE = os.environ.get("SUPABASE_TABLE", "tickdata")
+
+# OANDA API Configuration
+OANDA_API_KEY = os.environ.get("OANDA_API_KEY", "bc3eda63cee6780c003d88b4fab38d65-d6ee2b3133bfb3646462c6debb163fb0")
+OANDA_STREAM_URL = "https://stream-fxtrade.oanda.com"
+OANDA_REST_URL = "https://api-fxtrade.oanda.com"
+OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID", "001-004-19240534-003")
 
 # Timing configuration
 BATCH_MAX = 500
@@ -3577,6 +3584,350 @@ async def news_articles_task():
 
 
 # ============================================================================
+#                    TASK 11: OANDA STREAMING (Commodities & Indices)
+# ============================================================================
+# Real-time price streaming for commodities and indices via OANDA API.
+# Uses HTTP streaming (Server-Sent Events style) for persistent connection.
+#
+# INSTRUMENTS (24 total - excludes bonds):
+#   Metals (5): XAU, XAG, XPT, XPD, XCU
+#   Energy (3): WTICO, BCO, NATGAS  
+#   Agriculture (4): CORN, WHEAT, SOYBN, SUGAR
+#   US Indices (4): US30, SPX500, NAS100, US2000
+#   EU Indices (4): UK100, DE30, EU50, FR40
+#   Asia Indices (4): JP225, AU200, HK33, CN50
+# ============================================================================
+
+OANDA_TASK = "OANDA_STREAM"
+
+# OANDA instruments: API symbol -> (display_symbol, candle_table)
+OANDA_INSTRUMENTS = {
+    # Metals
+    "XAU_USD": ("XAU/USD", "candles_xau_usd"),
+    "XAG_USD": ("XAG/USD", "candles_xag_usd"),
+    "XPT_USD": ("XPT/USD", "candles_xpt_usd"),
+    "XPD_USD": ("XPD/USD", "candles_xpd_usd"),
+    "XCU_USD": ("XCU/USD", "candles_xcu_usd"),
+    # Energy
+    "WTICO_USD": ("WTICO/USD", "candles_wtico_usd"),
+    "BCO_USD": ("BCO/USD", "candles_bco_usd"),
+    "NATGAS_USD": ("NATGAS/USD", "candles_natgas_usd"),
+    # Agriculture
+    "CORN_USD": ("CORN/USD", "candles_corn_usd"),
+    "WHEAT_USD": ("WHEAT/USD", "candles_wheat_usd"),
+    "SOYBN_USD": ("SOYBN/USD", "candles_soybn_usd"),
+    "SUGAR_USD": ("SUGAR/USD", "candles_sugar_usd"),
+    # US Indices
+    "US30_USD": ("US30/USD", "candles_us30_usd"),
+    "SPX500_USD": ("SPX500/USD", "candles_spx500_usd"),
+    "NAS100_USD": ("NAS100/USD", "candles_nas100_usd"),
+    "US2000_USD": ("US2000/USD", "candles_us2000_usd"),
+    # European Indices
+    "UK100_GBP": ("UK100/GBP", "candles_uk100_gbp"),
+    "DE30_EUR": ("DE30/EUR", "candles_de30_eur"),
+    "EU50_EUR": ("EU50/EUR", "candles_eu50_eur"),
+    "FR40_EUR": ("FR40/EUR", "candles_fr40_eur"),
+    # Asia-Pacific Indices
+    "JP225_USD": ("JP225/USD", "candles_jp225_usd"),
+    "AU200_AUD": ("AU200/AUD", "candles_au200_aud"),
+    "HK33_HKD": ("HK33/HKD", "candles_hk33_hkd"),
+    "CN50_USD": ("CN50/USD", "candles_cn50_usd"),
+}
+
+# Track OANDA minute-level OHLC in memory for candle building
+_oanda_minute_ohlc: Dict[str, Dict[str, Dict[str, float]]] = {}
+_oanda_ohlc_lock = threading.Lock()
+
+
+def oanda_update_minute_ohlc(symbol: str, minute_ts: str, price: float) -> Dict[str, float]:
+    """Track minute-level OHLC for OANDA instruments."""
+    with _oanda_ohlc_lock:
+        if symbol not in _oanda_minute_ohlc:
+            _oanda_minute_ohlc[symbol] = {}
+        
+        candles = _oanda_minute_ohlc[symbol]
+        
+        # Cleanup old minutes (keep last 5)
+        if len(candles) > 10:
+            sorted_minutes = sorted(candles.keys())
+            for old_minute in sorted_minutes[:-5]:
+                del candles[old_minute]
+        
+        if minute_ts not in candles:
+            candles[minute_ts] = {
+                "open": price,
+                "high": price,
+                "low": price,
+                "close": price
+            }
+        else:
+            c = candles[minute_ts]
+            c["high"] = max(c["high"], price)
+            c["low"] = min(c["low"], price)
+            c["close"] = price
+        
+        return candles[minute_ts].copy()
+
+
+def oanda_detect_gaps(symbol: str, table_name: str, lookback_hours: int = 4) -> List[Tuple[datetime, datetime]]:
+    """Detect gaps in OANDA candle data since last backfill."""
+    try:
+        since = (datetime.now(timezone.utc) - timedelta(hours=lookback_hours)).isoformat()
+        
+        result = sb.table(table_name).select("timestamp").gte(
+            "timestamp", since
+        ).order("timestamp", desc=False).execute()
+        
+        if not result.data or len(result.data) < 2:
+            return []
+        
+        gaps = []
+        timestamps = [
+            datetime.fromisoformat(r["timestamp"].replace("Z", "+00:00"))
+            for r in result.data
+        ]
+        
+        for i in range(1, len(timestamps)):
+            gap_minutes = (timestamps[i] - timestamps[i-1]).total_seconds() / 60
+            if gap_minutes > 5:  # 5 minute gap threshold for OANDA data
+                gaps.append((timestamps[i-1], timestamps[i]))
+        
+        return gaps
+        
+    except Exception as e:
+        debug(OANDA_TASK, f"Gap detection error for {symbol}: {e}")
+        return []
+
+
+def oanda_fill_gaps_from_api(symbol: str, table_name: str, display_symbol: str, gaps: List[Tuple[datetime, datetime]]) -> int:
+    """Fill detected gaps using OANDA REST API historical candles."""
+    if not gaps:
+        return 0
+    
+    filled_count = 0
+    headers = {
+        "Authorization": f"Bearer {OANDA_API_KEY}",
+        "Accept-Datetime-Format": "RFC3339",
+    }
+    
+    for gap_start, gap_end in gaps:
+        try:
+            url = f"{OANDA_REST_URL}/v3/instruments/{symbol}/candles"
+            params = {
+                "granularity": "M1",
+                "price": "M",
+                "from": gap_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "to": gap_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+            
+            resp = requests.get(url, headers=headers, params=params, timeout=30)
+            if resp.status_code != 200:
+                continue
+            
+            candles = resp.json().get("candles", [])
+            
+            for c in candles:
+                if not c.get("complete", False):
+                    continue
+                
+                mid = c.get("mid", {})
+                candle_record = {
+                    "timestamp": c["time"],
+                    "open": float(mid.get("o", 0)),
+                    "high": float(mid.get("h", 0)),
+                    "low": float(mid.get("l", 0)),
+                    "close": float(mid.get("c", 0)),
+                    "volume": int(c.get("volume", 0)),
+                    "symbol": display_symbol,
+                }
+                
+                try:
+                    sb.table(table_name).upsert(candle_record, on_conflict="timestamp").execute()
+                    filled_count += 1
+                except Exception:
+                    pass
+            
+            time.sleep(0.25)  # Rate limit
+            
+        except Exception as e:
+            debug(OANDA_TASK, f"Gap fill error for {symbol}: {e}")
+    
+    return filled_count
+
+
+def oanda_run_gap_detection_and_fill() -> Dict[str, int]:
+    """Run gap detection and fill for all OANDA instruments."""
+    results = {}
+    
+    for oanda_symbol, (display_symbol, table_name) in OANDA_INSTRUMENTS.items():
+        gaps = oanda_detect_gaps(oanda_symbol, table_name)
+        if gaps:
+            filled = oanda_fill_gaps_from_api(oanda_symbol, table_name, display_symbol, gaps)
+            results[display_symbol] = filled
+            if filled > 0:
+                debug(OANDA_TASK, f"  {display_symbol}: Filled {filled} gap candles")
+    
+    return results
+
+
+async def oanda_streaming_task():
+    """Task 11: Stream real-time prices from OANDA for commodities & indices."""
+    task_metrics = metrics.get_or_create(OANDA_TASK)
+    
+    info(OANDA_TASK, f"OANDA Streaming started ({len(OANDA_INSTRUMENTS)} instruments)")
+    
+    # Run initial gap detection and fill
+    info(OANDA_TASK, "Running startup gap detection...")
+    loop = asyncio.get_event_loop()
+    gap_results = await loop.run_in_executor(None, oanda_run_gap_detection_and_fill)
+    if gap_results:
+        total_filled = sum(gap_results.values())
+        info(OANDA_TASK, f"Gap fill complete: {total_filled} candles filled across {len(gap_results)} instruments")
+    else:
+        info(OANDA_TASK, "No gaps detected")
+    
+    # Build instruments query string
+    instruments_str = ",".join(OANDA_INSTRUMENTS.keys())
+    url = f"{OANDA_STREAM_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/pricing/stream"
+    headers = {"Authorization": f"Bearer {OANDA_API_KEY}"}
+    params = {"instruments": instruments_str}
+    
+    # Streaming stats
+    tick_count = 0
+    reconnect_count = 0
+    last_health_log = datetime.now(timezone.utc)
+    instruments_seen = set()
+    
+    while not tick_streamer._shutdown.is_set():
+        try:
+            reconnect_count += 1
+            info(OANDA_TASK, f"Connecting to OANDA stream (attempt #{reconnect_count})...")
+            
+            # Use requests with stream=True for SSE-style streaming
+            with requests.get(url, headers=headers, params=params, stream=True, timeout=None) as resp:
+                if resp.status_code != 200:
+                    error(OANDA_TASK, f"Stream connection failed: HTTP {resp.status_code}")
+                    task_metrics.record_error(f"HTTP {resp.status_code}")
+                    await asyncio.sleep(30)
+                    continue
+                
+                info(OANDA_TASK, f"Connected! Streaming {len(OANDA_INSTRUMENTS)} instruments...")
+                
+                for line in resp.iter_lines():
+                    # Check shutdown
+                    if tick_streamer._shutdown.is_set():
+                        break
+                    
+                    if not line:
+                        continue
+                    
+                    try:
+                        data = json.loads(line.decode('utf-8'))
+                        msg_type = data.get("type", "")
+                        
+                        if msg_type == "PRICE":
+                            instrument = data.get("instrument", "")
+                            if instrument not in OANDA_INSTRUMENTS:
+                                continue
+                            
+                            display_symbol, candle_table = OANDA_INSTRUMENTS[instrument]
+                            instruments_seen.add(display_symbol)
+                            
+                            bids = data.get("bids", [])
+                            asks = data.get("asks", [])
+                            
+                            if not bids or not asks:
+                                continue
+                            
+                            bid = float(bids[0].get("price", 0))
+                            ask = float(asks[0].get("price", 0))
+                            price = (bid + ask) / 2
+                            
+                            # Get liquidity and map to volume
+                            bid_liquidity = int(bids[0].get("liquidity", 0))
+                            ask_liquidity = int(asks[0].get("liquidity", 0))
+                            volume = bid_liquidity + ask_liquidity
+                            
+                            now = datetime.now(timezone.utc)
+                            minute_ts = now.replace(second=0, microsecond=0).isoformat()
+                            
+                            # Update minute OHLC
+                            minute_ohlc = oanda_update_minute_ohlc(display_symbol, minute_ts, price)
+                            
+                            # Insert tick to tickdata
+                            tick = {
+                                "symbol": display_symbol,
+                                "price": price,
+                                "bid": bid,
+                                "ask": ask,
+                                "volume": volume,
+                                "ts": now.isoformat(),
+                            }
+                            
+                            try:
+                                sb.table(SUPABASE_TABLE).insert(tick).execute()
+                            except Exception as e:
+                                if tick_count % 1000 == 0:  # Only log occasionally
+                                    debug(OANDA_TASK, f"Tick insert error: {e}")
+                            
+                            # Upsert candle
+                            candle = {
+                                "timestamp": minute_ts,
+                                "open": minute_ohlc["open"],
+                                "high": minute_ohlc["high"],
+                                "low": minute_ohlc["low"],
+                                "close": minute_ohlc["close"],
+                                "volume": volume,
+                                "symbol": display_symbol,
+                            }
+                            
+                            try:
+                                sb.table(candle_table).upsert(candle, on_conflict="timestamp").execute()
+                            except Exception as e:
+                                if tick_count % 1000 == 0:
+                                    debug(OANDA_TASK, f"Candle upsert error: {e}")
+                            
+                            tick_count += 1
+                            task_metrics.record_success()
+                            
+                        elif msg_type == "HEARTBEAT":
+                            # OANDA sends heartbeats every 5 seconds if no price updates
+                            pass
+                        
+                    except json.JSONDecodeError:
+                        continue
+                    except Exception as e:
+                        debug(OANDA_TASK, f"Tick processing error: {e}")
+                    
+                    # Periodic health logging
+                    now = datetime.now(timezone.utc)
+                    if (now - last_health_log).total_seconds() >= 60:
+                        info(OANDA_TASK, f"HEALTH: {tick_count:,} ticks | {len(instruments_seen)}/{len(OANDA_INSTRUMENTS)} instruments active")
+                        task_metrics.custom_metrics.update({
+                            "tick_count": tick_count,
+                            "instruments_active": len(instruments_seen),
+                            "reconnect_count": reconnect_count,
+                        })
+                        last_health_log = now
+                        
+                        # Run gap detection every hour
+                        if now.minute == 0:
+                            gap_results = await loop.run_in_executor(None, oanda_run_gap_detection_and_fill)
+                            if gap_results:
+                                total_filled = sum(gap_results.values())
+                                info(OANDA_TASK, f"Hourly gap fill: {total_filled} candles")
+            
+        except requests.exceptions.RequestException as e:
+            error(OANDA_TASK, f"Stream error: {e}")
+            task_metrics.record_error(str(e))
+            await asyncio.sleep(10)
+        except Exception as e:
+            error(OANDA_TASK, f"Unexpected error: {e}", exc_info=DEBUG_MODE)
+            task_metrics.record_error(str(e))
+            await asyncio.sleep(30)
+
+
+# ============================================================================
 #                              MAIN ENTRY POINT
 # ============================================================================
 
@@ -3613,6 +3964,7 @@ async def main():
         asyncio.create_task(macro_fetcher_task(), name="macro"),
         asyncio.create_task(sector_sentiment_task(), name="sentiment"),
         asyncio.create_task(news_articles_task(), name="news_articles"),
+        asyncio.create_task(oanda_streaming_task(), name="oanda_stream"),
     ]
     
     # Periodic metrics logging
