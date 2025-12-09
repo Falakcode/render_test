@@ -4539,7 +4539,49 @@ def run_startup_gap_fill():
 STOCK_DATA_TASK = "STOCK_DATA"
 
 # Stocks to track - add more here as needed
-TRACKED_STOCKS = ["AAPL", "NVDA", "MSFT", "AMZN", "GOOGL"]
+# Old:
+#   TRACKED_STOCKS = ["AAPL", "NVDA", "MSFT", "AMZN", "GOOGL"]
+#
+# New (all 96 US stocks):
+
+TRACKED_STOCKS = [
+    # Big Tech (7)
+    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA",
+    
+    # Semiconductors (12)
+    "AMD", "INTC", "AVGO", "QCOM", "TXN", "MU", "AMAT", "LRCX", "KLAC", "ADI", "MRVL", "ON",
+    
+    # Enterprise Software (15)
+    "CRM", "ADBE", "NOW", "SNOW", "PLTR", "PANW", "CRWD", "ZS", "DDOG", "NET",
+    "TEAM", "MDB", "WDAY", "SPLK", "ZM",
+    
+    # Fintech & Payments (8)
+    "V", "MA", "PYPL", "SQ", "COIN", "HOOD", "AFRM", "UPST",
+    
+    # Banks (8)
+    "JPM", "BAC", "WFC", "GS", "MS", "C", "USB", "SCHW",
+    
+    # Healthcare (10)
+    "UNH", "JNJ", "PFE", "ABBV", "MRK", "LLY", "BMY", "GILD", "AMGN", "BIIB",
+    
+    # Retail & Consumer (10)
+    "WMT", "COST", "TGT", "HD", "LOW", "NKE", "SBUX", "MCD", "DIS", "NFLX",
+    
+    # Industrial & Aerospace (10)
+    "BA", "LMT", "RTX", "GE", "CAT", "DE", "HON", "MMM", "UPS", "FDX",
+    
+    # Energy (8)
+    "XOM", "CVX", "COP", "EOG", "SLB", "OXY", "PSX", "VLO",
+    
+    # REITs (4)
+    "AMT", "PLD", "CCI", "EQIX",
+    
+    # Telecom (4)
+    "T", "VZ", "TMUS", "CMCSA",
+    
+    # Auto (4)
+    "F", "GM", "RIVN", "LCID",
+]
 
 # Sync schedule (UTC hours)
 STOCK_DATA_FULL_SYNC_HOUR = 6  # 6 AM UTC - before London opens
