@@ -1065,10 +1065,16 @@ def classify_calendar_impact(event_name: str) -> str:
     return "Low"
 
 
-def fetch_eodhd_calendar(days_ahead: int = 7) -> Tuple[List[Dict], Optional[str]]:
+def fetch_eodhd_calendar(days_ahead: int = 7, days_back: int = 7) -> Tuple[List[Dict], Optional[str]]:
     """Fetch economic calendar from EODHD API.
+    
+    Args:
+        days_ahead: Days into the future to fetch
+        days_back: Days into the past to fetch (to get actuals!)
+    
     Returns (events, error_message)."""
-    from_date = datetime.now().strftime("%Y-%m-%d")
+    # Fetch PAST events too - this is where actuals come from!
+    from_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
     to_date = (datetime.now() + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
     
     url = "https://eodhd.com/api/economic-events"
@@ -1080,14 +1086,15 @@ def fetch_eodhd_calendar(days_ahead: int = 7) -> Tuple[List[Dict], Optional[str]
         "fmt": "json"
     }
     
-    debug(CALENDAR_TASK, f"Fetching calendar: {from_date} to {to_date}")
+    debug(CALENDAR_TASK, f"Fetching calendar: {from_date} to {to_date} (past {days_back}d + future {days_ahead}d)")
     
     try:
         response = requests.get(url, params=params, timeout=30)
         
         if response.status_code == 200:
             events = response.json()
-            debug(CALENDAR_TASK, f"API returned {len(events)} events")
+            with_actuals = sum(1 for e in events if e.get("actual") is not None)
+            debug(CALENDAR_TASK, f"API returned {len(events)} events ({with_actuals} with actuals)")
             return events, None
         else:
             return [], f"API returned status {response.status_code}: {response.text[:200]}"
@@ -1099,13 +1106,13 @@ def fetch_eodhd_calendar(days_ahead: int = 7) -> Tuple[List[Dict], Optional[str]
 
 
 def store_calendar_events(events: List[Dict]) -> Tuple[int, int, List[str]]:
-    """Store calendar events with detailed error tracking.
-    Returns (stored_count, skipped_count, errors)."""
+    """Store calendar events with UPSERT logic to update actuals.
+    Returns (stored_count, updated_count, errors)."""
     if not events:
         return 0, 0, []
     
     stored = 0
-    skipped = 0
+    updated = 0
     errors = []
     
     # Parse all events first
@@ -1146,8 +1153,8 @@ def store_calendar_events(events: List[Dict]) -> Tuple[int, int, List[str]]:
     if not dates:
         return 0, 0, errors
     
-    # Batch fetch existing events
-    existing_keys = set()
+    # Batch fetch existing events (include id and actual for update logic)
+    existing_events = {}  # key -> row data
     try:
         min_date = min(dates)
         max_date = max(dates)
@@ -1155,29 +1162,40 @@ def store_calendar_events(events: List[Dict]) -> Tuple[int, int, List[str]]:
         debug(CALENDAR_TASK, f"Checking existing events from {min_date} to {max_date}")
         
         result = sb.table("Economic_calander").select(
-            "date,time,country,event"
+            "id,date,time,country,event,actual"
         ).gte("date", min_date).lte("date", max_date).execute()
         
         for row in result.data:
             key = (row.get("date"), row.get("time"), row.get("country"), row.get("event"))
-            existing_keys.add(key)
+            existing_events[key] = row
         
-        debug(CALENDAR_TASK, f"Found {len(existing_keys)} existing events")
+        debug(CALENDAR_TASK, f"Found {len(existing_events)} existing events")
         
     except Exception as e:
         errors.append(f"Lookup failed: {e}")
         debug(CALENDAR_TASK, f"Existing events lookup failed, will try insert anyway: {e}")
     
-    # Filter to only new events
+    # Separate into: new events and events needing update
     new_events = []
+    updates = []
+    
     for evt in parsed_events:
         key = (evt["date"], evt["time"], evt["country"], evt["event"])
-        if key in existing_keys:
-            skipped += 1
+        
+        if key in existing_events:
+            existing = existing_events[key]
+            # Check if we have a new actual value to update
+            if evt["actual"] is not None and existing.get("actual") is None:
+                updates.append({
+                    "id": existing["id"],
+                    "actual": evt["actual"],
+                    "previous": evt["previous"],
+                    "consensus": evt["consensus"],
+                })
         else:
             new_events.append(evt)
     
-    debug(CALENDAR_TASK, f"New events to insert: {len(new_events)}, skipping {skipped} duplicates")
+    debug(CALENDAR_TASK, f"New events: {len(new_events)}, Updates needed: {len(updates)}")
     
     # Batch insert new events
     if new_events:
@@ -1198,11 +1216,27 @@ def store_calendar_events(events: List[Dict]) -> Tuple[int, int, List[str]]:
                         sb.table("Economic_calander").insert(evt).execute()
                         stored += 1
                     except Exception as e2:
-                        skipped += 1
-                        if len(errors) < 10:  # Limit error messages
+                        if len(errors) < 10:
                             errors.append(f"Individual insert failed: {str(e2)[:50]}")
     
-    return stored, skipped, errors
+    # Update existing events with new actuals
+    if updates:
+        for upd in updates:
+            try:
+                sb.table("Economic_calander").update({
+                    "actual": upd["actual"],
+                    "previous": upd["previous"],
+                    "consensus": upd["consensus"],
+                }).eq("id", upd["id"]).execute()
+                updated += 1
+            except Exception as e:
+                if len(errors) < 10:
+                    errors.append(f"Update failed: {str(e)[:50]}")
+        
+        if updated > 0:
+            info(CALENDAR_TASK, f"Updated {updated} events with actuals")
+    
+    return stored, updated, errors
 
 
 async def economic_calendar_task():
@@ -1221,10 +1255,10 @@ async def economic_calendar_task():
                 warning(CALENDAR_TASK, f"Fetch failed: {fetch_error}")
                 task_metrics.record_error(fetch_error)
             elif events:
-                stored, skipped, errors = store_calendar_events(events)
+                stored, updated, errors = store_calendar_events(events)
                 high_impact = sum(1 for e in events if classify_calendar_impact(e.get("type", "")) == "High")
                 
-                info(CALENDAR_TASK, f"Results: {len(events)} fetched, {stored} stored, {skipped} skipped, {high_impact} high-impact")
+                info(CALENDAR_TASK, f"Results: {len(events)} fetched, {stored} stored, {updated} updated, {high_impact} high-impact")
                 
                 if errors:
                     for err in errors[:5]:  # Log first 5 errors
@@ -1236,7 +1270,7 @@ async def economic_calendar_task():
                 task_metrics.custom_metrics.update({
                     "last_fetch_count": len(events),
                     "last_stored_count": stored,
-                    "last_skipped_count": skipped,
+                    "last_updated_count": updated,
                     "last_error_count": len(errors),
                 })
             else:
@@ -5255,6 +5289,329 @@ async def stock_data_sync_task():
 
 
 # ============================================================================
+#                    TASK 13: STOCK FUNDAMENTALS PRICE UPDATE
+# ============================================================================
+# Updates stock_fundamentals table with current prices twice daily:
+# - Pre-market: 13:30 UTC (8:30 AM EST)
+# - Post-market: 21:30 UTC (4:30 PM EST)
+# ============================================================================
+
+FUNDAMENTALS_TASK = "FUNDAMENTALS"
+
+# Schedule times (UTC hours)
+FUNDAMENTALS_PRE_MARKET_HOUR = 13   # 8:30 AM EST
+FUNDAMENTALS_PRE_MARKET_MINUTE = 30
+FUNDAMENTALS_POST_MARKET_HOUR = 21  # 4:30 PM EST  
+FUNDAMENTALS_POST_MARKET_MINUTE = 30
+
+# All 100 stocks to update
+FUNDAMENTALS_STOCKS = US_STOCKS  # Uses the existing US_STOCKS list
+
+
+def fundamentals_should_update() -> str:
+    """Check if it's time to update fundamentals prices.
+    Returns 'pre_market', 'post_market', or None."""
+    now = datetime.now(timezone.utc)
+    
+    # Pre-market window: 13:30-13:45 UTC
+    if now.hour == FUNDAMENTALS_PRE_MARKET_HOUR and FUNDAMENTALS_PRE_MARKET_MINUTE <= now.minute < FUNDAMENTALS_PRE_MARKET_MINUTE + 15:
+        return "pre_market"
+    
+    # Post-market window: 21:30-21:45 UTC
+    if now.hour == FUNDAMENTALS_POST_MARKET_HOUR and FUNDAMENTALS_POST_MARKET_MINUTE <= now.minute < FUNDAMENTALS_POST_MARKET_MINUTE + 15:
+        return "post_market"
+    
+    return None
+
+
+def fetch_real_time_price(symbol: str) -> Optional[Dict]:
+    """Fetch real-time price from EODHD API."""
+    url = f"https://eodhd.com/api/real-time/{symbol}.US"
+    params = {
+        "api_token": EODHD_API_KEY,
+        "fmt": "json"
+    }
+    
+    try:
+        response = requests.get(url, params=params, timeout=15)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            debug(FUNDAMENTALS_TASK, f"API error for {symbol}: {response.status_code}")
+            return None
+    except Exception as e:
+        debug(FUNDAMENTALS_TASK, f"Request failed for {symbol}: {e}")
+        return None
+
+
+def update_fundamentals_prices() -> Tuple[int, int]:
+    """Update all stock fundamentals with current prices.
+    Returns (updated_count, error_count)."""
+    
+    updated = 0
+    errors = 0
+    
+    info(FUNDAMENTALS_TASK, f"Updating prices for {len(FUNDAMENTALS_STOCKS)} stocks...")
+    
+    for i, symbol in enumerate(FUNDAMENTALS_STOCKS):
+        try:
+            # Rate limiting: ~3 requests per second
+            if i > 0 and i % 10 == 0:
+                time.sleep(0.5)
+                debug(FUNDAMENTALS_TASK, f"Progress: {i}/{len(FUNDAMENTALS_STOCKS)}")
+            
+            # Fetch real-time price
+            data = fetch_real_time_price(symbol)
+            
+            if not data:
+                errors += 1
+                continue
+            
+            # Extract price data
+            current_price = data.get("close")
+            previous_close = data.get("previousClose")
+            change_amount = data.get("change")
+            change_percent = data.get("change_p")
+            day_high = data.get("high")
+            day_low = data.get("low")
+            volume = data.get("volume")
+            
+            if current_price is None:
+                debug(FUNDAMENTALS_TASK, f"No price data for {symbol}")
+                errors += 1
+                continue
+            
+            # Update database
+            update_data = {
+                "current_price": str(current_price) if current_price else None,
+                "previous_close": str(previous_close) if previous_close else None,
+                "change_amount": str(change_amount) if change_amount else None,
+                "change_percent": str(change_percent) if change_percent else None,
+                "day_high": day_high,
+                "day_low": day_low,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            
+            # Upsert to stock_fundamentals
+            sb.table("stock_fundamentals").update(update_data).eq("symbol", symbol).execute()
+            updated += 1
+            
+        except Exception as e:
+            debug(FUNDAMENTALS_TASK, f"Error updating {symbol}: {e}")
+            errors += 1
+    
+    return updated, errors
+
+
+def clean_eodhd_value(val):
+    """Clean EODHD API values - convert NA/empty to None."""
+    if val is None:
+        return None
+    if isinstance(val, str):
+        if val.upper() in ["NA", "N/A", "NAN", "NONE", ""]:
+            return None
+        return val
+    # Check for NaN float
+    try:
+        import math
+        if isinstance(val, float) and math.isnan(val):
+            return None
+    except:
+        pass
+    return str(val) if val is not None else None
+
+
+def clean_eodhd_numeric(val):
+    """Clean EODHD numeric values - convert NA/invalid to None."""
+    if val is None:
+        return None
+    if isinstance(val, str):
+        if val.upper() in ["NA", "N/A", "NAN", "NONE", ""]:
+            return None
+        try:
+            return float(val)
+        except:
+            return None
+    try:
+        import math
+        if isinstance(val, float) and math.isnan(val):
+            return None
+    except:
+        pass
+    return val
+
+
+def ensure_all_stocks_exist():
+    """Ensure all 100 stocks exist in stock_fundamentals table.
+    Creates placeholder records for missing stocks."""
+    
+    info(FUNDAMENTALS_TASK, "Checking for missing stocks in stock_fundamentals...")
+    
+    try:
+        # Get existing symbols
+        result = sb.table("stock_fundamentals").select("symbol").execute()
+        existing = set(row["symbol"] for row in result.data)
+        
+        # Find missing
+        missing = [s for s in FUNDAMENTALS_STOCKS if s not in existing]
+        
+        if not missing:
+            debug(FUNDAMENTALS_TASK, "All stocks already exist")
+            return 0
+        
+        info(FUNDAMENTALS_TASK, f"Adding {len(missing)} missing stocks...")
+        
+        # Insert missing stocks with basic info
+        for symbol in missing:
+            try:
+                # Fetch fundamentals from EODHD
+                url = f"https://eodhd.com/api/fundamentals/{symbol}.US"
+                params = {"api_token": EODHD_API_KEY, "fmt": "json"}
+                
+                response = requests.get(url, params=params, timeout=30)
+                if response.status_code != 200:
+                    # Insert minimal record
+                    sb.table("stock_fundamentals").insert({
+                        "symbol": symbol,
+                        "name": symbol,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }).execute()
+                    continue
+                
+                data = response.json()
+                general = data.get("General", {})
+                highlights = data.get("Highlights", {})
+                valuation = data.get("Valuation", {})
+                shares = data.get("SharesStats", {})
+                analyst = data.get("AnalystRatings", {})
+                technicals = data.get("Technicals", {})
+                
+                record = {
+                    "symbol": symbol,
+                    "name": general.get("Name", symbol),
+                    "exchange": general.get("Exchange"),
+                    "currency": general.get("CurrencyCode", "USD"),
+                    "sector": general.get("Sector"),
+                    "industry": general.get("Industry"),
+                    "description": (general.get("Description") or "")[:1000],
+                    "website": general.get("WebURL"),
+                    "logo_url": general.get("LogoURL"),
+                    "country": general.get("CountryName"),
+                    "employees": clean_eodhd_numeric(general.get("FullTimeEmployees")),
+                    "market_cap": clean_eodhd_numeric(highlights.get("MarketCapitalization")),
+                    "enterprise_value": clean_eodhd_numeric(valuation.get("EnterpriseValue")),
+                    "pe_ratio": clean_eodhd_value(highlights.get("PERatio")),
+                    "forward_pe": clean_eodhd_value(valuation.get("ForwardPE")),
+                    "peg_ratio": clean_eodhd_value(highlights.get("PEGRatio")),
+                    "price_to_sales": clean_eodhd_value(valuation.get("PriceSalesTTM")),
+                    "price_to_book": clean_eodhd_value(valuation.get("PriceBookMRQ")),
+                    "ev_to_revenue": clean_eodhd_value(valuation.get("EnterpriseValueRevenue")),
+                    "ev_to_ebitda": clean_eodhd_value(valuation.get("EnterpriseValueEbitda")),
+                    "profit_margin": clean_eodhd_numeric(highlights.get("ProfitMargin")),
+                    "operating_margin": clean_eodhd_numeric(highlights.get("OperatingMarginTTM")),
+                    "return_on_equity": clean_eodhd_numeric(highlights.get("ReturnOnEquityTTM")),
+                    "return_on_assets": clean_eodhd_numeric(highlights.get("ReturnOnAssetsTTM")),
+                    "revenue_ttm": clean_eodhd_numeric(highlights.get("RevenueTTM")),
+                    "revenue_per_share": clean_eodhd_numeric(highlights.get("RevenuePerShareTTM")),
+                    "gross_profit_ttm": clean_eodhd_numeric(highlights.get("GrossProfitTTM")),
+                    "ebitda": clean_eodhd_numeric(highlights.get("EBITDA")),
+                    "eps_ttm": clean_eodhd_value(highlights.get("EarningsShare")),
+                    "eps_estimate_current_year": clean_eodhd_value(highlights.get("EPSEstimateCurrentYear")),
+                    "eps_estimate_next_year": clean_eodhd_value(highlights.get("EPSEstimateNextYear")),
+                    "dividend_per_share": clean_eodhd_value(highlights.get("DividendShare")),
+                    "dividend_yield": clean_eodhd_value(highlights.get("DividendYield")),
+                    "shares_outstanding": clean_eodhd_numeric(shares.get("SharesOutstanding")),
+                    "shares_float": clean_eodhd_numeric(shares.get("SharesFloat")),
+                    "percent_insiders": clean_eodhd_value(shares.get("PercentInsiders")),
+                    "percent_institutions": clean_eodhd_value(shares.get("PercentInstitutions")),
+                    "short_percent_float": clean_eodhd_value(shares.get("ShortPercentFloat")),
+                    "beta": clean_eodhd_value(technicals.get("Beta")),
+                    "week_52_high": clean_eodhd_value(technicals.get("52WeekHigh")),
+                    "week_52_low": clean_eodhd_value(technicals.get("52WeekLow")),
+                    "day_50_ma": clean_eodhd_value(technicals.get("50DayMA")),
+                    "day_200_ma": clean_eodhd_value(technicals.get("200DayMA")),
+                    "analyst_rating": clean_eodhd_value(analyst.get("Rating")),
+                    "analyst_target_price": clean_eodhd_value(analyst.get("TargetPrice")),
+                    "analyst_strong_buy": clean_eodhd_numeric(analyst.get("StrongBuy")),
+                    "analyst_buy": clean_eodhd_numeric(analyst.get("Buy")),
+                    "analyst_hold": clean_eodhd_numeric(analyst.get("Hold")),
+                    "analyst_sell": clean_eodhd_numeric(analyst.get("Sell")),
+                    "analyst_strong_sell": clean_eodhd_numeric(analyst.get("StrongSell")),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "data_source": "eodhd",
+                }
+                
+                sb.table("stock_fundamentals").insert(record).execute()
+                debug(FUNDAMENTALS_TASK, f"Added {symbol}")
+                
+                # Rate limit
+                time.sleep(0.3)
+                
+            except Exception as e:
+                debug(FUNDAMENTALS_TASK, f"Error adding {symbol}: {e}")
+        
+        return len(missing)
+        
+    except Exception as e:
+        warning(FUNDAMENTALS_TASK, f"Error checking stocks: {e}")
+        return 0
+
+
+async def stock_fundamentals_price_task():
+    """Task 13: Update stock fundamentals prices twice daily."""
+    task_metrics = metrics.get_or_create(FUNDAMENTALS_TASK)
+    
+    info(FUNDAMENTALS_TASK, f"Stock fundamentals price task started ({len(FUNDAMENTALS_STOCKS)} stocks)")
+    info(FUNDAMENTALS_TASK, f"  Pre-market update: {FUNDAMENTALS_PRE_MARKET_HOUR}:{FUNDAMENTALS_PRE_MARKET_MINUTE:02d} UTC")
+    info(FUNDAMENTALS_TASK, f"  Post-market update: {FUNDAMENTALS_POST_MARKET_HOUR}:{FUNDAMENTALS_POST_MARKET_MINUTE:02d} UTC")
+    
+    # Ensure all stocks exist on startup
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, ensure_all_stocks_exist)
+    
+    last_update = None
+    
+    while not tick_streamer._shutdown.is_set():
+        try:
+            now = datetime.now(timezone.utc)
+            
+            # Check if it's time to update
+            update_type = fundamentals_should_update()
+            
+            if update_type:
+                # Avoid duplicate updates within same window
+                if last_update is None or (now - last_update).total_seconds() > 900:  # 15 min cooldown
+                    info(FUNDAMENTALS_TASK, f"Running {update_type} price update...")
+                    
+                    updated, errors = await loop.run_in_executor(None, update_fundamentals_prices)
+                    
+                    info(FUNDAMENTALS_TASK, f"Price update complete: {updated} updated, {errors} errors")
+                    
+                    task_metrics.record_success()
+                    task_metrics.custom_metrics.update({
+                        "last_update": now.isoformat(),
+                        "last_update_type": update_type,
+                        "last_updated_count": updated,
+                        "last_error_count": errors,
+                    })
+                    
+                    last_update = now
+            
+            # Check every 5 minutes
+            await asyncio.sleep(300)
+            
+        except Exception as e:
+            error(FUNDAMENTALS_TASK, f"Task error: {e}", exc_info=DEBUG_MODE)
+            task_metrics.record_error(str(e))
+            await asyncio.sleep(60)
+
+
+# ============================================================================
+#                    END OF TASK 13: STOCK FUNDAMENTALS PRICE UPDATE
+# ============================================================================
+
+
+# ============================================================================
 #                              MAIN ENTRY POINT
 # ============================================================================
 
@@ -5296,6 +5653,7 @@ async def main():
         asyncio.create_task(oanda_streaming_task(), name="oanda_stream"),
         asyncio.create_task(bond_yields_streaming_task(), name="bond_4h"),
         asyncio.create_task(stock_data_sync_task(), name="stock_data"),  # NEW: Stock financial data sync
+        asyncio.create_task(stock_fundamentals_price_task(), name="fundamentals"),  # NEW: Stock fundamentals price updates
     ]
     
     # Periodic metrics logging
