@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-LONDON STRATEGIC EDGE - BULLETPROOF WORKER v9.0 (DEBUG EDITION)
+LONDON STRATEGIC EDGE - BULLETPROOF WORKER v9.1 (DEBUG EDITION)
 ================================================================================
 Production-grade data pipeline with comprehensive debugging and diagnostics.
 
@@ -26,6 +26,7 @@ TASKS:
   8. News Articles      - Multi-source news scraper with filtering
   9. OANDA Streaming    - Commodities & indices real-time (24 instruments)
   10. Bond Yields 4H    - Government bonds via OANDA streaming (6 bonds)
+  11. Stock Data Sync   - EODHD financial data (earnings, dividends, insider trades)
 
 ================================================================================
 """
@@ -2984,6 +2985,34 @@ NEWS_ARTICLES_TASK = "NEWS_ARTICLES"
 
 # News sources configuration
 NEWS_SOURCES_CONFIG = {
+    "reuters": {
+        "name": "Reuters",
+        "logo": "https://www.reuters.com/pf/resources/images/reuters/reuters-default.png",
+        "color": "#FF8000",
+        "rss_feeds": [
+            "https://www.reutersagency.com/feed/?best-topics=business-finance&post_type=best",
+        ],
+        "categories": ["markets", "economy", "breaking"],
+    },
+    "wsj": {
+        "name": "Wall Street Journal",
+        "logo": "https://s.wsj.net/img/meta/wsj-social-share.png",
+        "color": "#0274B6",
+        "rss_feeds": [
+            "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
+            "https://feeds.a.dj.com/rss/WSJcomUSBusiness.xml",
+        ],
+        "categories": ["markets", "business", "economy"],
+    },
+    "bloomberg": {
+        "name": "Bloomberg",
+        "logo": "https://assets.bwbx.io/s3/javelin/public/hub/images/social-default-a4f15fa7ee.jpg",
+        "color": "#2800D7",
+        "rss_feeds": [
+            "https://feeds.bloomberg.com/markets/news.rss",
+        ],
+        "categories": ["markets", "economy", "stocks"],
+    },
     "yahoo_finance": {
         "name": "Yahoo Finance",
         "logo": "https://s.yimg.com/cv/apiv2/default/20190501/yahoo_finance_en-US_2x.png",
@@ -3008,18 +3037,8 @@ NEWS_SOURCES_CONFIG = {
         "rss_feeds": ["https://www.coindesk.com/arc/outboundfeeds/rss/"],
         "categories": ["crypto", "bitcoin", "ethereum"],
     },
-  "thestreet": {
-    "name": "TheStreet",
-    "logo": "https://www.thestreet.com/favicon.ico",
-    "color": "#0033A0",
-    "rss_feeds": [
-        "https://www.thestreet.com/.rss/full",
-        "https://www.thestreet.com/markets/.rss/full"
-    ],
-    "categories": ["markets", "stocks"],
-},
-
-  "ft": {
+    # TheStreet REMOVED - too much clickbait content
+    "ft": {
     "name": "Financial Times",
     "logo": "https://upload.wikimedia.org/wikipedia/commons/5/5a/Financial_Times_logo_%282019%29.svg",
     "color": "#FFE6D5",
@@ -3043,15 +3062,47 @@ NEWS_SOURCES_CONFIG = {
 
 # Content filtering - reject these
 NEWS_REJECT_KEYWORDS = [
+    # Geopolitical/Holiday noise
     "palestinian", "bethlehem", "gaza", "israel conflict", "christmas",
     "holiday gift", "thanksgiving", "family gathering",
+    "how to talk to your family", "gift guide",
+    
+    # Legal spam
     "investor news: if you have suffered", "class action", "lawsuit alert",
     "securities fraud", "investor alert", "legal action",
-    "how to talk to your family", "gift guide",
+    
+    # Crypto spam
     "shibarium", "shib explorer", "meme coin", "pump and dump",
     "airdrop alert", "free tokens", "moonshot",
+    
+    # Sponsored/PR content
     "geekstake", "sponsored content", "partner content",
     "press release:", "prn newswire", "business wire",
+    
+    # Clickbait patterns
+    "you won't believe", "shocking", "this dangerous", "at risk from this",
+    "perfect gift", "bestselling", "limited time", "deal alert",
+    "millionaires are buying", "get rich", "passive income",
+    "one stock to buy", "this stock could", "history says",
+    "will soar", "going to explode", "next big thing",
+    "don't miss", "before it's too late", "secret",
+    "wall street doesn't want you", "they don't want you to know",
+    "guaranteed returns", "100% returns", "double your money",
+    
+    # Lifestyle/Non-financial
+    "birthstone", "necklace", "jewelry", "fashion week",
+    "horoscope", "zodiac", "astrology",
+    "recipe", "cooking tips", "diet plan", "weight loss",
+    "drivers at risk", "homeowners at risk", "retirees at risk",
+    "simple trick", "weird trick", "doctors hate",
+    "celebrity", "kardashian", "royal family", "meghan markle",
+    "quiz:", "poll:", "vote:",
+    
+    # Listicle/Opinion patterns  
+    "top 10", "top 5", "5 reasons", "7 ways", "3 stocks", "10 best",
+    "should you buy", "is it time to buy", "time to sell",
+    "my favorite stock", "i'm buying", "i'm selling",
+    "here's why i", "why i think", "in my opinion",
 ]
 
 # Priority keywords - boost these
@@ -3081,26 +3132,68 @@ def news_should_reject(title: str, summary: str) -> bool:
 
 
 def news_calculate_priority(title: str, summary: str, symbols: List[str]) -> int:
-    """Calculate priority score (0-100)."""
+    """Calculate priority score (0-100). Higher = more important factual news."""
     text = f"{title} {summary}".lower()
+    title_lower = title.lower()
     score = 50
     
+    # BOOST: Factual keywords
     for keyword in NEWS_PRIORITY_KEYWORDS:
         if keyword.lower() in text:
             score += 5
     
+    # BOOST: Has stock symbols mentioned
     score += len(symbols) * 3
     
-    if any(x in title.lower() for x in ["breaking", "just in", "alert"]):
+    # BOOST: Breaking/Alert news
+    if any(x in title_lower for x in ["breaking", "just in", "alert", "confirms", "announces"]):
         score += 15
-    if any(x in text for x in ["earnings", "quarterly", "revenue beat"]):
+    
+    # BOOST: Earnings/Financial results (factual)
+    if any(x in text for x in ["earnings", "quarterly", "revenue beat", "reports q", "fiscal year"]):
+        score += 12
+    
+    # BOOST: Central bank/Economic data (factual)
+    if any(x in text for x in ["federal reserve", "fed ", "rate decision", "fomc", "ecb ", "boe "]):
+        score += 12
+    if any(x in text for x in ["cpi ", "inflation data", "jobs report", "nonfarm", "gdp growth"]):
         score += 10
-    if any(x in text for x in ["federal reserve", "fed ", "rate decision"]):
+    
+    # BOOST: Regulatory/Official actions
+    if any(x in text for x in ["sec ", "regulatory", "approved", "rejected", "investigation"]):
+        score += 8
+    
+    # BOOST: Corporate actions (factual)
+    if any(x in text for x in ["acquisition", "merger", "buyout", "deal worth", "agrees to"]):
         score += 10
-    if any(x in title.lower() for x in ["my favorite", "could", "should you"]):
+    if any(x in text for x in ["ipo price", "goes public", "files for ipo"]):
+        score += 8
+    
+    # PENALIZE: Opinion/Prediction patterns
+    if any(x in title_lower for x in ["my favorite", "could ", "should you", "i think", "i believe"]):
+        score -= 20
+    if any(x in title_lower for x in ["top 10", "5 stocks", "3 reasons", "best stocks", "worst stocks"]):
+        score -= 20
+    if any(x in title_lower for x in ["will soar", "going to", "predicted to", "expected to rally"]):
+        score -= 15
+    if any(x in title_lower for x in ["opinion:", "analysis:", "why i", "my take", "my view"]):
+        score -= 20
+    if any(x in title_lower for x in ["history says", "according to history", "historically"]):
+        score -= 15
+    if any(x in title_lower for x in ["this is why", "here's why", "here is why", "the reason"]):
         score -= 10
-    if any(x in title.lower() for x in ["top 10", "5 stocks", "3 reasons"]):
-        score -= 5
+    
+    # PENALIZE: Question headlines (often clickbait)
+    if "?" in title and len(title) < 70:
+        score -= 12
+    
+    # PENALIZE: Vague/Sensational language
+    if any(x in title_lower for x in ["this stock", "one stock", "the stock"]) and not any(s in title for s in symbols):
+        score -= 15
+    if any(x in title_lower for x in ["you need to know", "what you should", "don't miss"]):
+        score -= 15
+    if any(x in title_lower for x in ["can ", "may ", "might "]) and "?" not in title:
+        score -= 8
     
     return min(100, max(0, score))
 
@@ -3189,7 +3282,7 @@ def scrape_news_source(source_id: str, source_config: dict) -> List[Dict]:
                 symbols = news_detect_symbols(f"{title} {summary}")
                 priority = news_calculate_priority(title, summary, symbols)
                 
-                if priority < 30:
+                if priority < 45:  # Raised from 30 - stricter quality filter
                     continue
                 
                 article = {
@@ -4425,6 +4518,699 @@ def run_startup_gap_fill():
     log.info("=" * 70)
     log.info("")
 
+# ============================================================================
+#                    TASK 12: STOCK FINANCIAL DATA SYNC
+# ============================================================================
+# Syncs financial data for tracked stocks from EODHD API:
+#   - Earnings calendar (daily)
+#   - Dividends (daily)
+#   - Insider trades (daily)
+#   - Financial statements (daily - catches quarterly releases)
+#   - Stock news with sentiment (every 6 hours)
+#
+# UPDATE SCHEDULE (UTC):
+#   - Full sync: Daily at 06:00 UTC (before London open)
+#   - News refresh: Every 6 hours (06:00, 12:00, 18:00, 00:00)
+#   - Weekend: News only at 12:00 UTC
+#
+# Stocks: AAPL, NVDA, MSFT, AMZN, GOOGL (expandable)
+# ============================================================================
+
+STOCK_DATA_TASK = "STOCK_DATA"
+
+# Stocks to track - add more here as needed
+TRACKED_STOCKS = ["AAPL", "NVDA", "MSFT", "AMZN", "GOOGL"]
+
+# Sync schedule (UTC hours)
+STOCK_DATA_FULL_SYNC_HOUR = 6  # 6 AM UTC - before London opens
+STOCK_DATA_NEWS_HOURS = [0, 6, 12, 18]  # News refresh times
+
+# How far back to look for new data
+STOCK_DATA_LOOKBACK_DAYS = 30  # For insider trades, news
+STOCK_DATA_EARNINGS_DAYS_AHEAD = 90  # Future earnings dates
+
+
+def stock_data_fetch_eodhd(endpoint: str, params: Dict = None) -> Optional[any]:
+    """Generic EODHD API fetcher for stock data."""
+    if params is None:
+        params = {}
+    params["api_token"] = EODHD_API_KEY
+    params["fmt"] = "json"
+    
+    url = f"https://eodhd.com/api/{endpoint}"
+    
+    try:
+        response = requests.get(url, params=params, timeout=60)
+        if response.status_code == 200:
+            return response.json()
+        elif response.status_code == 404:
+            return None
+        else:
+            debug(STOCK_DATA_TASK, f"API error {response.status_code}: {response.text[:100]}")
+            return None
+    except Exception as e:
+        debug(STOCK_DATA_TASK, f"API request failed: {e}")
+        return None
+
+
+def stock_data_safe_float(value, default=None):
+    """Safely convert to float."""
+    if value is None or value == "" or value == "None":
+        return default
+    try:
+        return float(value)
+    except:
+        return default
+
+
+def stock_data_safe_int(value, default=None):
+    """Safely convert to int."""
+    if value is None or value == "" or value == "None":
+        return default
+    try:
+        return int(float(value))
+    except:
+        return default
+
+
+# -----------------------------------------------------------------------------
+# EARNINGS CALENDAR SYNC
+# -----------------------------------------------------------------------------
+
+def stock_data_sync_earnings() -> Tuple[int, int]:
+    """Sync earnings calendar for tracked stocks."""
+    debug(STOCK_DATA_TASK, "Syncing earnings calendar...")
+    
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    future = (datetime.now(timezone.utc) + timedelta(days=STOCK_DATA_EARNINGS_DAYS_AHEAD)).strftime("%Y-%m-%d")
+    past = (datetime.now(timezone.utc) - timedelta(days=365)).strftime("%Y-%m-%d")
+    
+    symbols_str = ",".join([f"{s}.US" for s in TRACKED_STOCKS])
+    
+    data = stock_data_fetch_eodhd("calendar/earnings", {
+        "symbols": symbols_str,
+        "from": past,
+        "to": future
+    })
+    
+    if not data or "earnings" not in data:
+        return 0, 0
+    
+    inserted = 0
+    errors = 0
+    
+    for e in data.get("earnings", []):
+        try:
+            report_date = e.get("report_date")
+            if not report_date:
+                continue
+            
+            code = e.get("code") or ""
+            symbol = code.replace(".US", "")
+            fiscal_date = e.get("date") or ""
+            
+            # Determine quarter
+            quarter = "Q?"
+            year = 0
+            if fiscal_date:
+                try:
+                    dt = datetime.strptime(fiscal_date, "%Y-%m-%d")
+                    quarter = f"Q{(dt.month - 1) // 3 + 1}"
+                    year = dt.year
+                except:
+                    pass
+            
+            eps_est = stock_data_safe_float(e.get("estimate"))
+            eps_act = stock_data_safe_float(e.get("actual"))
+            
+            eps_surprise = None
+            eps_surprise_pct = None
+            if eps_est is not None and eps_act is not None:
+                eps_surprise = round(eps_act - eps_est, 4)
+                if eps_est != 0:
+                    eps_surprise_pct = round((eps_surprise / abs(eps_est)) * 100, 2)
+            
+            is_upcoming = report_date >= today
+            
+            # Build title
+            if eps_act is not None and eps_est is not None:
+                result = "BEAT" if eps_act > eps_est else "MISS" if eps_act < eps_est else "MET"
+                title = f"{symbol} {quarter} {year} Earnings: {result} (${eps_act:.2f} vs ${eps_est:.2f} est)"
+            elif eps_est is not None:
+                title = f"{symbol} {quarter} {year} Earnings Report (Est: ${eps_est:.2f})"
+            else:
+                title = f"{symbol} {quarter} {year} Earnings Report"
+            
+            record = {
+                "symbol": symbol,
+                "event_date": report_date,
+                "event_type": "earnings",
+                "event_time": e.get("before_after_market") or None,
+                "is_upcoming": is_upcoming,
+                "fiscal_quarter": quarter,
+                "fiscal_year": year,
+                "eps_estimate": eps_est,
+                "eps_actual": eps_act,
+                "eps_surprise": eps_surprise,
+                "eps_surprise_pct": eps_surprise_pct,
+                "insider_name": "",
+                "shares_traded": 0,
+                "title": title[:300],
+                "description": f"Fiscal period ending {fiscal_date}" if fiscal_date else None,
+                "impact_level": "high",
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }
+            
+            sb.table("financial_calendar").upsert(
+                record, 
+                on_conflict="symbol,event_date,event_type,insider_name,shares_traded"
+            ).execute()
+            inserted += 1
+            
+        except Exception as e:
+            errors += 1
+            if errors <= 3:
+                debug(STOCK_DATA_TASK, f"Earnings insert error: {e}")
+    
+    return inserted, errors
+
+
+# -----------------------------------------------------------------------------
+# DIVIDENDS SYNC
+# -----------------------------------------------------------------------------
+
+def stock_data_sync_dividends() -> Tuple[int, int]:
+    """Sync dividend data for tracked stocks."""
+    debug(STOCK_DATA_TASK, "Syncing dividends...")
+    
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    past = (datetime.now(timezone.utc) - timedelta(days=365)).strftime("%Y-%m-%d")
+    
+    inserted = 0
+    errors = 0
+    
+    for symbol in TRACKED_STOCKS:
+        try:
+            data = stock_data_fetch_eodhd(f"div/{symbol}.US", {"from": past})
+            
+            if not data:
+                continue
+            
+            for d in data:
+                try:
+                    ex_date = d.get("date")
+                    if not ex_date:
+                        continue
+                    
+                    amount = stock_data_safe_float(d.get("value"), 0)
+                    payment_date = d.get("paymentDate")
+                    is_upcoming = ex_date >= today
+                    
+                    # Insert into dividends table
+                    div_record = {
+                        "symbol": symbol,
+                        "dividend_amount": amount,
+                        "currency": d.get("currency") or "USD",
+                        "declaration_date": d.get("declarationDate"),
+                        "ex_dividend_date": ex_date,
+                        "record_date": d.get("recordDate"),
+                        "payment_date": payment_date,
+                        "dividend_type": "Regular",
+                    }
+                    
+                    sb.table("dividends").upsert(
+                        div_record,
+                        on_conflict="symbol,ex_dividend_date,dividend_amount"
+                    ).execute()
+                    
+                    # Also insert into financial_calendar
+                    title = f"{symbol} Ex-Dividend ${amount:.4f}"
+                    if payment_date:
+                        title += f" (Payment: {payment_date})"
+                    
+                    cal_record = {
+                        "symbol": symbol,
+                        "event_date": ex_date,
+                        "event_type": "dividend_ex",
+                        "event_time": "Market Open",
+                        "is_upcoming": is_upcoming,
+                        "dividend_amount": amount,
+                        "payment_date": payment_date,
+                        "insider_name": "",
+                        "shares_traded": 0,
+                        "title": title[:300],
+                        "description": f"Must own shares before {ex_date} to receive dividend",
+                        "impact_level": "medium",
+                        "updated_at": datetime.now(timezone.utc).isoformat()
+                    }
+                    
+                    sb.table("financial_calendar").upsert(
+                        cal_record,
+                        on_conflict="symbol,event_date,event_type,insider_name,shares_traded"
+                    ).execute()
+                    
+                    inserted += 1
+                    
+                except Exception as e:
+                    errors += 1
+            
+            time.sleep(0.2)  # Rate limiting
+            
+        except Exception as e:
+            errors += 1
+            debug(STOCK_DATA_TASK, f"Dividend sync error for {symbol}: {e}")
+    
+    return inserted, errors
+
+
+# -----------------------------------------------------------------------------
+# INSIDER TRADES SYNC
+# -----------------------------------------------------------------------------
+
+def stock_data_sync_insider_trades() -> Tuple[int, int]:
+    """Sync insider trades for tracked stocks."""
+    debug(STOCK_DATA_TASK, "Syncing insider trades...")
+    
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=STOCK_DATA_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+    
+    type_map = {
+        "P": ("Purchase", "insider_buy"),
+        "S": ("Sale", "insider_sell"),
+        "A": ("Award", "insider_award"),
+        "M": ("Exercise", "insider_exercise"),
+        "G": ("Gift", "insider_gift"),
+        "D": ("Disposed", "insider_disposed")
+    }
+    
+    inserted = 0
+    errors = 0
+    
+    for symbol in TRACKED_STOCKS:
+        try:
+            data = stock_data_fetch_eodhd("insider-transactions", {
+                "code": f"{symbol}.US",
+                "from": cutoff,
+                "limit": 100
+            })
+            
+            if not data:
+                continue
+            
+            for t in data:
+                try:
+                    trans_date = t.get("transactionDate")
+                    if not trans_date:
+                        continue
+                    
+                    code = t.get("transactionCode") or ""
+                    trans_type, event_type = type_map.get(code, (code, "insider_other"))
+                    
+                    shares = stock_data_safe_int(t.get("transactionAmount"))
+                    price = stock_data_safe_float(t.get("transactionPrice"))
+                    total_value = round(shares * price, 2) if shares and price else None
+                    
+                    insider_name = t.get("ownerName") or "Unknown"
+                    insider_title = t.get("ownerTitle") or ""
+                    
+                    # Insert into insider_trades table
+                    trade_record = {
+                        "symbol": symbol,
+                        "insider_name": insider_name[:200],
+                        "insider_title": insider_title[:100] if insider_title else None,
+                        "insider_relationship": t.get("ownerRelationship"),
+                        "transaction_type": trans_type,
+                        "transaction_code": code,
+                        "shares_traded": shares,
+                        "price_per_share": price,
+                        "total_value": total_value,
+                        "shares_owned_after": t.get("postTransactionAmount"),
+                        "transaction_date": trans_date,
+                        "filing_date": t.get("reportDate"),
+                        "sec_link": t.get("link"),
+                    }
+                    
+                    sb.table("insider_trades").upsert(
+                        trade_record,
+                        on_conflict="symbol,insider_name,transaction_date,transaction_code,shares_traded"
+                    ).execute()
+                    
+                    inserted += 1
+                    
+                except Exception as e:
+                    errors += 1
+            
+            time.sleep(0.2)  # Rate limiting
+            
+        except Exception as e:
+            errors += 1
+            debug(STOCK_DATA_TASK, f"Insider trades sync error for {symbol}: {e}")
+    
+    return inserted, errors
+
+
+# -----------------------------------------------------------------------------
+# FINANCIAL STATEMENTS SYNC
+# -----------------------------------------------------------------------------
+
+def stock_data_sync_financial_statements() -> Tuple[int, int]:
+    """Sync financial statements for tracked stocks."""
+    debug(STOCK_DATA_TASK, "Syncing financial statements...")
+    
+    # Only fetch last 2 years for daily updates (full history done separately)
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=730)).strftime("%Y-%m-%d")
+    
+    # All fields for financial_statements table
+    all_fields = [
+        "symbol", "statement_type", "period_type", "fiscal_date", "currency",
+        "total_revenue", "cost_of_revenue", "gross_profit", "operating_income",
+        "net_income", "ebitda", "operating_expenses", "research_development",
+        "selling_general_admin", "interest_expense", "income_tax_expense",
+        "net_interest_income", "total_assets", "total_liabilities", "total_equity",
+        "cash_and_equivalents", "short_term_investments", "total_current_assets",
+        "total_current_liabilities", "long_term_debt", "short_term_debt",
+        "total_debt", "retained_earnings", "common_stock", "inventory",
+        "accounts_receivable", "accounts_payable", "operating_cash_flow",
+        "investing_cash_flow", "financing_cash_flow", "free_cash_flow",
+        "capital_expenditures", "dividends_paid", "stock_repurchased",
+        "net_change_in_cash", "depreciation_amortization", "updated_at",
+    ]
+    
+    income_fields = {
+        "totalRevenue": "total_revenue", "costOfRevenue": "cost_of_revenue",
+        "grossProfit": "gross_profit", "operatingIncome": "operating_income",
+        "netIncome": "net_income", "ebitda": "ebitda",
+        "operatingExpenses": "operating_expenses", "researchDevelopment": "research_development",
+        "sellingGeneralAdministrative": "selling_general_admin",
+        "interestExpense": "interest_expense", "incomeTaxExpense": "income_tax_expense",
+        "netInterestIncome": "net_interest_income",
+    }
+    
+    balance_fields = {
+        "totalAssets": "total_assets", "totalLiab": "total_liabilities",
+        "totalStockholderEquity": "total_equity", "cash": "cash_and_equivalents",
+        "shortTermInvestments": "short_term_investments",
+        "totalCurrentAssets": "total_current_assets",
+        "totalCurrentLiabilities": "total_current_liabilities",
+        "longTermDebt": "long_term_debt", "shortTermDebt": "short_term_debt",
+        "shortLongTermDebtTotal": "total_debt", "retainedEarnings": "retained_earnings",
+        "commonStock": "common_stock", "inventory": "inventory",
+        "netReceivables": "accounts_receivable", "accountsPayable": "accounts_payable",
+    }
+    
+    cashflow_fields = {
+        "totalCashFromOperatingActivities": "operating_cash_flow",
+        "totalCashflowsFromInvestingActivities": "investing_cash_flow",
+        "totalCashFromFinancingActivities": "financing_cash_flow",
+        "freeCashFlow": "free_cash_flow", "capitalExpenditures": "capital_expenditures",
+        "dividendsPaid": "dividends_paid", "salePurchaseOfStock": "stock_repurchased",
+        "changeInCash": "net_change_in_cash", "depreciation": "depreciation_amortization",
+    }
+    
+    inserted = 0
+    errors = 0
+    
+    for symbol in TRACKED_STOCKS:
+        try:
+            data = stock_data_fetch_eodhd(f"fundamentals/{symbol}.US")
+            
+            if not data or "Financials" not in data:
+                continue
+            
+            financials = data.get("Financials", {})
+            
+            statement_configs = [
+                ("Income_Statement", "income_statement", income_fields),
+                ("Balance_Sheet", "balance_sheet", balance_fields),
+                ("Cash_Flow", "cash_flow", cashflow_fields),
+            ]
+            
+            for eodhd_key, stmt_type, field_map in statement_configs:
+                statement_data = financials.get(eodhd_key, {})
+                
+                for period_type, period_data in [("quarterly", statement_data.get("quarterly", {})),
+                                                  ("yearly", statement_data.get("yearly", {}))]:
+                    for fiscal_date, values in period_data.items():
+                        if fiscal_date < cutoff or not values:
+                            continue
+                        
+                        try:
+                            record = {field: None for field in all_fields}
+                            record["symbol"] = symbol
+                            record["statement_type"] = stmt_type
+                            record["period_type"] = period_type
+                            record["fiscal_date"] = fiscal_date
+                            record["currency"] = values.get("currencySymbol", "USD") or "USD"
+                            record["updated_at"] = datetime.now(timezone.utc).isoformat()
+                            
+                            for eodhd_field, db_field in field_map.items():
+                                value = values.get(eodhd_field)
+                                if value is not None and value != "None" and value != "":
+                                    try:
+                                        record[db_field] = int(float(value))
+                                    except:
+                                        pass
+                            
+                            sb.table("financial_statements").upsert(
+                                record,
+                                on_conflict="symbol,statement_type,period_type,fiscal_date"
+                            ).execute()
+                            inserted += 1
+                            
+                        except Exception as e:
+                            errors += 1
+            
+            time.sleep(0.3)  # Rate limiting - fundamentals is heavy
+            
+        except Exception as e:
+            errors += 1
+            debug(STOCK_DATA_TASK, f"Financial statements sync error for {symbol}: {e}")
+    
+    return inserted, errors
+
+
+# -----------------------------------------------------------------------------
+# STOCK NEWS SYNC
+# -----------------------------------------------------------------------------
+
+def stock_data_sync_news() -> Tuple[int, int]:
+    """Sync stock-specific news with sentiment."""
+    debug(STOCK_DATA_TASK, "Syncing stock news...")
+    
+    from_date = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
+    
+    inserted = 0
+    errors = 0
+    
+    for symbol in TRACKED_STOCKS:
+        try:
+            data = stock_data_fetch_eodhd("news", {
+                "s": f"{symbol}.US",
+                "limit": 30,
+                "from": from_date
+            })
+            
+            if not data:
+                continue
+            
+            for article in data:
+                try:
+                    title = article.get("title", "")
+                    url = article.get("link")
+                    
+                    if not title or not url:
+                        continue
+                    
+                    # Parse sentiment
+                    sentiment_data = article.get("sentiment", {})
+                    if isinstance(sentiment_data, dict):
+                        polarity = sentiment_data.get("polarity", 0) or 0
+                        sentiment = "positive" if polarity > 0.1 else "negative" if polarity < -0.1 else "neutral"
+                        sentiment_score = polarity
+                    else:
+                        sentiment = "neutral"
+                        sentiment_score = 0
+                    
+                    record = {
+                        "symbol": symbol,
+                        "title": title[:500],
+                        "summary": (article.get("content") or article.get("description", ""))[:1000],
+                        "url": url,
+                        "source": article.get("source"),
+                        "sentiment": sentiment,
+                        "sentiment_score": sentiment_score,
+                        "published_at": article.get("date"),
+                    }
+                    
+                    sb.table("stock_news").upsert(
+                        record,
+                        on_conflict="symbol,url"
+                    ).execute()
+                    inserted += 1
+                    
+                except Exception as e:
+                    errors += 1
+            
+            time.sleep(0.2)  # Rate limiting
+            
+        except Exception as e:
+            errors += 1
+            debug(STOCK_DATA_TASK, f"Stock news sync error for {symbol}: {e}")
+    
+    return inserted, errors
+
+
+# -----------------------------------------------------------------------------
+# CALENDAR UPDATE (is_upcoming flag)
+# -----------------------------------------------------------------------------
+
+def stock_data_update_calendar_flags():
+    """Update is_upcoming flags in financial_calendar."""
+    debug(STOCK_DATA_TASK, "Updating calendar flags...")
+    
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    
+    try:
+        # This requires raw SQL, so we'll do it via REST
+        # Mark past events as not upcoming
+        headers = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal"
+        }
+        
+        # Update past events
+        url = f"{SUPABASE_URL}/rest/v1/financial_calendar?event_date=lt.{today}&is_upcoming=eq.true"
+        requests.patch(url, headers=headers, json={"is_upcoming": False}, timeout=30)
+        
+        debug(STOCK_DATA_TASK, "Calendar flags updated")
+        
+    except Exception as e:
+        debug(STOCK_DATA_TASK, f"Calendar flag update error: {e}")
+
+
+# -----------------------------------------------------------------------------
+# MAIN SYNC ORCHESTRATOR
+# -----------------------------------------------------------------------------
+
+def stock_data_should_run_full_sync() -> bool:
+    """Check if we should run full sync (daily at 6 AM UTC)."""
+    now = datetime.now(timezone.utc)
+    # Run at 6:00-6:15 AM UTC
+    return now.hour == STOCK_DATA_FULL_SYNC_HOUR and now.minute < 15
+
+
+def stock_data_should_run_news_sync() -> bool:
+    """Check if we should run news sync (every 6 hours)."""
+    now = datetime.now(timezone.utc)
+    # Run at :00-:15 of scheduled hours
+    return now.hour in STOCK_DATA_NEWS_HOURS and now.minute < 15
+
+
+def stock_data_run_full_sync() -> Dict[str, Tuple[int, int]]:
+    """Run full data sync for all data types."""
+    results = {}
+    
+    info(STOCK_DATA_TASK, f"Starting full sync for {len(TRACKED_STOCKS)} stocks...")
+    
+    # Update calendar flags first
+    stock_data_update_calendar_flags()
+    
+    # Sync earnings
+    results["earnings"] = stock_data_sync_earnings()
+    info(STOCK_DATA_TASK, f"  Earnings: {results['earnings'][0]} inserted, {results['earnings'][1]} errors")
+    
+    # Sync dividends
+    results["dividends"] = stock_data_sync_dividends()
+    info(STOCK_DATA_TASK, f"  Dividends: {results['dividends'][0]} inserted, {results['dividends'][1]} errors")
+    
+    # Sync insider trades
+    results["insider_trades"] = stock_data_sync_insider_trades()
+    info(STOCK_DATA_TASK, f"  Insider trades: {results['insider_trades'][0]} inserted, {results['insider_trades'][1]} errors")
+    
+    # Sync financial statements
+    results["financial_statements"] = stock_data_sync_financial_statements()
+    info(STOCK_DATA_TASK, f"  Financial statements: {results['financial_statements'][0]} inserted, {results['financial_statements'][1]} errors")
+    
+    # Sync news
+    results["news"] = stock_data_sync_news()
+    info(STOCK_DATA_TASK, f"  Stock news: {results['news'][0]} inserted, {results['news'][1]} errors")
+    
+    total_inserted = sum(r[0] for r in results.values())
+    total_errors = sum(r[1] for r in results.values())
+    
+    info(STOCK_DATA_TASK, f"Full sync complete: {total_inserted} total inserted, {total_errors} total errors")
+    
+    return results
+
+
+async def stock_data_sync_task():
+    """Task 11: Stock financial data sync."""
+    task_metrics = metrics.get_or_create(STOCK_DATA_TASK)
+    
+    info(STOCK_DATA_TASK, f"Stock data sync task started ({len(TRACKED_STOCKS)} stocks)")
+    info(STOCK_DATA_TASK, f"  Stocks: {', '.join(TRACKED_STOCKS)}")
+    info(STOCK_DATA_TASK, f"  Full sync: Daily at {STOCK_DATA_FULL_SYNC_HOUR}:00 UTC")
+    info(STOCK_DATA_TASK, f"  News sync: Every 6 hours ({STOCK_DATA_NEWS_HOURS})")
+    
+    last_full_sync = None
+    last_news_sync = None
+    
+    while not tick_streamer._shutdown.is_set():
+        try:
+            now = datetime.now(timezone.utc)
+            loop = asyncio.get_event_loop()
+            
+            # Check for full sync (daily)
+            if stock_data_should_run_full_sync():
+                if last_full_sync is None or (now - last_full_sync).total_seconds() > 3600:
+                    info(STOCK_DATA_TASK, "Running scheduled full sync...")
+                    
+                    results = await loop.run_in_executor(None, stock_data_run_full_sync)
+                    
+                    total_inserted = sum(r[0] for r in results.values())
+                    total_errors = sum(r[1] for r in results.values())
+                    
+                    task_metrics.record_success()
+                    task_metrics.custom_metrics.update({
+                        "last_full_sync": now.isoformat(),
+                        "last_total_inserted": total_inserted,
+                        "last_total_errors": total_errors,
+                    })
+                    
+                    last_full_sync = now
+                    last_news_sync = now  # News is included in full sync
+            
+            # Check for news-only sync (every 6 hours, skip if just did full sync)
+            elif stock_data_should_run_news_sync():
+                if last_news_sync is None or (now - last_news_sync).total_seconds() > 3600:
+                    info(STOCK_DATA_TASK, "Running scheduled news sync...")
+                    
+                    inserted, errors = await loop.run_in_executor(None, stock_data_sync_news)
+                    
+                    info(STOCK_DATA_TASK, f"News sync complete: {inserted} inserted, {errors} errors")
+                    
+                    task_metrics.record_success()
+                    task_metrics.custom_metrics.update({
+                        "last_news_sync": now.isoformat(),
+                        "last_news_inserted": inserted,
+                    })
+                    
+                    last_news_sync = now
+            
+            # Sleep for 5 minutes before checking again
+            await asyncio.sleep(300)
+            
+        except Exception as e:
+            error(STOCK_DATA_TASK, f"Task error: {e}", exc_info=DEBUG_MODE)
+            task_metrics.record_error(str(e))
+            await asyncio.sleep(60)
+
+
+# ============================================================================
+#                    END OF TASK 12: STOCK FINANCIAL DATA SYNC
+# ============================================================================
+
 
 # ============================================================================
 #                              MAIN ENTRY POINT
@@ -4441,7 +5227,7 @@ async def main():
     await loop.run_in_executor(None, run_startup_gap_fill)
     
     log.info("=" * 70)
-    log.info("LONDON STRATEGIC EDGE - WORKER v9.0 (DEBUG)")
+    log.info("LONDON STRATEGIC EDGE - WORKER v9.1 (DEBUG)")
     log.info("=" * 70)
     log.info("Starting all tasks...")
     log.info("=" * 70)
@@ -4467,6 +5253,7 @@ async def main():
         asyncio.create_task(news_articles_task(), name="news_articles"),
         asyncio.create_task(oanda_streaming_task(), name="oanda_stream"),
         asyncio.create_task(bond_yields_streaming_task(), name="bond_4h"),
+        asyncio.create_task(stock_data_sync_task(), name="stock_data"),  # NEW: Stock financial data sync
     ]
     
     # Periodic metrics logging
