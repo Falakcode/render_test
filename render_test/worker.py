@@ -457,23 +457,22 @@ FOREX_SYMBOLS = [
 
 CRYPTO_SYMBOLS = [
     "BTC-USD", "ETH-USD", "BNB-USD", "XRP-USD", "SOL-USD", "ADA-USD", "DOGE-USD",
-    "DOT-USD", "AVAX-USD", "MATIC-USD",
+    "DOT-USD", "AVAX-USD", "POL-USD",
     "LINK-USD", "UNI-USD", "LTC-USD", "ATOM-USD", "XLM-USD", "FIL-USD",
     "APT-USD", "ARB-USD", "OP-USD", "NEAR-USD", "ICP-USD", "VET-USD",
-    "ALGO-USD", "FTM-USD", "SAND-USD",
+    "ALGO-USD", "SAND-USD",
     "MANA-USD", "AXS-USD", "AAVE-USD", "MKR-USD", "CRV-USD", "SNX-USD",
     "COMP-USD", "ENJ-USD", "CHZ-USD", "GALA-USD", "IMX-USD", "LDO-USD",
     "RPL-USD", "GMX-USD", "BLUR-USD",
-    "ETH-BTC", "BNB-BTC", "XRP-BTC", "SOL-BTC", "ADA-BTC",
-    "USDT-USD", "USDC-USD", "DAI-USD", "BUSD-USD", "TUSD-USD"
+    "USDT-USD", "USDC-USD", "DAI-USD", "TUSD-USD"
 ]
 
 US_STOCKS = [
     "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA",
     "AMD", "INTC", "AVGO", "QCOM", "TXN", "MU", "AMAT", "LRCX", "KLAC", "ADI", "MRVL", "ON",
     "CRM", "ADBE", "NOW", "SNOW", "PLTR", "PANW", "CRWD", "ZS", "DDOG", "NET",
-    "TEAM", "MDB", "WDAY", "SPLK", "ZM",
-    "V", "MA", "PYPL", "SQ", "COIN", "HOOD", "AFRM", "UPST",
+    "TEAM", "MDB", "WDAY", "ZM",
+    "V", "MA", "PYPL", "COIN", "HOOD", "AFRM", "UPST",
     "JPM", "BAC", "WFC", "GS", "MS", "C", "USB", "SCHW",
     "UNH", "JNJ", "PFE", "ABBV", "MRK", "LLY", "BMY", "GILD", "AMGN", "BIIB",
     "WMT", "COST", "TGT", "HD", "LOW", "NKE", "SBUX", "MCD", "DIS", "NFLX",
@@ -515,9 +514,9 @@ ET = pytz.timezone('America/New_York')
 CRYPTO_BASE_SYMBOLS = {
     'BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'DOGE', 'BNB', 'AVAX', 'DOT', 'LINK',
     'ATOM', 'LTC', 'ALGO', 'NEAR', 'FIL', 'AAVE', 'UNI', 'COMP', 'CRV', 'XLM',
-    'ARB', 'OP', 'SAND', 'MANA', 'LDO', 'SNX', 'VET', 'MATIC', 'FTM', 'ICP',
+    'ARB', 'OP', 'SAND', 'MANA', 'LDO', 'SNX', 'VET', 'POL', 'ICP',
     'IMX', 'APT', 'AXS', 'BLUR', 'CHZ', 'ENJ', 'GALA', 'GMX', 'MKR', 'RPL',
-    'DAI', 'USDC', 'USDT', 'BUSD', 'TUSD'
+    'DAI', 'USDC', 'USDT', 'TUSD'
 }
 
 
@@ -1161,9 +1160,10 @@ def store_calendar_events(events: List[Dict]) -> Tuple[int, int, List[str]]:
         
         debug(CALENDAR_TASK, f"Checking existing events from {min_date} to {max_date}")
         
+        # Fetch with higher limit - default is 1000 which misses events for 14-day range
         result = sb.table("Economic_calander").select(
             "id,date,time,country,event,actual"
-        ).gte("date", min_date).lte("date", max_date).execute()
+        ).gte("date", min_date).lte("date", max_date).limit(5000).execute()
         
         for row in result.data:
             key = (row.get("date"), row.get("time"), row.get("country"), row.get("event"))
@@ -1664,7 +1664,7 @@ Smart whale detection with 7 methods:
 
 # Whale Flow Configuration
 WHALE_THRESHOLD_USD = 100000       # $100k minimum
-WHALE_MOMENTUM_WINDOW_MINS = 60    # 60 minute rolling window
+WHALE_MOMENTUM_WINDOW_MINS = 10080 # 1 week rolling window (7 * 24 * 60)
 WHALE_LOG_INTERVAL = 30            # Log stats every 30 seconds
 BLOCKCHAIN_WS_URL = "wss://ws.blockchain.info/inv"
 
@@ -2211,8 +2211,8 @@ class WhaleFlowTracker:
             async with self._lock:
                 self._flows.append(flow)
                 
-                # Trim old flows (keep last 2 hours)
-                cutoff = datetime.now(timezone.utc) - timedelta(hours=2)
+                # Trim old flows (keep within momentum window)
+                cutoff = datetime.now(timezone.utc) - timedelta(minutes=WHALE_MOMENTUM_WINDOW_MINS)
                 self._flows = [f for f in self._flows if f['timestamp'] > cutoff]
             
             # Log the whale transaction
@@ -2242,6 +2242,60 @@ class WhaleFlowTracker:
             'unknown': 'âšª'               # Unknown
         }
         return emojis.get(flow_type, 'âšª')
+    
+    async def _load_recent_flows(self):
+        """Load recent flows from database to restore momentum state on startup."""
+        try:
+            cutoff = datetime.now(timezone.utc) - timedelta(minutes=WHALE_MOMENTUM_WINDOW_MINS)
+            cutoff_str = cutoff.isoformat()
+            
+            result = sb.table('whale_flows').select(
+                'tx_hash,timestamp,amount_btc,amount_usd,flow_type,exchange,detection_method'
+            ).gte('timestamp', cutoff_str).order('timestamp', desc=False).limit(10000).execute()
+            
+            if result.data:
+                loaded_count = 0
+                for row in result.data:
+                    try:
+                        # Parse timestamp string back to datetime
+                        ts_str = row.get('timestamp', '')
+                        if ts_str:
+                            # Handle both formats: with and without timezone
+                            if '+' in ts_str or 'Z' in ts_str:
+                                ts = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+                            else:
+                                ts = datetime.fromisoformat(ts_str).replace(tzinfo=timezone.utc)
+                        else:
+                            continue
+                        
+                        flow = {
+                            'tx_hash': row.get('tx_hash', ''),
+                            'timestamp': ts,
+                            'amount_btc': float(row.get('amount_btc', 0)),
+                            'amount_usd': float(row.get('amount_usd', 0)),
+                            'flow_type': row.get('flow_type', 'unknown'),
+                            'exchange': row.get('exchange'),
+                            'detection_method': row.get('detection_method')
+                        }
+                        self._flows.append(flow)
+                        loaded_count += 1
+                    except Exception as e:
+                        log.debug(f"Failed to parse flow record: {e}")
+                        continue
+                
+                if loaded_count > 0:
+                    # Calculate current momentum after loading
+                    momentum = self._calculate_momentum()
+                    log.info(f"🐋 Restored {loaded_count} recent flows from database")
+                    log.info(f"🐋 Restored momentum: Score={momentum['flow_score']:+d} | Regime={momentum['regime']}")
+                    log.info(f"🐋   Inflows: ${momentum['inflow_usd']/1e6:.2f}M ({momentum['inflow_count']} txs)")
+                    log.info(f"🐋   Outflows: ${momentum['outflow_usd']/1e6:.2f}M ({momentum['outflow_count']} txs)")
+            else:
+                log.info("🐋 No recent flows in database to restore (starting fresh)")
+                
+        except Exception as e:
+            log.warning(f"🐋 Could not load recent flows from database: {e}")
+            log.info("🐋 Starting with fresh momentum tracking")
     
     async def _store_flow(self, flow: Dict):
         """Store flow to Supabase."""
@@ -2399,6 +2453,9 @@ class WhaleFlowTracker:
         
         # Fetch initial BTC price
         await self._fetch_btc_price()
+        
+        # Load recent flows from database to restore momentum state
+        await self._load_recent_flows()
         
         # Start periodic tasks
         periodic = asyncio.create_task(self._periodic_tasks())
@@ -4585,12 +4642,12 @@ TRACKED_STOCKS = [
     # Semiconductors (12)
     "AMD", "INTC", "AVGO", "QCOM", "TXN", "MU", "AMAT", "LRCX", "KLAC", "ADI", "MRVL", "ON",
     
-    # Enterprise Software (15)
+    # Enterprise Software (13)
     "CRM", "ADBE", "NOW", "SNOW", "PLTR", "PANW", "CRWD", "ZS", "DDOG", "NET",
-    "TEAM", "MDB", "WDAY", "SPLK", "ZM",
+    "TEAM", "MDB", "WDAY", "ZM",
     
-    # Fintech & Payments (8)
-    "V", "MA", "PYPL", "SQ", "COIN", "HOOD", "AFRM", "UPST",
+    # Fintech & Payments (7)
+    "V", "MA", "PYPL", "COIN", "HOOD", "AFRM", "UPST",
     
     # Banks (8)
     "JPM", "BAC", "WFC", "GS", "MS", "C", "USB", "SCHW",
