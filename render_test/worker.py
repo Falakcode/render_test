@@ -1037,75 +1037,181 @@ async def tick_streaming_task():
 
 CALENDAR_TASK = "CALENDAR"
 
-HIGH_IMPACT_KEYWORDS = [
-    "non farm payrolls", "nonfarm payrolls", "nfp", "unemployment rate",
-    "cpi", "consumer price index", "inflation", "core cpi",
-    "gdp", "gross domestic product", "interest rate decision",
-    "fed", "fomc", "ecb", "boe", "boj", "rba", "retail sales",
-    "pce", "core pce", "ism manufacturing", "ism services"
+# G20 + EU country codes for filtering
+G20_EU_COUNTRIES = {
+    'AR', 'AU', 'BR', 'CA', 'CN', 'FR', 'DE', 'IN', 'ID', 'IT',
+    'JP', 'MX', 'RU', 'SA', 'ZA', 'KR', 'TR', 'GB', 'UK', 'US',
+    'EU', 'EA'
+}
+
+# Period patterns to extract from event names
+PERIOD_PATTERNS = [
+    r'(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)$',
+    r'(Q[1-4])$',
+    r'(H[1-2])$',
+    r'(\d{4})$',
 ]
 
-MEDIUM_IMPACT_KEYWORDS = [
-    "ppi", "producer price", "housing starts", "building permits",
-    "durable goods", "consumer confidence", "michigan", "pmi",
-    "industrial production", "trade balance", "jobless claims"
-]
 
-
-def classify_calendar_impact(event_name: str) -> str:
-    """Classify event importance based on keywords."""
-    name_lower = event_name.lower()
-    for kw in HIGH_IMPACT_KEYWORDS:
-        if kw in name_lower:
-            return "High"  # Capital H to match constraint
-    for kw in MEDIUM_IMPACT_KEYWORDS:
-        if kw in name_lower:
-            return "Medium"
-    return "Low"
-
-
-def fetch_eodhd_calendar(days_ahead: int = 7, days_back: int = 7) -> Tuple[List[Dict], Optional[str]]:
-    """Fetch economic calendar from EODHD API.
+def extract_period_hint(event_name: str) -> Tuple[str, str]:
+    """Extract period hint from event name. Returns (clean_event_name, period_hint)."""
+    import re
+    if not event_name:
+        return event_name, ''
     
-    Args:
-        days_ahead: Days into the future to fetch
-        days_back: Days into the past to fetch (to get actuals!)
+    for pattern in PERIOD_PATTERNS:
+        match = re.search(pattern, event_name, re.IGNORECASE)
+        if match:
+            period = match.group(1).upper()
+            clean_name = event_name[:match.start()].strip()
+            return clean_name, period
     
+    return event_name, ''
+
+
+def parse_time_to_24h(time_str: str) -> str:
+    """Convert 12h time to 24h format for datetime column."""
+    if not time_str:
+        return ''
+    try:
+        parsed = datetime.strptime(time_str.strip(), "%I:%M %p")
+        return parsed.strftime("%H:%M:%S")
+    except:
+        return time_str
+
+
+def check_revised(element) -> bool:
+    """Check if a value element indicates revision."""
+    if not element:
+        return False
+    text = element.get_text() if hasattr(element, 'get_text') else str(element)
+    if '®' in text or 'revised' in text.lower():
+        return True
+    return False
+
+
+def scrape_tradingeconomics_calendar() -> Tuple[List[Dict], Optional[str]]:
+    """Scrape economic calendar from TradingEconomics for G20 + EU countries.
     Returns (events, error_message)."""
-    # Fetch PAST events too - this is where actuals come from!
-    from_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
-    to_date = (datetime.now() + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+    from bs4 import BeautifulSoup
     
-    url = "https://eodhd.com/api/economic-events"
-    params = {
-        "api_token": EODHD_API_KEY,
-        "from": from_date,
-        "to": to_date,
-        "limit": 1000,
-        "fmt": "json"
-    }
+    url = "https://tradingeconomics.com/calendar"
     
-    debug(CALENDAR_TASK, f"Fetching calendar: {from_date} to {to_date} (past {days_back}d + future {days_ahead}d)")
+    debug(CALENDAR_TASK, f"Fetching TradingEconomics calendar: {url}")
     
     try:
-        response = requests.get(url, params=params, timeout=30)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
         
-        if response.status_code == 200:
-            events = response.json()
-            with_actuals = sum(1 for e in events if e.get("actual") is not None)
-            debug(CALENDAR_TASK, f"API returned {len(events)} events ({with_actuals} with actuals)")
-            return events, None
-        else:
-            return [], f"API returned status {response.status_code}: {response.text[:200]}"
+        response = requests.get(url, headers=headers, timeout=30)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        table = soup.find('table', {'id': 'calendar'})
+        if not table:
+            return [], "Could not find calendar table"
+        
+        events = []
+        skipped = 0
+        current_date = datetime.now().strftime("%Y-%m-%d")
+        
+        rows = table.find_all('tr')
+        
+        for row in rows:
+            # Check for date header
+            th = row.find('th')
+            if th:
+                date_text = th.get_text(strip=True)
+                try:
+                    date_obj = datetime.strptime(date_text, "%A %B %d %Y")
+                    current_date = date_obj.strftime("%Y-%m-%d")
+                except:
+                    pass
+                continue
             
+            cols = row.find_all('td')
+            
+            if len(cols) < 7:
+                continue
+            
+            try:
+                time_str = cols[0].get_text(strip=True)
+                region_code = cols[1].get_text(strip=True).upper()
+                event_name_raw = cols[4].get_text(strip=True)
+                
+                # Filter G20 + EU only
+                if region_code not in G20_EU_COUNTRIES:
+                    skipped += 1
+                    continue
+                
+                # Extract period hint
+                event_name, period_hint = extract_period_hint(event_name_raw)
+                
+                # Get values
+                actual = cols[5].get_text(strip=True) if len(cols) > 5 else ""
+                previous = cols[6].get_text(strip=True) if len(cols) > 6 else ""
+                consensus = cols[7].get_text(strip=True) if len(cols) > 7 else ""
+                forecast = cols[8].get_text(strip=True) if len(cols) > 8 else ""
+                
+                # Check revision flags
+                actual_revised = check_revised(cols[5]) if len(cols) > 5 else False
+                previous_revised = check_revised(cols[6]) if len(cols) > 6 else False
+                consensus_revised = check_revised(cols[7]) if len(cols) > 7 else False
+                forecast_revised = check_revised(cols[8]) if len(cols) > 8 else False
+                
+                # Build datetime string
+                time_24h = parse_time_to_24h(time_str)
+                datetime_str = f"{current_date} {time_24h}" if time_24h else None
+                
+                # Validate
+                if not event_name or len(event_name) < 3:
+                    continue
+                if not time_str:
+                    continue
+                
+                # Clean values - remove ® symbol
+                actual = actual.replace('®', '').strip() if actual else None
+                previous = previous.replace('®', '').strip() if previous else None
+                consensus = consensus.replace('®', '').strip() if consensus else None
+                forecast = forecast.replace('®', '').strip() if forecast else None
+                
+                event_data = {
+                    'date': current_date,
+                    'time': time_str,
+                    'datetime': datetime_str,
+                    'region_code': region_code,
+                    'event': event_name,
+                    'period_hint': period_hint if period_hint else None,
+                    'actual': actual if actual else None,
+                    'previous': previous if previous else None,
+                    'consensus': consensus if consensus else None,
+                    'forecast': forecast if forecast else None,
+                    'actual_revised': actual_revised,
+                    'previous_revised': previous_revised,
+                    'consensus_revised': consensus_revised,
+                    'forecast_revised': forecast_revised,
+                }
+                
+                events.append(event_data)
+                
+            except Exception as e:
+                continue
+        
+        with_actuals = sum(1 for e in events if e.get('actual'))
+        debug(CALENDAR_TASK, f"Scraped {len(events)} G20/EU events ({with_actuals} with actuals), skipped {skipped} other countries")
+        
+        return events, None
+        
     except requests.Timeout:
         return [], "Request timed out"
     except Exception as e:
-        return [], f"Request failed: {e}"
+        return [], f"Scrape failed: {e}"
 
 
 def store_calendar_events(events: List[Dict]) -> Tuple[int, int, List[str]]:
-    """Store calendar events with UPSERT logic to update actuals.
+    """Store calendar events to economic_calender table with UPSERT logic.
     Returns (stored_count, updated_count, errors)."""
     if not events:
         return 0, 0, []
@@ -1114,59 +1220,27 @@ def store_calendar_events(events: List[Dict]) -> Tuple[int, int, List[str]]:
     updated = 0
     errors = []
     
-    # Parse all events first
-    parsed_events = []
-    for event in events:
-        try:
-            event_date = event.get("date", "")
-            date_part = event_date.split(" ")[0] if event_date else None
-            time_part = event_date.split(" ")[1] if event_date and " " in event_date else None
-            
-            if not date_part:
-                continue
-            
-            event_name = event.get("type", "") or ""
-            country = event.get("country", "") or ""
-            
-            parsed_events.append({
-                "event": event_name,
-                "country": country,
-                "date": date_part,
-                "time": time_part,
-                "actual": str(event.get("actual")) if event.get("actual") is not None else None,
-                "previous": str(event.get("previous")) if event.get("previous") is not None else None,
-                "consensus": str(event.get("estimate")) if event.get("estimate") is not None else None,
-                "importance": classify_calendar_impact(event_name),
-            })
-        except Exception as e:
-            errors.append(f"Parse error: {e}")
-            continue
-    
-    if not parsed_events:
-        return 0, 0, errors
-    
-    debug(CALENDAR_TASK, f"Parsed {len(parsed_events)} events")
+    debug(CALENDAR_TASK, f"Processing {len(events)} events for storage")
     
     # Get date range for batch lookup
-    dates = set(e["date"] for e in parsed_events if e["date"])
+    dates = set(e["date"] for e in events if e.get("date"))
     if not dates:
-        return 0, 0, errors
+        return 0, 0, ["No valid dates in events"]
     
-    # Batch fetch existing events (include id and actual for update logic)
-    existing_events = {}  # key -> row data
+    min_date = min(dates)
+    max_date = max(dates)
+    
+    # Batch fetch existing events
+    existing_events = {}
     try:
-        min_date = min(dates)
-        max_date = max(dates)
-        
         debug(CALENDAR_TASK, f"Checking existing events from {min_date} to {max_date}")
         
-        # Fetch with higher limit - default is 1000 which misses events for 14-day range
-        result = sb.table("Economic_calander").select(
-            "id,date,time,country,event,actual"
+        result = sb.table("economic_calender").select(
+            "id,datetime,region_code,event,actual"
         ).gte("date", min_date).lte("date", max_date).limit(5000).execute()
         
         for row in result.data:
-            key = (row.get("date"), row.get("time"), row.get("country"), row.get("event"))
+            key = (row.get("datetime"), row.get("region_code"), row.get("event"))
             existing_events[key] = row
         
         debug(CALENDAR_TASK, f"Found {len(existing_events)} existing events")
@@ -1179,18 +1253,23 @@ def store_calendar_events(events: List[Dict]) -> Tuple[int, int, List[str]]:
     new_events = []
     updates = []
     
-    for evt in parsed_events:
-        key = (evt["date"], evt["time"], evt["country"], evt["event"])
+    for evt in events:
+        key = (evt.get("datetime"), evt.get("region_code"), evt.get("event"))
         
         if key in existing_events:
             existing = existing_events[key]
             # Check if we have a new actual value to update
-            if evt["actual"] is not None and existing.get("actual") is None:
+            if evt.get("actual") and not existing.get("actual"):
                 updates.append({
                     "id": existing["id"],
                     "actual": evt["actual"],
-                    "previous": evt["previous"],
-                    "consensus": evt["consensus"],
+                    "previous": evt.get("previous"),
+                    "consensus": evt.get("consensus"),
+                    "forecast": evt.get("forecast"),
+                    "actual_revised": evt.get("actual_revised", False),
+                    "previous_revised": evt.get("previous_revised", False),
+                    "consensus_revised": evt.get("consensus_revised", False),
+                    "forecast_revised": evt.get("forecast_revised", False),
                 })
         else:
             new_events.append(evt)
@@ -1203,7 +1282,7 @@ def store_calendar_events(events: List[Dict]) -> Tuple[int, int, List[str]]:
         for i in range(0, len(new_events), chunk_size):
             chunk = new_events[i:i+chunk_size]
             try:
-                sb.table("Economic_calander").insert(chunk).execute()
+                sb.table("economic_calender").insert(chunk).execute()
                 stored += len(chunk)
                 debug(CALENDAR_TASK, f"Inserted chunk of {len(chunk)} events")
             except Exception as e:
@@ -1213,7 +1292,7 @@ def store_calendar_events(events: List[Dict]) -> Tuple[int, int, List[str]]:
                 # Try individual inserts
                 for evt in chunk:
                     try:
-                        sb.table("Economic_calander").insert(evt).execute()
+                        sb.table("economic_calender").insert(evt).execute()
                         stored += 1
                     except Exception as e2:
                         if len(errors) < 10:
@@ -1223,11 +1302,17 @@ def store_calendar_events(events: List[Dict]) -> Tuple[int, int, List[str]]:
     if updates:
         for upd in updates:
             try:
-                sb.table("Economic_calander").update({
+                update_data = {
                     "actual": upd["actual"],
                     "previous": upd["previous"],
                     "consensus": upd["consensus"],
-                }).eq("id", upd["id"]).execute()
+                    "forecast": upd["forecast"],
+                    "actual_revised": upd["actual_revised"],
+                    "previous_revised": upd["previous_revised"],
+                    "consensus_revised": upd["consensus_revised"],
+                    "forecast_revised": upd["forecast_revised"],
+                }
+                sb.table("economic_calender").update(update_data).eq("id", upd["id"]).execute()
                 updated += 1
             except Exception as e:
                 if len(errors) < 10:
@@ -1240,28 +1325,35 @@ def store_calendar_events(events: List[Dict]) -> Tuple[int, int, List[str]]:
 
 
 async def economic_calendar_task():
-    """Task 2: Fetch and store economic calendar events."""
+    """Task 2: Scrape and store economic calendar events from TradingEconomics.
+    
+    Scraping pattern: Every 15 minutes at :00, :15, :30, :45
+    Plus 5 seconds later to catch late-published actuals.
+    Example: 1:30:00 → 1:30:05 → 1:45:00 → 1:45:05
+    """
     task_metrics = metrics.get_or_create(CALENDAR_TASK)
     
-    info(CALENDAR_TASK, "Economic calendar task started")
+    info(CALENDAR_TASK, "Economic calendar task started (TradingEconomics scraper)")
+    info(CALENDAR_TASK, "Scrape pattern: every 15 mins + 5 sec follow-up")
     
-    while not tick_streamer._shutdown.is_set():
+    async def do_scrape(label: str = ""):
+        """Helper to perform scrape and store."""
         try:
-            info(CALENDAR_TASK, "Fetching economic calendar...")
-            
-            events, fetch_error = fetch_eodhd_calendar(days_ahead=7)
+            events, fetch_error = scrape_tradingeconomics_calendar()
             
             if fetch_error:
-                warning(CALENDAR_TASK, f"Fetch failed: {fetch_error}")
+                warning(CALENDAR_TASK, f"Scrape failed{label}: {fetch_error}")
                 task_metrics.record_error(fetch_error)
-            elif events:
+                return
+            
+            if events:
                 stored, updated, errors = store_calendar_events(events)
-                high_impact = sum(1 for e in events if classify_calendar_impact(e.get("type", "")) == "High")
+                with_actuals = sum(1 for e in events if e.get("actual"))
                 
-                info(CALENDAR_TASK, f"Results: {len(events)} fetched, {stored} stored, {updated} updated, {high_impact} high-impact")
+                info(CALENDAR_TASK, f"Results{label}: {len(events)} scraped, {stored} stored, {updated} updated, {with_actuals} with actuals")
                 
                 if errors:
-                    for err in errors[:5]:  # Log first 5 errors
+                    for err in errors[:5]:
                         warning(CALENDAR_TASK, f"  Error: {err}")
                     if len(errors) > 5:
                         warning(CALENDAR_TASK, f"  ... and {len(errors) - 5} more errors")
@@ -1271,13 +1363,50 @@ async def economic_calendar_task():
                     "last_fetch_count": len(events),
                     "last_stored_count": stored,
                     "last_updated_count": updated,
+                    "last_with_actuals": with_actuals,
                     "last_error_count": len(errors),
                 })
             else:
-                info(CALENDAR_TASK, "No events returned from API")
+                info(CALENDAR_TASK, f"No events scraped{label}")
+        except Exception as e:
+            error(CALENDAR_TASK, f"Scrape error{label}: {e}", exc_info=DEBUG_MODE)
+            task_metrics.record_error(str(e))
+    
+    while not tick_streamer._shutdown.is_set():
+        try:
+            # Calculate seconds until next 15-minute mark
+            now = datetime.now()
+            minutes_past = now.minute % 15
+            seconds_past = now.second
             
-            # Wait before next fetch
-            await asyncio.sleep(CALENDAR_FETCH_INTERVAL)
+            if minutes_past == 0 and seconds_past < 10:
+                # We're at a 15-min mark, scrape now
+                wait_seconds = 0
+            else:
+                # Wait until next 15-min mark
+                minutes_to_wait = 15 - minutes_past if minutes_past > 0 else 0
+                wait_seconds = (minutes_to_wait * 60) - seconds_past
+                if wait_seconds < 0:
+                    wait_seconds = 0
+            
+            if wait_seconds > 0:
+                next_scrape = now + timedelta(seconds=wait_seconds)
+                debug(CALENDAR_TASK, f"Waiting {wait_seconds}s until {next_scrape.strftime('%H:%M:%S')}")
+                await asyncio.sleep(wait_seconds)
+            
+            # First scrape at :00/:15/:30/:45
+            info(CALENDAR_TASK, f"Scraping at {datetime.now().strftime('%H:%M:%S')}...")
+            await do_scrape(" (primary)")
+            
+            # Wait 5 seconds
+            await asyncio.sleep(5)
+            
+            # Second scrape to catch late actuals
+            info(CALENDAR_TASK, f"Follow-up scrape at {datetime.now().strftime('%H:%M:%S')}...")
+            await do_scrape(" (follow-up)")
+            
+            # Small sleep to prevent tight loop if we're still within the same second
+            await asyncio.sleep(1)
             
         except Exception as e:
             error(CALENDAR_TASK, f"Task error: {e}", exc_info=DEBUG_MODE)
