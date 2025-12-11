@@ -362,6 +362,37 @@ class DebugTableRef:
         
         return UpsertBuilder(self)
     
+    def update(self, data: Any):
+        """Update with logging and chaining support."""
+        self._client.log_request(self._table_name, "UPDATE", data)
+        
+        class UpdateBuilder:
+            def __init__(inner_self, table_ref):
+                inner_self._table_ref = table_ref
+                inner_self._data = data
+                inner_self._filters = []
+            
+            def eq(inner_self, column: str, value: Any):
+                inner_self._filters.append(("eq", column, value))
+                return inner_self
+            
+            def execute(inner_self):
+                try:
+                    if inner_self._table_ref._table is None:
+                        raise Exception("Supabase client not initialized")
+                    query = inner_self._table_ref._table.update(inner_self._data)
+                    for filter_type, col, val in inner_self._filters:
+                        if filter_type == "eq":
+                            query = query.eq(col, val)
+                    result = query.execute()
+                    inner_self._table_ref._client.log_response(inner_self._table_ref._table_name, "UPDATE", result)
+                    return result
+                except Exception as e:
+                    inner_self._table_ref._client.log_response(inner_self._table_ref._table_name, "UPDATE", None, e)
+                    raise
+        
+        return UpdateBuilder(self)
+    
     def select(self, columns: str = "*"):
         """Select with chaining support."""
         return SelectBuilder(self, columns)
