@@ -1041,7 +1041,7 @@ CALENDAR_TASK = "CALENDAR"
 G20_EU_COUNTRIES = {
     'AR', 'AU', 'BR', 'CA', 'CN', 'FR', 'DE', 'IN', 'ID', 'IT',
     'JP', 'MX', 'RU', 'SA', 'ZA', 'KR', 'TR', 'GB', 'UK', 'US',
-    'EU', 'EA'
+    'EU', 'EA', 'ES', 'SG'  # Added Spain and Singapore
 }
 
 # Period patterns to extract from event names
@@ -1163,7 +1163,8 @@ def scrape_tradingeconomics_calendar() -> Tuple[List[Dict], Optional[str]]:
                 
                 # Build datetime string
                 time_24h = parse_time_to_24h(time_str)
-                datetime_str = f"{current_date} {time_24h}" if time_24h else None
+                # Add UTC timezone to match database format
+                datetime_str = f"{current_date} {time_24h}+00" if time_24h else None
                 
                 # Validate
                 if not event_name or len(event_name) < 3:
@@ -1240,7 +1241,11 @@ def store_calendar_events(events: List[Dict]) -> Tuple[int, int, List[str]]:
         ).gte("date", min_date).lte("date", max_date).limit(5000).execute()
         
         for row in result.data:
-            key = (row.get("datetime"), row.get("region_code"), row.get("event"))
+            # Normalize datetime string for comparison (remove timezone variations)
+            dt_str = str(row.get("datetime", "")).replace("+00:00", "+00").replace("T", " ")
+            if dt_str and not dt_str.endswith("+00"):
+                dt_str = dt_str.split("+")[0] + "+00"  # Normalize timezone format
+            key = (dt_str, row.get("region_code"), row.get("event"))
             existing_events[key] = row
         
         debug(CALENDAR_TASK, f"Found {len(existing_events)} existing events")
@@ -1254,7 +1259,11 @@ def store_calendar_events(events: List[Dict]) -> Tuple[int, int, List[str]]:
     updates = []
     
     for evt in events:
-        key = (evt.get("datetime"), evt.get("region_code"), evt.get("event"))
+        # Normalize datetime for key matching
+        dt_str = str(evt.get("datetime", "")).replace("+00:00", "+00").replace("T", " ")
+        if dt_str and not dt_str.endswith("+00"):
+            dt_str = dt_str.split("+")[0] + "+00"
+        key = (dt_str, evt.get("region_code"), evt.get("event"))
         
         if key in existing_events:
             existing = existing_events[key]
