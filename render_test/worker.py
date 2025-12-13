@@ -27,6 +27,7 @@ TASKS:
   9. OANDA Streaming    - Commodities & indices real-time (24 instruments)
   10. Bond Yields 4H    - Government bonds via OANDA streaming (6 bonds)
   11. Stock Data Sync   - EODHD financial data (earnings, dividends, insider trades)
+  12. Gov Yields EODHD  - Government bond yields via EODHD Bulk API (108 bonds, 4H updates)
 
 ================================================================================
 """
@@ -5838,6 +5839,338 @@ async def stock_fundamentals_price_task():
 
 
 # ============================================================================
+#                    TASK 14: GOVERNMENT YIELDS (EODHD Bulk API, 4-Hour Updates)
+# ============================================================================
+# Fetches government bond yields from EODHD Bulk API every 4 hours.
+# Uses single API call to get ALL 108 bonds (costs 100 API calls vs 108).
+# Follows FX market hours (Sunday 5PM ET to Friday 5PM ET).
+# ============================================================================
+
+GOV_YIELDS_TASK = "GOV_YIELDS"
+
+# EODHD symbol -> (country_name, maturity)
+# Maps the bond code to country and maturity for database storage
+GOV_YIELDS_SYMBOLS = {
+    # Austria
+    "AT1Y": ("Austria", "1Y"),
+    "AT2Y": ("Austria", "2Y"),
+    # Australia
+    "AU10Y": ("Australia", "10Y"),
+    "AU1Y": ("Australia", "1Y"),
+    "AU2Y": ("Australia", "2Y"),
+    "AU30Y": ("Australia", "30Y"),
+    "AU5Y": ("Australia", "5Y"),
+    # Brazil
+    "BR1Y": ("Brazil", "1Y"),
+    # Canada
+    "CA10Y": ("Canada", "10Y"),
+    "CA20Y": ("Canada", "20Y"),
+    "CA2Y": ("Canada", "2Y"),
+    "CA30Y": ("Canada", "30Y"),
+    "CA3M": ("Canada", "3M"),
+    "CA5Y": ("Canada", "5Y"),
+    # Chile
+    "CH10Y": ("Chile", "10Y"),
+    # China
+    "CN10Y": ("China", "10Y"),
+    "CN1Y": ("China", "1Y"),
+    "CN2Y": ("China", "2Y"),
+    "CN3Y": ("China", "3Y"),
+    "CN5Y": ("China", "5Y"),
+    "CN7Y": ("China", "7Y"),
+    # Germany
+    "DE10Y": ("Germany", "10Y"),
+    "DE1Y": ("Germany", "1Y"),
+    "DE2Y": ("Germany", "2Y"),
+    "DE30Y": ("Germany", "30Y"),
+    "DE3M": ("Germany", "3M"),
+    "DE3Y": ("Germany", "3Y"),
+    "DE5Y": ("Germany", "5Y"),
+    "DE6M": ("Germany", "6M"),
+    # Denmark
+    "DK2Y": ("Denmark", "2Y"),
+    # Spain
+    "ES10Y": ("Spain", "10Y"),
+    "ES1Y": ("Spain", "1Y"),
+    "ES3M": ("Spain", "3M"),
+    "ES3Y": ("Spain", "3Y"),
+    "ES5Y": ("Spain", "5Y"),
+    "ES6M": ("Spain", "6M"),
+    # France
+    "FR10Y": ("France", "10Y"),
+    "FR1M": ("France", "1M"),
+    "FR1Y": ("France", "1Y"),
+    "FR2Y": ("France", "2Y"),
+    "FR3M": ("France", "3M"),
+    "FR3Y": ("France", "3Y"),
+    "FR5Y": ("France", "5Y"),
+    "FR6M": ("France", "6M"),
+    # Greece
+    "GR10Y": ("Greece", "10Y"),
+    # Indonesia
+    "ID10Y": ("Indonesia", "10Y"),
+    "ID1Y": ("Indonesia", "1Y"),
+    "ID3Y": ("Indonesia", "3Y"),
+    "ID5Y": ("Indonesia", "5Y"),
+    # India
+    "IN10Y": ("India", "10Y"),
+    "IN1Y": ("India", "1Y"),
+    "IN2Y": ("India", "2Y"),
+    "IN5Y": ("India", "5Y"),
+    # Italy
+    "IT10Y": ("Italy", "10Y"),
+    "IT1Y": ("Italy", "1Y"),
+    "IT2Y": ("Italy", "2Y"),
+    "IT30Y": ("Italy", "30Y"),
+    "IT3M": ("Italy", "3M"),
+    "IT3Y": ("Italy", "3Y"),
+    "IT5Y": ("Italy", "5Y"),
+    "IT6M": ("Italy", "6M"),
+    # Japan
+    "JP10Y": ("Japan", "10Y"),
+    "JP2Y": ("Japan", "2Y"),
+    "JP30Y": ("Japan", "30Y"),
+    "JP3M": ("Japan", "3M"),
+    "JP3Y": ("Japan", "3Y"),
+    "JP5Y": ("Japan", "5Y"),
+    # Kenya
+    "KE10Y": ("Kenya", "10Y"),
+    # South Korea
+    "KR10Y": ("South Korea", "10Y"),
+    "KR1Y": ("South Korea", "1Y"),
+    "KR20Y": ("South Korea", "20Y"),
+    "KR2Y": ("South Korea", "2Y"),
+    "KR3Y": ("South Korea", "3Y"),
+    "KR5Y": ("South Korea", "5Y"),
+    # Mexico
+    "MX10Y": ("Mexico", "10Y"),
+    # Malaysia
+    "MY10Y": ("Malaysia", "10Y"),
+    "MY5Y": ("Malaysia", "5Y"),
+    # Netherlands
+    "NL10Y": ("Netherlands", "10Y"),
+    "NL3M": ("Netherlands", "3M"),
+    "NL6M": ("Netherlands", "6M"),
+    # Norway
+    "NO10Y": ("Norway", "10Y"),
+    # New Zealand
+    "NZ10Y": ("New Zealand", "10Y"),
+    "NZ2Y": ("New Zealand", "2Y"),
+    # Portugal
+    "PT1Y": ("Portugal", "1Y"),
+    "PT3Y": ("Portugal", "3Y"),
+    "PT5Y": ("Portugal", "5Y"),
+    "PT6M": ("Portugal", "6M"),
+    # Sweden
+    "SE10Y": ("Sweden", "10Y"),
+    # Switzerland
+    "SW2Y": ("Switzerland", "2Y"),
+    "SW3M": ("Switzerland", "3M"),
+    # United Kingdom
+    "UK10Y": ("United Kingdom", "10Y"),
+    "UK1Y": ("United Kingdom", "1Y"),
+    "UK2Y": ("United Kingdom", "2Y"),
+    "UK30Y": ("United Kingdom", "30Y"),
+    "UK3Y": ("United Kingdom", "3Y"),
+    "UK5Y": ("United Kingdom", "5Y"),
+    "UK7Y": ("United Kingdom", "7Y"),
+    # United States
+    "US10Y": ("United States", "10Y"),
+    "US1M": ("United States", "1M"),
+    "US1Y": ("United States", "1Y"),
+    "US20Y": ("United States", "20Y"),
+    "US2Y": ("United States", "2Y"),
+    "US30Y": ("United States", "30Y"),
+    "US3M": ("United States", "3M"),
+    "US3Y": ("United States", "3Y"),
+    "US5Y": ("United States", "5Y"),
+    "US6M": ("United States", "6M"),
+    "US7Y": ("United States", "7Y"),
+}
+
+
+def fetch_all_gov_yields_bulk() -> Tuple[int, int]:
+    """
+    Fetch yields for ALL government bonds using EODHD Bulk API.
+    Single API call gets all ~108 bonds (costs 100 API calls).
+    
+    Returns:
+        Tuple of (success_count, error_count)
+    """
+    url = "https://eodhd.com/api/eod-bulk-last-day/GBOND"
+    params = {
+        "api_token": EODHD_API_KEY,
+        "fmt": "json"
+    }
+    
+    info(GOV_YIELDS_TASK, "Fetching all government yields via Bulk API...")
+    
+    try:
+        response = requests.get(url, params=params, timeout=60)
+        
+        if response.status_code != 200:
+            error(GOV_YIELDS_TASK, f"Bulk API error: HTTP {response.status_code}")
+            return 0, 1
+        
+        data = response.json()
+        
+        if not data:
+            warning(GOV_YIELDS_TASK, "Bulk API returned empty data")
+            return 0, 1
+        
+        info(GOV_YIELDS_TASK, f"Received {len(data)} bond records from Bulk API")
+        
+        # Process and prepare records for upsert
+        records = []
+        success_count = 0
+        error_count = 0
+        
+        for item in data:
+            try:
+                symbol = item.get("code", "")
+                
+                # Look up country and maturity from our mapping
+                if symbol in GOV_YIELDS_SYMBOLS:
+                    country, maturity = GOV_YIELDS_SYMBOLS[symbol]
+                else:
+                    # Handle any new symbols not in our map
+                    country = symbol[:2] if len(symbol) >= 2 else "Unknown"
+                    maturity = symbol[2:] if len(symbol) > 2 else "Unknown"
+                    debug(GOV_YIELDS_TASK, f"Unknown symbol {symbol}, using extracted: {country}/{maturity}")
+                
+                record = {
+                    "symbol": symbol,
+                    "country": country,
+                    "maturity": maturity,
+                    "date": item.get("date"),
+                    "open": item.get("open"),
+                    "high": item.get("high"),
+                    "low": item.get("low"),
+                    "close": item.get("close"),
+                    "adjusted_close": item.get("adjusted_close"),
+                    "volume": item.get("volume", 0),
+                    "fetched_at": datetime.now(timezone.utc).isoformat(),
+                }
+                records.append(record)
+                success_count += 1
+                
+            except Exception as e:
+                debug(GOV_YIELDS_TASK, f"Error processing record: {e}")
+                error_count += 1
+        
+        # Batch upsert all records
+        if records:
+            try:
+                batch_size = 50
+                for i in range(0, len(records), batch_size):
+                    batch = records[i:i + batch_size]
+                    sb.table("government_yields").upsert(batch, on_conflict="symbol,date").execute()
+                
+                info(GOV_YIELDS_TASK, f"Upserted {len(records)} yield records to database")
+                
+            except Exception as e:
+                error(GOV_YIELDS_TASK, f"Database upsert error: {e}")
+        
+        return success_count, error_count
+        
+    except requests.exceptions.Timeout:
+        error(GOV_YIELDS_TASK, "Bulk API request timed out")
+        return 0, 1
+    except Exception as e:
+        error(GOV_YIELDS_TASK, f"Bulk API error: {e}")
+        return 0, 1
+
+
+async def government_yields_task():
+    """
+    Task 14: Fetch government bond yields every 4 hours using Bulk API.
+    
+    Follows FX market hours:
+    - Active: Sunday 5PM ET to Friday 5PM ET
+    - Paused: Friday 5PM ET to Sunday 5PM ET
+    
+    Fetches at 4-hour boundaries: 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC
+    
+    Uses EODHD Bulk API: 1 request = all 108 bonds (100 API calls vs 108)
+    """
+    task_metrics = metrics.get_or_create(GOV_YIELDS_TASK)
+    
+    info(GOV_YIELDS_TASK, f"Government Yields task started ({len(GOV_YIELDS_SYMBOLS)} bonds)")
+    info(GOV_YIELDS_TASK, f"Using Bulk API: 1 request for all bonds (100 API calls)")
+    info(GOV_YIELDS_TASK, f"Update interval: every 4 hours at 00/04/08/12/16/20 UTC")
+    info(GOV_YIELDS_TASK, f"Following FX market hours (Sun 5PM ET - Fri 5PM ET)")
+    
+    # Initial fetch on startup (if market is open)
+    if is_market_open("EURUSD"):
+        info(GOV_YIELDS_TASK, "Running initial yield fetch...")
+        loop = asyncio.get_event_loop()
+        success, errors = await loop.run_in_executor(None, fetch_all_gov_yields_bulk)
+        
+        task_metrics.record_success()
+        task_metrics.custom_metrics.update({
+            "last_fetch": datetime.now(timezone.utc).isoformat(),
+            "last_success_count": success,
+            "last_error_count": errors,
+            "total_symbols": len(GOV_YIELDS_SYMBOLS),
+        })
+        
+        info(GOV_YIELDS_TASK, f"Initial fetch complete: {success} success, {errors} errors")
+    else:
+        info(GOV_YIELDS_TASK, "Market closed, skipping initial fetch")
+    
+    # Track last fetch time to avoid duplicate fetches
+    last_fetch_bucket = None
+    
+    while not tick_streamer._shutdown.is_set():
+        try:
+            now = datetime.now(timezone.utc)
+            
+            # Get current 4-hour bucket
+            current_bucket_hour = (now.hour // 4) * 4
+            current_bucket = now.replace(hour=current_bucket_hour, minute=0, second=0, microsecond=0)
+            
+            # Check if we should fetch (new bucket and market is open)
+            should_fetch = (
+                current_bucket != last_fetch_bucket and
+                is_market_open("EURUSD") and
+                now.minute < 30
+            )
+            
+            if should_fetch:
+                info(GOV_YIELDS_TASK, f"4H boundary reached ({current_bucket.strftime('%H:%M UTC')}), fetching yields...")
+                
+                loop = asyncio.get_event_loop()
+                success, errors = await loop.run_in_executor(None, fetch_all_gov_yields_bulk)
+                
+                task_metrics.record_success()
+                task_metrics.custom_metrics.update({
+                    "last_fetch": now.isoformat(),
+                    "last_success_count": success,
+                    "last_error_count": errors,
+                    "last_bucket": current_bucket.isoformat(),
+                })
+                
+                info(GOV_YIELDS_TASK, f"Yield fetch complete: {success} success, {errors} errors")
+                
+                last_fetch_bucket = current_bucket
+            
+            # Check every 5 minutes to catch the 4-hour boundaries
+            await asyncio.sleep(300)
+            
+        except Exception as e:
+            error(GOV_YIELDS_TASK, f"Task error: {e}", exc_info=DEBUG_MODE)
+            task_metrics.record_error(str(e))
+            await asyncio.sleep(60)
+    
+    info(GOV_YIELDS_TASK, "Government yields task shutting down")
+
+
+# ============================================================================
+#                    END OF TASK 14: GOVERNMENT YIELDS
+# ============================================================================
+
+
+# ============================================================================
 #                              MAIN ENTRY POINT
 # ============================================================================
 
@@ -5880,6 +6213,7 @@ async def main():
         asyncio.create_task(bond_yields_streaming_task(), name="bond_4h"),
         asyncio.create_task(stock_data_sync_task(), name="stock_data"),  # NEW: Stock financial data sync
         asyncio.create_task(stock_fundamentals_price_task(), name="fundamentals"),  # NEW: Stock fundamentals price updates
+        asyncio.create_task(government_yields_task(), name="gov_yields"),  # NEW: Government bond yields (EODHD Bulk API)
     ]
     
     # Periodic metrics logging
@@ -5913,6 +6247,9 @@ async def main():
 if __name__ == "__main__":
     try:
         asyncio.run(main())
+    except KeyboardInterrupt:
+        log.info("Interrupted by user")
+        sys.exit(0)
     except KeyboardInterrupt:
         log.info("Interrupted by user")
         sys.exit(0)
